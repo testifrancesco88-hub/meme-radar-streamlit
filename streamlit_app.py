@@ -1,9 +1,11 @@
-# streamlit_app.py — Meme Radar (Streamlit) v11.3 (no GetMoni, no Bubblemaps, no Pump.fun)
+# streamlit_app.py — Meme Radar (Streamlit) v11.4
 # - Auto-refresh, countdown, "Aggiorna ora"
 # - StrategyMomentumV2 (turnover, market heat, change range, break-even lock)
 # - KPI, Meme Score, grafici, watchlist
-# - Alert Telegram dalla tabella (soglie + cooldown + test)
-# - RIMOSSI: Bubblemaps & Social (GetMoni)
+# - Alert Telegram sulla tabella (soglie + cooldown + test)
+# - NEW: DEX consentiti (multiselect)
+# - NEW: Adaptive Relax (sblocca candidati se 0)
+# - RIMOSSI: Bubblemaps / Social (GetMoni) / Pump.fun
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -69,6 +71,14 @@ with st.sidebar:
         w_txns   = st.slider("Peso: Txns 1h", 0, 100, 25)
         w_liq    = st.slider("Peso: Sweet spot di Liquidity", 0, 100, 20)
         w_dex    = st.slider("Peso: DEX (Raydium > altri)", 0, 100, 15)
+
+    # --- DEX consentiti (NUOVO) ---
+    allowed_dex = st.multiselect(
+        "DEX consentiti",
+        ["raydium", "orca", "meteora", "lifinity"],
+        default=st.session_state.get("allowed_dex", ["raydium", "orca", "meteora", "lifinity"])
+    )
+    st.session_state["allowed_dex"] = allowed_dex
 
     st.divider()
     st.subheader("Tabella")
@@ -469,16 +479,6 @@ if not df_pairs.empty:
         }
     )
 
-# ---------------- Top 10 per Meme Score ----------------
-st.markdown("### Top 10 per Meme Score")
-if not df_pairs.empty:
-    top10_meme = df_pairs.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]).head(10)
-    fig3 = px.bar(top10_meme, x="Pair", y="Meme Score",
-                  hover_data=["DEX","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Price (USD)","Change 24h (%)","Created (UTC)","Pair Age","Base Address"],
-                  title="Top 10 per Meme Score")
-    fig3.update_layout(yaxis_range=[0, 100]); fig3.update_xaxes(tickangle=-30)
-    st.plotly_chart(fig3, use_container_width=True)
-
 # ---------------- Diagnostica Strategia (in-app) ----------------
 def market_heat_value(df: pd.DataFrame, topN: int) -> float:
     if df is None or df.empty: 
@@ -536,7 +536,7 @@ else:
         except Exception: return 0
 
     c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
-    c_dex = cnt(s["DEX"].str.lower().isin(list(("raydium","orca","meteora"))))
+    c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
     c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
@@ -560,7 +560,7 @@ else:
             turnover_min=float(st.session_state.get("strat_turnover",1.2)),
             chg24_min=float(st.session_state.get("chg_min",-8)),
             chg24_max=float(st.session_state.get("chg_max",180)),
-            allow_dex=("raydium","orca","meteora"),
+            allow_dex=tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])),
             heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
             heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
         )
@@ -587,6 +587,87 @@ else:
         df_near = pd.DataFrame(near).sort_values(by=["Meme","Tx1h","Liq"], ascending=[False,False,False]).head(10)
         st.markdown("**Bocciati da UN solo filtro (top 10)**")
         st.dataframe(df_near, use_container_width=True)
+
+# === Adaptive Relax (NUOVO) =========================================
+def _count_candidates(df: pd.DataFrame, cfg) -> int:
+    if df is None or df.empty: 
+        return 0
+    def _reasons(row):
+        reasons = []
+        try:
+            liq = float(row.get("Liquidity (USD)", 0) or 0)
+            vol = float(row.get("Volume 24h (USD)", 0) or 0)
+            tx1 = int(row.get("Txns 1h", 0) or 0)
+            meme = int(row.get("Meme Score", 0) or 0)
+            chg = row.get("Change 24h (%)", None); chg = float(chg) if chg is not None else 0.0
+            dex = str(row.get("DEX", "")).lower()
+        except Exception:
+            return ["parse"]
+        if not (float(cfg.liq_min) <= liq <= float(cfg.liq_max)): reasons.append("liq")
+        if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex: reasons.append("dex")
+        if meme < int(cfg.meme_score_min): reasons.append("meme")
+        if tx1 < int(cfg.txns1h_min): reasons.append("tx1h")
+        turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
+        if turnover < float(cfg.turnover_min): reasons.append("turnover")
+        if chg < float(cfg.chg24_min) or chg > float(cfg.chg24_max): reasons.append("chg24")
+        return reasons
+    return sum(1 for _, r in df.iterrows() if len(_reasons(r)) == 0)
+
+def relax_strategy_if_empty(df: pd.DataFrame, cfg):
+    allowed = tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))
+    base = dict(
+        allow_dex=allowed,
+        heat_tx1h_topN=cfg.heat_tx1h_topN,
+        heat_tx1h_avg_min=cfg.heat_tx1h_avg_min,
+    )
+    steps = [
+        cfg,  # step 0 (strict)
+        StratConfig(**base,
+            meme_score_min=max(0, int(cfg.meme_score_min) - 10),
+            txns1h_min=int(cfg.txns1h_min),
+            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+            turnover_min=float(cfg.turnover_min),
+            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
+        ),
+        StratConfig(**base,
+            meme_score_min=int(cfg.meme_score_min),
+            txns1h_min=max(0, int(cfg.txns1h_min * 0.8)),
+            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+            turnover_min=float(cfg.turnover_min),
+            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
+        ),
+        StratConfig(**base,
+            meme_score_min=int(cfg.meme_score_min),
+            txns1h_min=int(cfg.txns1h_min),
+            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+            turnover_min=max(0.0, float(cfg.turnover_min) * 0.8),
+            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
+        ),
+        StratConfig(**base,
+            meme_score_min=int(cfg.meme_score_min),
+            txns1h_min=int(cfg.txns1h_min),
+            liq_min=max(0.0, float(cfg.liq_min) * 0.5), 
+            liq_max=float(cfg.liq_max) * 1.5,
+            turnover_min=float(cfg.turnover_min),
+            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
+        ),
+        StratConfig(**base,
+            meme_score_min=int(cfg.meme_score_min),
+            txns1h_min=int(cfg.txns1h_min),
+            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+            turnover_min=float(cfg.turnover_min),
+            chg24_min=float(cfg.chg24_min) - 10, 
+            chg24_max=float(cfg.chg24_max) + 50,
+        ),
+    ]
+    chosen = steps[0]
+    for i, c in enumerate(steps):
+        if _count_candidates(df, c) > 0:
+            chosen = c
+            if i > 0:
+                st.info(f"Adaptive relax attivo: step {i} (soglie alleggerite).")
+            break
+    return chosen
 
 # ---------------- Trading (Paper) ----------------
 st.markdown("## 🧪 Trading — Paper Mode")
@@ -617,18 +698,23 @@ s_cfg = StratConfig(
     turnover_min=float(st.session_state.get("strat_turnover",1.2)),
     chg24_min=float(st.session_state.get("chg_min",-8)),
     chg24_max=float(st.session_state.get("chg_max",180)),
-    allow_dex=("raydium","orca","meteora"),
+    allow_dex=tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])),
     heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
-    heat_tx1h_avg_min=int(st.session_state.get("strat_heat_avg",120)),
+    heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
 )
 
-# crea/aggiorna il motore (senza bm_check/sent_check)
+# Applica Adaptive Relax se necessario
+active_s_cfg = s_cfg
+if df_pairs is not None and not df_pairs.empty:
+    active_s_cfg = relax_strategy_if_empty(df_pairs, s_cfg)
+
+# crea/aggiorna il motore
 if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
-    st.session_state["trade_engine"] = TradeEngine(r_cfg, s_cfg, bm_check=None, sent_check=None)
+    st.session_state["trade_engine"] = TradeEngine(r_cfg, active_s_cfg, bm_check=None, sent_check=None)
 else:
     eng_tmp = st.session_state["trade_engine"]
     eng_tmp.risk.cfg = r_cfg
-    eng_tmp.strategy.cfg = s_cfg
+    eng_tmp.strategy.cfg = active_s_cfg
     eng_tmp.bm_check = None
     eng_tmp.sent_check = None
 
