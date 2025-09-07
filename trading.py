@@ -9,13 +9,13 @@ import pandas as pd
 # ---------------- Risk Manager ----------------
 @dataclass
 class RiskConfig:
-    position_usd: float = 50.0           # dimensione fissa per trade
-    max_positions: int = 3               # quante posizioni aperte al massimo
-    stop_loss_pct: float = 0.20          # 20% stop
-    take_profit_pct: float = 0.40        # 40% take profit
-    trailing_pct: float = 0.15           # trailing 15% dal massimo
-    daily_loss_limit_usd: float = 200.0  # blocca nuove entrate se raggiunto
-    slippage_pct: float = 0.01           # per la simulazione di esecuzione
+    position_usd: float = 50.0
+    max_positions: int = 3
+    stop_loss_pct: float = 0.20
+    take_profit_pct: float = 0.40
+    trailing_pct: float = 0.15
+    daily_loss_limit_usd: float = 200.0
+    slippage_pct: float = 0.01
 
 @dataclass
 class RiskState:
@@ -87,28 +87,21 @@ class PaperBroker:
         return pos
 
     def mark_to_market(self, prices: Dict[str, float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        prices: mappa symbol->prezzo
-        Ritorna: (df_open, df_closed_recent)
-        """
         rows = []
         to_close = []
         for pos in self.positions.values():
             px = float(prices.get(pos.symbol, 0) or 0)
             if px <= 0: 
-                rows.append(self._row(pos, px, 0.0))
+                rows.append(self._row(pos, px, 0.0)); 
                 continue
 
-            # aggiorna massimo visto (per trailing)
             if px > pos.max_price_seen:
                 pos.max_price_seen = px
 
-            pnl = (px - pos.entry_price) * pos.qty  # USD
+            pnl = (px - pos.entry_price) * pos.qty
             pnl_pct = (px / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
-
             rows.append(self._row(pos, px, pnl))
 
-            # regole di uscita: stop/take/trailing
             if pnl_pct <= -abs(self.risk.cfg.stop_loss_pct):
                 to_close.append((pos, px, "SL"))
             elif pnl_pct >= abs(self.risk.cfg.take_profit_pct):
@@ -119,7 +112,6 @@ class PaperBroker:
                     if drawdown >= abs(self.risk.cfg.trailing_pct):
                         to_close.append((pos, px, "TRAIL"))
 
-        # applica chiusure
         for pos, px, reason in to_close:
             self.close(pos.id, px, reason)
 
@@ -159,7 +151,7 @@ class PaperBroker:
             "reason": reason,
         })
 
-# ---------------- Strategia: Momentum + Meme Score ----------------
+# ---------------- Strategia: Momentum + Meme Score (più permissiva) ----------------
 @dataclass
 class StratConfig:
     meme_score_min: int = 75
@@ -182,23 +174,29 @@ class StrategyMomentumV1:
         except Exception:
             return False
 
-        # filtri base
-        if meme < self.cfg.meme_score_min: return False
-        if tx1h < self.cfg.txns1h_min: return False
-        if liq < self.cfg.liq_min or liq > self.cfg.liq_max: return False
-        if self.cfg.allow_dex and dex not in self.cfg.allow_dex: return False
-
-        # piccolo vincolo di momentum addizionale: prezzo 24h non negativo
-        if chg is not None and chg < -5.0:  # evita già in dump
+        # Filtri hard
+        if liq < self.cfg.liq_min or liq > self.cfg.liq_max: 
             return False
-        return True
+        if self.cfg.allow_dex and dex not in self.cfg.allow_dex: 
+            return False
+
+        # Regola principale
+        if meme >= self.cfg.meme_score_min and tx1h >= self.cfg.txns1h_min and (chg is None or chg >= -5.0):
+            return True
+
+        # Compensazioni soft
+        if meme >= self.cfg.meme_score_min + 10 and tx1h >= int(self.cfg.txns1h_min * 0.6) and (chg is None or chg >= -8.0):
+            return True
+        if tx1h >= self.cfg.txns1h_min + 150 and (chg is None or chg >= -10.0):
+            return True
+
+        return False
 
 # ---------------- Trade Engine ----------------
 class TradeEngine:
     """
-    Collega strategia + broker + risk. Gestisce open/close su DataFrame di segnali.
+    Collega strategia + broker + risk. Supporta filtro Bubblemaps via callback.
     """
-class TradeEngine:
     def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig, bm_check=None):
         self.risk = RiskManager(risk_cfg)
         self.broker = PaperBroker(self.risk)
@@ -206,32 +204,8 @@ class TradeEngine:
         self.bm_check = bm_check  # funzione(token_address) -> dict
 
     def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Valuta segnali long e marca a mercato le posizioni aperte.
-        df_pairs è la tabella 'Pairs (post-filtri)' prodotta dall'app.
-        """
         prices: Dict[str, float] = {}
         candidates: List[Dict] = []
-
-        # 1) scan segnali
-        for r in df_pairs.to_dict(orient="records"):
-            sym = r.get("Pair","")
-            last = float(r.get("Price (USD)") or 0.0)
-            prices[sym] = last
-            if self.strategy.signal_long(r):
-                candidates.append({
-                    "Pair": sym,
-                    "DEX": r.get("DEX",""),
-                    "Score": int(r.get("Meme Score", 0) or 0),
-                    "Txns 1h": int(r.get("Txns 1h", 0) or 0),
-                    "Liquidity (USD)": int(r.get("Liquidity (USD)", 0) or 0),
-                    "Price (USD)": last,
-                    "Link": r.get("Link",""),
-                })
-
-        df_signals = pd.DataFrame(candidates).sort_values(
-            by=["Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]
-        ).reset_index(drop=True) if candidates else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link"])
 
         # 1) scan segnali
         for r in df_pairs.to_dict(orient="records"):
@@ -250,7 +224,7 @@ class TradeEngine:
                     "Base Address": r.get("Base Address","") or r.get("baseAddress",""),
                 })
 
-        # --- Bubblemaps anti-cluster (filtra i candidati ad alto rischio) ---
+        # --- Bubblemaps anti-cluster ---
         filtered = []
         for c in candidates:
             addr = c.get("Base Address") or ""
@@ -259,18 +233,30 @@ class TradeEngine:
                 try:
                     bm = self.bm_check(addr)
                     if bm.get("is_high_risk"):
-                        # scarta (non tradabile)
                         bm_ok = "HIGH"
-                        # NON aggiungere a filtered
-                        continue
+                        continue  # ESCLUSO dalle negoziazioni
                     else:
                         bm_ok = "OK"
                 except Exception:
                     bm_ok = "ERR"
-            c["BM Risk"] = bm_ok  # visibile in UI
+            c["BM Risk"] = bm_ok
             filtered.append(c)
 
         df_signals = (pd.DataFrame(filtered)
                         .sort_values(by=["Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
                         .reset_index(drop=True)
                       ) if filtered else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk"])
+
+        # 2) apri max 1 posizione per step
+        if not df_signals.empty and self.risk.can_open(len(self.broker.positions)):
+            top = df_signals.iloc[0].to_dict()
+            sym = top["Pair"]; px = float(top["Price (USD)"] or 0.0)
+            if px > 0:
+                self.broker.open_long(sym, label=f"{top['DEX']} | S{top['Score']}", price=px, usd_amount=self.risk.cfg.position_usd)
+
+        # 3) mark-to-market & uscite
+        df_open, df_closed = self.broker.mark_to_market(prices)
+        return df_signals, df_open, df_closed
+
+    def close_by_id(self, pid: str, last_price: float):
+        self.broker.close(pid, last_price, "MANUAL")
