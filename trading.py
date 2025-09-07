@@ -1,6 +1,6 @@
 # trading.py — motore di paper trading + risk manager + strategia momentum per meme coin
 from __future__ import annotations
-import time, math, uuid
+import time, uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -16,6 +16,12 @@ class RiskConfig:
     trailing_pct: float = 0.15
     daily_loss_limit_usd: float = 200.0
     slippage_pct: float = 0.01
+    # --- anti-duplicati / timing ---
+    max_positions_per_symbol: int = 1
+    symbol_cooldown_min: int = 20
+    allow_pyramiding: bool = False
+    pyramid_add_on_trigger_pct: float = 0.08  # 8% sopra ultimo ingresso
+    time_stop_min: int = 60                   # 0 = disattivo
 
 @dataclass
 class RiskState:
@@ -89,10 +95,10 @@ class PaperBroker:
     def mark_to_market(self, prices: Dict[str, float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
         rows = []
         to_close = []
-        for pos in self.positions.values():
+        for pos in list(self.positions.values()):
             px = float(prices.get(pos.symbol, 0) or 0)
-            if px <= 0: 
-                rows.append(self._row(pos, px, 0.0)); 
+            if px <= 0:
+                rows.append(self._row(pos, px, 0.0))
                 continue
 
             if px > pos.max_price_seen:
@@ -102,11 +108,19 @@ class PaperBroker:
             pnl_pct = (px / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
             rows.append(self._row(pos, px, pnl))
 
+            # --- NEW: time-stop (se attivo) ---
+            age_sec = time.time() - pos.opened_ts
+            if self.risk.cfg.time_stop_min and age_sec >= self.risk.cfg.time_stop_min * 60 and pnl <= 0:
+                to_close.append((pos, px, "TIME"))
+                continue
+
+            # SL / TP
             if pnl_pct <= -abs(self.risk.cfg.stop_loss_pct):
                 to_close.append((pos, px, "SL"))
             elif pnl_pct >= abs(self.risk.cfg.take_profit_pct):
                 to_close.append((pos, px, "TP"))
             else:
+                # trailing stop
                 if pos.max_price_seen > 0:
                     drawdown = 1 - (px / pos.max_price_seen)
                     if drawdown >= abs(self.risk.cfg.trailing_pct):
@@ -201,6 +215,8 @@ class TradeEngine:
         self.strategy = StrategyMomentumV1(strat_cfg)
         self.bm_check = bm_check
         self.sent_check = sent_check
+        # anti-duplicati
+        self.last_entry_by_symbol: Dict[str, float] = {}
 
     def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         prices: Dict[str, float] = {}
@@ -251,10 +267,8 @@ class TradeEngine:
                     social = self.sent_check(c.get("Base Symbol"), c.get("Base Address"))
                 except Exception:
                     social = {"passes": True, "err": True}
-            # se non passa -> escludi
             if not social.get("passes", True):
                 continue
-            # arricchisci riga
             c["Moni User"] = social.get("username")
             c["Mentions 24h"] = social.get("mentions_24h")
             c["Smarts"] = social.get("smarts_count")
@@ -264,17 +278,50 @@ class TradeEngine:
 
         sort_cols = ["Score","Txns 1h","Liquidity (USD)","Mentions 24h","Smarts","Sentiment"]
         df_signals = (pd.DataFrame(filtered2)
-                        .sort_values(by=[c for c in sort_cols if c in (filtered2[0].keys() if filtered2 else [])],
-                                     ascending=[False]*len(sort_cols) if filtered2 else True)
+                        .sort_values(by=[c for c in sort_cols if filtered2 and c in filtered2[0].keys()],
+                                     ascending=[False]*len([c for c in sort_cols if filtered2 and c in filtered2[0].keys()]))
                         .reset_index(drop=True)
-                      ) if filtered2 else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"])
+                      ) if filtered2 else pd.DataFrame(columns=[
+                          "Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link",
+                          "Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"
+                      ])
 
-        # 4) apri max 1 posizione per step
+        # 4) apri max 1 posizione per step (rispettando vincoli per-simbolo)
         if not df_signals.empty and self.risk.can_open(len(self.broker.positions)):
             top = df_signals.iloc[0].to_dict()
-            sym = top["Pair"]; px = float(top["Price (USD)"] or 0.0)
+            sym = top["Pair"]
+            px = float(top["Price (USD)"] or 0.0)
             if px > 0:
-                self.broker.open_long(sym, label=f"{top.get('DEX','')} | S{top.get('Score',0)}", price=px, usd_amount=self.risk.cfg.position_usd)
+                now = time.time()
+                open_count_sym = sum(1 for p in self.broker.positions.values() if p.symbol == sym)
+                open_allowed = True
+
+                # limite per-simbolo
+                if open_count_sym >= max(1, int(self.risk.cfg.max_positions_per_symbol)):
+                    open_allowed = False
+
+                # cooldown per simbolo
+                last_ts = self.last_entry_by_symbol.get(sym, 0)
+                if self.risk.cfg.symbol_cooldown_min and (now - last_ts) < self.risk.cfg.symbol_cooldown_min * 60:
+                    open_allowed = False
+
+                # pyramiding
+                if open_count_sym > 0 and not self.risk.cfg.allow_pyramiding:
+                    open_allowed = False
+                elif open_count_sym > 0 and self.risk.cfg.allow_pyramiding:
+                    last_entry_price = 0.0
+                    try:
+                        last_entry_price = max(p.entry_price for p in self.broker.positions.values() if p.symbol == sym)
+                    except Exception:
+                        pass
+                    trig = (1.0 + float(self.risk.cfg.pyramid_add_on_trigger_pct or 0.08))
+                    if not (px >= last_entry_price * trig):
+                        open_allowed = False
+
+                if open_allowed:
+                    pos = self.broker.open_long(sym, label=f"{top.get('DEX','')} | S{top.get('Score',0)}", price=px, usd_amount=self.risk.cfg.position_usd)
+                    if pos:
+                        self.last_entry_by_symbol[sym] = now
 
         # 5) mark-to-market & uscite
         df_open, df_closed = self.broker.mark_to_market(prices)
