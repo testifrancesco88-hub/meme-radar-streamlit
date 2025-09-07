@@ -1,4 +1,6 @@
 # market_data.py — Provider dati live per token/pairs (Solana) con aggiornamento continuo
+# v8.2: schema stabile anche a DF vuoto + filtri robusti su exclude_quotes
+
 from __future__ import annotations
 
 import math, random, threading, time, logging
@@ -60,6 +62,26 @@ def _txns1h(p: Dict[str, Any]) -> int:
     h1 = ((p or {}).get("txns") or {}).get("h1") or {}
     return int((h1.get("buys") or 0) + (h1.get("sells") or 0))
 
+def _normalize_exclude_quotes(exclude_quotes: Optional[Iterable[Any]]) -> set[str]:
+    out: set[str] = set()
+    if not exclude_quotes:
+        return out
+    try:
+        for item in exclude_quotes:
+            if item is None:
+                continue
+            if isinstance(item, (list, tuple, set)):
+                for sub in item:
+                    if sub is None:
+                        continue
+                    out.add(str(sub).upper())
+            else:
+                out.add(str(item).upper())
+    except TypeError:
+        # Non iterabile: converto direttamente
+        out.add(str(exclude_quotes).upper())
+    return out
+
 class MarketDataProvider:
     def __init__(
         self,
@@ -95,7 +117,7 @@ class MarketDataProvider:
 
         self.only_raydium = bool(only_raydium)
         self.min_liq = float(min_liq) if min_liq else 0.0
-        self.exclude_quotes = set(map(str.upper, exclude_quotes or []))
+        self.exclude_quotes = _normalize_exclude_quotes(exclude_quotes)
         self.preserve_on_empty = bool(preserve_on_empty)
 
     # -------- Public API --------
@@ -125,7 +147,6 @@ class MarketDataProvider:
 
     def get_snapshot(self) -> Tuple[pd.DataFrame, float]:
         with self._lock:
-            # sempre copia con tutte le colonne attese
             df = self._df.copy()
             for col in EXPECTED_COLS:
                 if col not in df.columns:
@@ -158,11 +179,11 @@ class MarketDataProvider:
         *,
         only_raydium: Optional[bool] = None,
         min_liq: Optional[float] = None,
-        exclude_quotes: Optional[Iterable[str]] = None,
+        exclude_quotes: Optional[Iterable[Any]] = None,
     ) -> None:
         if only_raydium is not None: self.only_raydium = bool(only_raydium)
         if min_liq is not None: self.min_liq = float(min_liq) if min_liq else 0.0
-        if exclude_quotes is not None: self.exclude_quotes = set(map(str.upper, exclude_quotes))
+        if exclude_quotes is not None: self.exclude_quotes = _normalize_exclude_quotes(exclude_quotes)
 
     def get_top_by(self, field: str, n: int = 10) -> pd.DataFrame:
         df, _ = self.get_snapshot()
@@ -249,10 +270,8 @@ class MarketDataProvider:
         if not rows:
             return pd.DataFrame(columns=EXPECTED_COLS)
         df = pd.DataFrame(rows)
-        # Assicura tutte le colonne attese
         for c in EXPECTED_COLS:
             if c not in df.columns: df[c] = None
-        # Ordina di default
         df = df.sort_values(by=["volume24hUsd","txns1h","liquidityUsd"], ascending=[False, False, False]).reset_index(drop=True)
         return df
 
@@ -265,7 +284,6 @@ class MarketDataProvider:
             out = out[(out["liquidityUsd"].fillna(0) >= float(self.min_liq))]
         if self.exclude_quotes:
             out = out[~out["quoteSymbol"].str.upper().isin(self.exclude_quotes)]
-        # ritorna con schema pieno
         for c in EXPECTED_COLS:
             if c not in out.columns: out[c] = None
         return out.reset_index(drop=True)[EXPECTED_COLS]
