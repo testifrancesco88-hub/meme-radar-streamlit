@@ -1,5 +1,5 @@
-streamlit>=1.36
+streamlit
 pandas
-plotly
 requests
-websockets>=12
+plotly
+websocket-client
