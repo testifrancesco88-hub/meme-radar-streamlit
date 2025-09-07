@@ -1,6 +1,6 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8.4.1
-# Fix crash Meme Score: rimosso placeholder e resi robusti compute_meme_score_row/score_liq
-# Include: MarketDataProvider + Charts + Watchlist + CSV + Alert Telegram + LIVE Pump.fun
+# streamlit_app.py — Meme Radar (Streamlit) v8.4.2
+# Fix: st.query_params; provider robusto; LIVE Pump.fun con header, backoff, bottone Riconnetti;
+# auto-refresh sospeso quando LIVE attivo; Meme Score, watchlist, grafici, CSV, alert Telegram.
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -14,7 +14,7 @@ try:
 except Exception:
     websocket = None
 
-from market_data import MarketDataProvider  # v8.3 consigliata
+from market_data import MarketDataProvider  # v8.3
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -32,7 +32,6 @@ SEARCH_QUERIES = [
     "chain:solana bonk",
     "chain:solana wif",
     "chain:solana pepe",
-    # extra copertura pump.fun quando indicizzato
     "chain:solana pump",
 ]
 
@@ -100,12 +99,15 @@ with st.sidebar:
     pump_alert_enable = st.toggle("Alert Telegram su match keyword", value=False, help="Richiede BOT_TOKEN e CHAT_ID sopra")
     st.caption("Fonte: PumpPortal WebSocket – un'unica connessione condivisa. Evita multi-connessioni. ")
 
-# Refresh via query param (no experimental)
-if auto_refresh:
+# 🔁 Rerun solo se LIVE Pump.fun NON è attivo (evita di troncare il WS)
+if auto_refresh and not pump_enable:
     try:
         st.query_params.update({"_": str(int(time.time() // REFRESH_SEC))})
     except Exception:
         pass
+else:
+    if pump_enable:
+        st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
 
 # ---------------- Helpers ----------------
 def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
@@ -195,43 +197,26 @@ def score_age(hours):
     return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
 
 def score_liq(liq, mn, mx):
-    """
-    Gestione robusta di mn/mx None: se non passati, assumo banda [0, +inf).
-    """
-    if liq is None or liq <= 0:
-        return 0.0
-    try:
-        mn = float(mn) if mn is not None else 0.0
-    except Exception:
-        mn = 0.0
-    try:
-        mx = float(mx) if mx not in (None, 0) else float("inf")
-    except Exception:
-        mx = float("inf")
-    if mn <= liq <= mx:
-        return 1.0
-    if liq < mn:
-        return max(0.0, liq / (mn if mn > 0 else 1.0))
-    # liq > mx (mx può essere inf → questo ramo non scatta)
+    # robusto a None e inf
+    if liq is None or liq <= 0: return 0.0
+    try: mn = float(mn) if mn is not None else 0.0
+    except Exception: mn = 0.0
+    try: mx = float(mx) if mx not in (None, 0) else float("inf")
+    except Exception: mx = float("inf")
+    if mn <= liq <= mx: return 1.0
+    if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
     return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
 
 def score_dex(d): 
     return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
 def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
-    """
-    Calcola Meme Score (0–100).
-    - weights: tuple/list (w_symbol, w_age, w_txns, w_liq, w_dex). Se None → usa cursori sidebar.
-    - sweet_min/max: banda ideale liquidity. Se None → trattata come [0, +inf) (nessuna penalità per eccesso).
-    """
-    # supporta dict/Series
     base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
     dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
     liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
     tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
 
-    # fallback ai cursori della sidebar se weights è None
     if weights is None:
         local_weights = (w_symbol, w_age, w_txns, w_liq, w_dex)
     else:
@@ -456,13 +441,21 @@ else:
 
 # ---------------- LIVE Pump.fun — classe + integrazione ----------------
 class PumpFunLive:
-    """WebSocket single-connection a PumpPortal per subscribeNewToken (dedup mint, buffer, snapshot DF)."""
-    def __init__(self, max_rows=200, api_key: str | None = None):
+    """
+    WebSocket single-connection a PumpPortal (subscribeNewToken).
+    - Header Origin/User-Agent per handshake
+    - Dedup per mint, buffer, snapshot DF
+    - Reconnect con backoff + diagnostica
+    """
+    def __init__(self, max_rows=200, api_key: str | None = None, ua: str | None = None):
         self.max_rows = int(max_rows)
         self.api_key = api_key
-        self.url = "wss://pumpportal.fun/api/data"
-        if api_key:
-            self.url += f"?api-key={api_key}"
+        base = "wss://pumpportal.fun/api/data"
+        self.url = f"{base}?api-key={api_key}" if api_key else base
+        self.headers = [
+            "Origin: https://pumpportal.fun",
+            f"User-Agent: {ua or 'MemeRadar/1.0 (+streamlit)'}",
+        ]
         self._rows = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -470,12 +463,18 @@ class PumpFunLive:
         self._thread = None
         self._last_err = None
         self._connected = False
+        self._last_close = None
 
     def start(self):
         if self._thread and self._thread.is_alive(): return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="PumpFunLive", daemon=True)
         self._thread.start()
+
+    def reconnect_now(self):
+        self.stop()
+        time.sleep(0.2)
+        self.start()
 
     def stop(self):
         self._stop.set()
@@ -485,6 +484,7 @@ class PumpFunLive:
 
     def _on_open(self, ws):
         self._connected = True
+        self._last_err = None
         try:
             ws.send(json.dumps({"method": "subscribeNewToken"}))
         except Exception as e:
@@ -498,17 +498,17 @@ class PumpFunLive:
             symbol = data.get("symbol") or ""
             creator= data.get("creator") or data.get("user") or data.get("owner") or ""
             ts = (data.get("createdTimestamp") or data.get("createdOn") or data.get("createdAt") or int(time.time()))
+            if not mint: return
             row = {
-                "Mint": mint or "",
+                "Mint": mint,
                 "Name": name,
                 "Symbol": symbol,
                 "Creator": creator,
                 "Created (UTC)": ms_to_dt(ts),
                 "Age": fmt_age(hours_since_ms(ts)),
-                "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "",
-                "Solscan": f"https://solscan.io/token/{mint}" if mint else "",
+                "Pump.fun": f"https://pump.fun/coin/{mint}",
+                "Solscan": f"https://solscan.io/token/{mint}",
             }
-            if not mint: return
             with self._lock:
                 if any(r["Mint"] == mint for r in self._rows): return
                 self._rows.insert(0, row)
@@ -520,31 +520,36 @@ class PumpFunLive:
     def _on_error(self, ws, error):
         self._last_err = f"{error}"
 
-    def _on_close(self, ws, a, b):
+    def _on_close(self, ws, close_status_code, close_msg):
         self._connected = False
+        self._last_close = f"code={close_status_code}, reason={close_msg}"
 
     def _run(self):
         while not self._stop.is_set():
             try:
                 self._ws = websocket.WebSocketApp(
                     self.url,
+                    header=self.headers,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+                self._ws.run_forever(ping_interval=20, ping_timeout=10, ping_payload="ping")
             except Exception as e:
                 self._last_err = f"run_forever err: {e}"
             if not self._stop.is_set():
-                time.sleep(1.5 + random.uniform(0, 1.5))
+                time.sleep(1.5 + random.uniform(0, 2.0))
 
     def snapshot_df(self) -> pd.DataFrame:
         with self._lock:
             return pd.DataFrame(self._rows).copy()
 
     def status(self):
-        return ("connected" if self._connected else "disconnected", self._last_err)
+        info = []
+        if self._last_err: info.append(f"err={self._last_err}")
+        if self._last_close: info.append(f"close={self._last_close}")
+        return ("connected" if self._connected else "disconnected", " • ".join(info) if info else None)
 
 # init istanza live in sessione
 if "pump_live" not in st.session_state:
@@ -566,8 +571,13 @@ else:
 st.markdown("## 🔴 LIVE: New on Pump.fun")
 if pump_enable and st.session_state["pump_live"] and websocket is not None:
     p = st.session_state["pump_live"]
-    status, last_err = p.status()
-    st.caption(f"WebSocket: {status}" + (f" • Error: {last_err}" if last_err else ""))
+    status, last_info = p.status()
+    col_stat, col_btn = st.columns([3,1])
+    with col_stat:
+        st.caption(f"WebSocket: {status}" + (f" • {last_info}" if last_info else ""))
+    with col_btn:
+        if st.button("🔁 Riconnetti WS"):
+            p.reconnect_now()
 
     df_live = p.snapshot_df()
     # filtro keyword (name/symbol)
@@ -612,7 +622,7 @@ if pump_enable and st.session_state["pump_live"] and websocket is not None:
     else:
         st.info("In ascolto… nessun evento compatibile (o nessuna keyword).")
 else:
-    st.caption("Attiva la levetta “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
+    st.caption("Attiva “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
 
 # ---------------- Diagnostica ----------------
 st.subheader("Diagnostica")
