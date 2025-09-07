@@ -1,4 +1,4 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12.2
+# streamlit_app.py — Meme Radar (Streamlit) v12.3
 # - Scanner Solana (DexScreener + Birdeye per nuove coin)
 # - KPI, Meme Score, grafici, watchlist
 # - Filtro Volume 24h (MIN/MAX)
@@ -7,7 +7,7 @@
 # - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
 # - Alert Telegram dalla tabella
 # - LIVE Trading (Jupiter): deeplink o autosign (locale)
-# - Toggle Top10 tabella + Change 1h + Change 4h con fallback H6
+# - Tabella: Top10 toggle + Change 1h + Change 4h con fallback H6 (nested-aware)
 # - Start / Stop: pausa globale (strategia, alert, live mirror)
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
@@ -211,11 +211,9 @@ with st.sidebar:
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
         st.session_state["app_running"] = True
         st.toast("Esecuzione avviata", icon="✅")
-        # opzionale: mantieni live_positions
     if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
         st.session_state["app_running"] = False
-        # opzionale (prudente): svuota live mirror
-        st.session_state["live_positions"] = {}
+        st.session_state["live_positions"] = {}  # prudente
         st.toast("Esecuzione in pausa", icon="⏸️")
     running = bool(st.session_state["app_running"])
 
@@ -629,8 +627,9 @@ with right:
         fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
         st.plotly_chart(fig2, use_container_width=True)
 
-# ---------------- Tabella pairs con Meme Score ----------------
+# ---------------- Tabella pairs con Meme Score (nested-aware) ----------------
 def _first_or_none(d, keys):
+    # Cerca al livello piatto
     for k in keys:
         try:
             v = d.get(k) if hasattr(d, "get") else d[k]
@@ -640,17 +639,73 @@ def _first_or_none(d, keys):
             pass
     return None
 
+def _to_float_pct(x):
+    # '12.34' o '12.34%' -> 12.34; altrimenti None
+    if x is None:
+        return None
+    try:
+        s = str(x).replace("%", "").strip()
+        return float(s) if s != "" else None
+    except Exception:
+        return None
+
+def _get_change_pct_from_nested(r, nested_key, candidates):
+    # Cerca dentro un oggetto annidato (es. r['priceChange'])
+    try:
+        obj = r.get(nested_key) if hasattr(r, "get") else r[nested_key]
+    except Exception:
+        obj = None
+    if isinstance(obj, dict):
+        for name in candidates:
+            if name in obj and obj[name] is not None:
+                val = _to_float_pct(obj[name])
+                if val is not None:
+                    return val
+    return None
+
+def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
+    # 1) flat; 2) nested priceChange[h1/h4/h6/…]
+    v = _first_or_none(r, flat_keys)
+    v = _to_float_pct(v)
+    if v is not None:
+        return v
+    return _get_change_pct_from_nested(r, nested_key, nested_candidates)
+
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
         mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
 
-        # Change 1h / 4h con fallback H6 se richiesto
-        chg_1h = _first_or_none(r, ["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"])
-        chg_4h = _first_or_none(r, ["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"])
+        # Change 1h: flat -> nested priceChange['h1'/'1h'/'m60'/...]
+        chg_1h = _get_change_pct(
+            r,
+            flat_keys=["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"],
+            nested_key="priceChange",
+            nested_candidates=("h1","1h","m60","60m")
+        )
+
+        # Change 4h con fallback a H6 se mancante
+        chg_4h = _get_change_pct(
+            r,
+            flat_keys=["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"],
+            nested_key="priceChange",
+            nested_candidates=("h4","4h","m240","240m")
+        )
         if chg_4h is None and show_h6_fallback:
-            chg_4h = _first_or_none(r, ["priceChange6hPct","priceChangeH6Pct","pc6h","priceChange6h"])
+            chg_4h = _get_change_pct(
+                r,
+                flat_keys=["priceChange6hPct","priceChangeH6Pct","pc6h","priceChange6h"],
+                nested_key="priceChange",
+                nested_candidates=("h6","6h","m360","360m")
+            )
+
+        chg_24h = _get_change_pct(
+            r,
+            flat_keys=["priceChange24hPct","priceChangeH24Pct","pc24h","priceChange24h"],
+            nested_key="priceChange",
+            nested_candidates=("h24","24h","m1440","1440m")
+        )
 
         rows.append({
             "Meme Score": mscore,
@@ -662,7 +717,7 @@ def build_table(df):
             "Price (USD)": r.get("priceUsd"),
             "Change 1h (%)": chg_1h,
             "Change 4h/6h (%)": chg_4h,
-            "Change 24h (%)": r.get("priceChange24hPct"),
+            "Change 24h (%)": chg_24h,
             "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
             "Pair Age": fmt_age(ageh),
             "Link": r.get("url",""),
@@ -703,6 +758,14 @@ if not df_pairs.empty:
     cap = "Top 10 per Volume 24h." if show_top10_table else "Tutte le coppie post-filtri."
     cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
     st.caption(cap)
+
+    # Diagnostica popolamento Change
+    try:
+        n1 = pd.to_numeric(df_pairs_for_view["Change 1h (%)"], errors="coerce").notna().sum()
+        n4 = pd.to_numeric(df_pairs_for_view["Change 4h/6h (%)"], errors="coerce").notna().sum()
+        st.caption(f"Diagnostica Change: 1h valorizzati {n1}/{len(df_pairs_for_view)} • 4h/6h valorizzati {n4}/{len(df_pairs_for_view)}")
+    except Exception:
+        pass
 else:
     st.caption("Nessuna coppia disponibile con i filtri attuali.")
 
@@ -738,7 +801,6 @@ else:
     c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
-    # Vol24 OK sul dataset attuale (già filtrato): utile a colpo d'occhio
     if vmin is None: vmin = 0
     if vmax > 0:
         c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vmax))
