@@ -1,6 +1,6 @@
-# streamlit_app.py — Meme Radar (Streamlit) v9.2
-# Novità v9.2: integrazione GetMoni (SocialSentimentAnalyzer) con filtro su segnali + colonne social.
-# Confermati: Bubblemaps anti-cluster, LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, CSV, alert Telegram.
+# streamlit_app.py — Meme Radar (Streamlit) v10
+# Novità v10: anti-duplicati + cooldown + time-stop + pyramiding opz.
+# Confermati: Bubblemaps anti-cluster, GetMoni social filter, LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, Telegram base.
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -16,7 +16,7 @@ except Exception:
 from market_data import MarketDataProvider
 from trading import RiskConfig, StratConfig, TradeEngine
 from bubblemaps_client import check_wallet_clusters
-from getmoni_client import SocialSentimentAnalyzer  # <--- NEW
+from getmoni_client import SocialSentimentAnalyzer
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -122,6 +122,23 @@ with st.sidebar:
     strat_meme = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 75), key="strat_meme")
     strat_txns = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 300), step=50, key="strat_txns")
 
+    # --- Regole anti-duplicato & timing ---
+    st.markdown("**Regole anti-duplicato & timing**")
+    colx1, colx2, colx3 = st.columns(3)
+    with colx1:
+        max_per_symbol = st.number_input("Max per simbolo", min_value=1, value=int(st.session_state.get("max_per_symbol", 1)), step=1, key="max_per_symbol")
+    with colx2:
+        cooldown_min = st.number_input("Cooldown (min)", min_value=0, value=int(st.session_state.get("cooldown_min", 20)), step=5, key="cooldown_min")
+    with colx3:
+        time_stop_min = st.number_input("Time-stop (min, 0=off)", min_value=0, value=int(st.session_state.get("time_stop_min", 60)), step=5, key="time_stop_min")
+
+    colp1, colp2 = st.columns(2)
+    with colp1:
+        allow_pyr = st.toggle("Abilita pyramiding", value=bool(st.session_state.get("allow_pyr", False)), key="allow_pyr")
+    with colp2:
+        add_on_pct = st.slider("Trigger add-on (%)", 1, 25, int(st.session_state.get("add_on_pct", 8)), key="add_on_pct",
+                               help="Apre un'add-on solo se il prezzo è già salito di almeno questa % dall'ultimo ingresso")
+
     BUBBLEMAPS_API_KEY = st.text_input("BUBBLEMAPS_API_KEY", value=os.getenv("BUBBLEMAPS_API_KEY",""), type="password", help="Filtro anti-cluster")
 
     # ---------- GetMoni (nuovo) ----------
@@ -144,14 +161,14 @@ with st.sidebar:
         height=100
     )
 
-# 🔁 refresh token
+# 🔁 Auto-refresh (pausa se WS attivo)
 if auto_refresh and not pump_enable:
     try: st.query_params.update({"_": str(int(time.time() // REFRESH_SEC))})
     except Exception: pass
 else:
     if pump_enable: st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
 
-# ---------------- Helpers & scoring (stessa logica di v9.1, omesso per brevità nei commenti) ----------------
+# ---------------- Helpers ----------------
 def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
     last = (None, None)
     for i in range(tries):
@@ -206,6 +223,7 @@ def safe_sort(df, col, ascending=False):
     if df is None or df.empty or col not in df.columns: return df
     return df.sort_values(by=[col], ascending=ascending)
 
+# Meme Score helpers
 STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
 WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
 DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
@@ -250,6 +268,7 @@ if "provider" not in st.session_state:
     prov.start_auto_refresh()
 provider: MarketDataProvider = st.session_state["provider"]
 
+# Filtri provider
 try:
     if disable_all_filters:
         provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
@@ -260,6 +279,7 @@ except Exception:
                          min_liq=min_liq if not disable_all_filters else 0,
                          exclude_quotes=[])
 
+# Snapshot provider
 df_provider, ts = provider.get_snapshot()
 codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
@@ -285,7 +305,7 @@ if watchlist_only and not df_view.empty:
     df_view = df_view[mask].reset_index(drop=True)
 post_count = len(df_view)
 
-# KPI base
+# ---------------- KPI base ----------------
 if df_view.empty:
     vol24_avg = None; tx1h_avg = None
 else:
@@ -295,7 +315,7 @@ else:
 if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
-# Nuove coin — Birdeye + Fallback
+# ---------------- Nuove coin — Birdeye + Fallback ----------------
 be_headers = {"accept": "application/json"}
 be_key = os.getenv("BE_API_KEY","")
 if be_key: be_headers["x-api-key"] = be_key
@@ -334,7 +354,7 @@ if vol24_avg is not None and vol24_avg > 0:
     elif vol24_avg > 200_000: score = "MEDIO"
     else: score = "FIACCO"
 
-# KPI UI
+# ---------------- KPI UI ----------------
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     tone = {"ON FIRE":"🟢","MEDIO":"🟡","FIACCO":"🔴","N/D":"⚪️"}.get(score,"")
@@ -343,7 +363,7 @@ with c2: st.metric("Volume 24h medio Top 10", fmt_int(vol24_avg))
 with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
-# Charts
+# ---------------- Charts ----------------
 left, right = st.columns(2)
 with left:
     if not df_view.empty:
@@ -363,7 +383,7 @@ with right:
         fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
         st.plotly_chart(fig2, use_container_width=True)
 
-# Tabella pairs con Meme Score
+# ---------------- Tabella pairs con Meme Score ----------------
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
@@ -409,7 +429,7 @@ if not df_pairs.empty:
         }
     )
 
-# Top 10 per Meme Score
+# ---------------- Top 10 per Meme Score ----------------
 st.markdown("### Top 10 per Meme Score")
 if not df_pairs.empty:
     top10_meme = df_pairs.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]).head(10)
@@ -489,9 +509,20 @@ def sent_check(symbol: str, base_addr: str):
     return st.session_state["gm_analyzer"].analyze(symbol)
 
 # costruzione TradeEngine
-r_cfg = RiskConfig(position_usd=float(st.session_state.get("pos_usd",50.0)), max_positions=int(st.session_state.get("max_pos",3)),
-                   stop_loss_pct=float(st.session_state.get("stop_pct",20))/100.0, take_profit_pct=float(st.session_state.get("tp_pct",40))/100.0,
-                   trailing_pct=float(st.session_state.get("trail_pct",15))/100.0, daily_loss_limit_usd=float(st.session_state.get("day_loss",200.0)))
+r_cfg = RiskConfig(
+    position_usd=float(st.session_state.get("pos_usd",50.0)),
+    max_positions=int(st.session_state.get("max_pos",3)),
+    stop_loss_pct=float(st.session_state.get("stop_pct",20))/100.0,
+    take_profit_pct=float(st.session_state.get("tp_pct",40))/100.0,
+    trailing_pct=float(st.session_state.get("trail_pct",15))/100.0,
+    daily_loss_limit_usd=float(st.session_state.get("day_loss",200.0)),
+    # NEW anti-duplicati
+    max_positions_per_symbol=int(st.session_state.get("max_per_symbol",1)),
+    symbol_cooldown_min=int(st.session_state.get("cooldown_min",20)),
+    allow_pyramiding=bool(st.session_state.get("allow_pyr", False)),
+    pyramid_add_on_trigger_pct=float(st.session_state.get("add_on_pct",8))/100.0,
+    time_stop_min=int(st.session_state.get("time_stop_min",60)),
+)
 s_cfg = StratConfig(meme_score_min=int(st.session_state.get("strat_meme",75)), txns1h_min=int(st.session_state.get("strat_txns",300)),
                     liq_min=float(liq_min_sweet), liq_max=float(liq_max_sweet),
                     allow_dex=("raydium","orca","meteora"))
@@ -559,9 +590,145 @@ else:
     else:
         st.caption("Nessuna chiusura → curva PnL in attesa.")
 
-# ---------------- LIVE Pump.fun + Moralis (come v9.1) ----------------
-# (codice identico alla tua versione precedente — omesso qui per compattezza se già presente)
-# Se nella tua repo hai già la classe PumpFunLive e le funzioni moralis_new_tokens, lasciale invariate.
+# ---------------- LIVE Pump.fun (WS) + Fallback Moralis ----------------
+class PumpFunLive:
+    def __init__(self, max_rows=200, api_key: str | None = None, ua: str | None = None):
+        self.max_rows = int(max_rows); self.api_key = api_key
+        base = "wss://pumpportal.fun/api/data"
+        self.url = f"{base}?api-key={api_key}" if api_key else base
+        self.headers = ["Origin: https://pumpportal.fun", f"User-Agent: {ua or 'MemeRadar/1.0 (+streamlit)'}"]
+        self._rows = []; self._lock = threading.Lock(); self._stop = threading.Event()
+        self._ws = None; self._thread = None; self._last_err = None; self._connected = False; self._last_close = None
+    def start(self):
+        if self._thread and self._thread.is_alive(): return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="PumpFunLive", daemon=True); self._thread.start()
+    def reconnect_now(self):
+        self.stop(); time.sleep(0.2); self.start()
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._ws: self._ws.close()
+        except Exception: pass
+    def _on_open(self, ws):
+        self._connected = True; self._last_err = None
+        try: ws.send(json.dumps({"method": "subscribeNewToken"}))
+        except Exception as e: self._last_err = f"on_open send err: {e}"
+    def _on_message(self, ws, message: str):
+        try:
+            data = json.loads(message) if isinstance(message, (str, bytes, bytearray)) else message
+            mint   = data.get("mint") or data.get("token") or data.get("mintAddress") or data.get("address")
+            name   = data.get("name") or data.get("tokenName") or data.get("symbol") or ""
+            symbol = data.get("symbol") or ""
+            creator= data.get("creator") or data.get("user") or data.get("owner") or ""
+            ts = (data.get("createdTimestamp") or data.get("createdOn") or data.get("createdAt") or int(time.time()))
+            if not mint: return
+            row = {"Mint": mint,"Name": name,"Symbol": symbol,"Creator": creator,
+                   "Created (UTC)": ms_to_dt(ts),"Age": fmt_age(hours_since_ms(ts)),
+                   "Pump.fun": f"https://pump.fun/coin/{mint}","Solscan": f"https://solscan.io/token/{mint}"}
+            with self._lock:
+                if any(r["Mint"] == mint for r in self._rows): return
+                self._rows.insert(0, row); 
+                if len(self._rows) > self.max_rows: self._rows = self._rows[:self.max_rows]
+        except Exception as e: self._last_err = f"on_message err: {e}"
+    def _on_error(self, ws, error): self._last_err = f"{error}"
+    def _on_close(self, ws, code, msg): self._connected = False; self._last_close = f"code={code}, reason={msg}"
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._ws = websocket.WebSocketApp(self.url, header=self.headers,
+                    on_open=self._on_open, on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
+                self._ws.run_forever(ping_interval=20, ping_timeout=10, ping_payload="ping")
+            except Exception as e: self._last_err = f"run_forever err: {e}"
+            if not self._stop.is_set(): time.sleep(1.5 + random.uniform(0, 2.0))
+    def snapshot_df(self) -> pd.DataFrame:
+        with self._lock: return pd.DataFrame(self._rows).copy()
+    def status(self):
+        info = []
+        if self._last_err: info.append(f"err={self._last_err}")
+        if self._last_close: info.append(f"close={self._last_close}")
+        return ("connected" if self._connected else "disconnected", " • ".join(info) if info else None)
+
+# init live
+if "pump_live" not in st.session_state: st.session_state["pump_live"] = None
+if pump_enable and websocket is None:
+    st.warning("Installa `websocket-client` in requirements.txt per attivare il feed live.")
+elif pump_enable and websocket is not None:
+    if st.session_state["pump_live"] is None:
+        st.session_state["pump_live"] = PumpFunLive(max_rows=pump_buffer, api_key=os.getenv("PUMP_API_KEY","")); st.session_state["pump_live"].start()
+    else:
+        st.session_state["pump_live"].max_rows = int(pump_buffer)
+else:
+    if st.session_state["pump_live"] is not None:
+        st.session_state["pump_live"].stop(); st.session_state["pump_live"] = None
+
+def moralis_new_tokens(exchange: str, limit: int = 20, api_key: str | None = None) -> pd.DataFrame:
+    if not api_key:
+        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
+    url = f"https://solana-gateway.moralis.io/token/mainnet/exchange/{exchange}/new?limit={int(limit)}"
+    headers = {"X-API-Key": api_key, **UA_HEADERS}
+    data, code = fetch_with_retry(url, headers=headers)
+    if not data:
+        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
+    items = data.get("result") or data.get("data") or data.get("tokens") or data.get("items") or data
+    if not isinstance(items, list): items = []
+    rows = []
+    for t in items:
+        mint = t.get("mint") or t.get("tokenAddress") or t.get("token_address") or t.get("address") or t.get("id")
+        name = t.get("name") or t.get("tokenName") or t.get("symbol") or ""
+        symbol = t.get("symbol") or ""
+        ts = t.get("createdAt") or t.get("created_time") or t.get("creationTime") or t.get("createdTimestamp") or 0
+        rows.append({"Mint": mint or "", "Name": name, "Symbol": symbol,
+                     "Created (UTC)": ms_to_dt(ts) if ts else "", "Age": fmt_age(hours_since_ms(ts)) if ts else "",
+                     "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "", "Solscan": f"https://solscan.io/token/{mint}" if mint else ""})
+    df = pd.DataFrame(rows)
+    if not df.empty: df = df.drop_duplicates(subset=["Mint"]).reset_index(drop=True)
+    return df
+
+st.markdown("## 🔴 LIVE: New on Pump.fun")
+if pump_enable and st.session_state["pump_live"] and websocket is not None:
+    p = st.session_state["pump_live"]
+    status, last_info = p.status()
+    col_stat, col_btn = st.columns([3,1])
+    with col_stat:
+        st.caption(f"WebSocket: {status}" + (f" • {last_info}" if last_info else ""))
+    with col_btn:
+        if st.button("🔁 Riconnetti WS"): p.reconnect_now()
+
+    df_live = p.snapshot_df()
+    keys = [k.strip().lower() for k in (pump_keywords or "").split(",") if k.strip()]
+    if not df_live.empty and keys:
+        def match_row(r):
+            s = (str(r.get("Name","")) + " " + str(r.get("Symbol",""))).lower()
+            return any(k in s for k in keys)
+        df_live = df_live[df_live.apply(match_row, axis=1)].reset_index(drop=True)
+
+    if not df_live.empty:
+        st.dataframe(df_live.head(50), use_container_width=True,
+                     column_config={"Pump.fun": st.column_config.LinkColumn("Pump.fun"),
+                                    "Solscan": st.column_config.LinkColumn("Solscan")})
+        # (opz) invio Telegram su match keyword
+        if pump_alert_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and keys:
+            try:
+                hit = df_live.iloc[0].to_dict()
+                text = f"🆕 Pump.fun: {hit.get('Name','')} ({hit.get('Symbol','')})\n{hit.get('Pump.fun','')}"
+                requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                             params={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+            except Exception:
+                pass
+    else:
+        st.info("In ascolto… nessun evento finora.")
+        if moralis_enable and MORALIS_API_KEY:
+            df_fb = moralis_new_tokens(moralis_exchange, moralis_limit, MORALIS_API_KEY)
+            if not df_fb.empty:
+                st.markdown("**Ultimi token (HTTP fallback — Moralis)**")
+                st.dataframe(df_fb.head(moralis_limit), use_container_width=True,
+                             column_config={"Pump.fun": st.column_config.LinkColumn("Pump.fun"),
+                                            "Solscan": st.column_config.LinkColumn("Solscan")})
+        elif moralis_enable and not MORALIS_API_KEY:
+            st.caption("Per il fallback Moralis inserisci una MORALIS_API_KEY (free).")
+else:
+    st.caption("Attiva “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
 
 # ---------------- Diagnostica ----------------
 st.subheader("Diagnostica")
