@@ -151,7 +151,7 @@ class PaperBroker:
             "reason": reason,
         })
 
-# ---------------- Strategia: Momentum + Meme Score (più permissiva) ----------------
+# ---------------- Strategia ----------------
 @dataclass
 class StratConfig:
     meme_score_min: int = 75
@@ -174,40 +174,39 @@ class StrategyMomentumV1:
         except Exception:
             return False
 
-        # Filtri hard
         if liq < self.cfg.liq_min or liq > self.cfg.liq_max: 
             return False
         if self.cfg.allow_dex and dex not in self.cfg.allow_dex: 
             return False
 
-        # Regola principale
         if meme >= self.cfg.meme_score_min and tx1h >= self.cfg.txns1h_min and (chg is None or chg >= -5.0):
             return True
-
-        # Compensazioni soft
         if meme >= self.cfg.meme_score_min + 10 and tx1h >= int(self.cfg.txns1h_min * 0.6) and (chg is None or chg >= -8.0):
             return True
         if tx1h >= self.cfg.txns1h_min + 150 and (chg is None or chg >= -10.0):
             return True
-
         return False
 
 # ---------------- Trade Engine ----------------
 class TradeEngine:
     """
-    Collega strategia + broker + risk. Supporta filtro Bubblemaps via callback.
+    Collega strategia + broker + risk.
+    Supporta:
+      - bm_check(token_address) -> dict    # Bubblemaps anti-cluster
+      - sent_check(symbol, base_addr, base_symbol) -> dict  # GetMoni social
     """
-    def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig, bm_check=None):
+    def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig, bm_check=None, sent_check=None):
         self.risk = RiskManager(risk_cfg)
         self.broker = PaperBroker(self.risk)
         self.strategy = StrategyMomentumV1(strat_cfg)
-        self.bm_check = bm_check  # funzione(token_address) -> dict
+        self.bm_check = bm_check
+        self.sent_check = sent_check
 
     def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         prices: Dict[str, float] = {}
         candidates: List[Dict] = []
 
-        # 1) scan segnali
+        # 1) scan segnali (tecnici)
         for r in df_pairs.to_dict(orient="records"):
             sym = r.get("Pair","")
             last = float(r.get("Price (USD)") or 0.0)
@@ -222,9 +221,10 @@ class TradeEngine:
                     "Price (USD)": last,
                     "Link": r.get("Link",""),
                     "Base Address": r.get("Base Address","") or r.get("baseAddress",""),
+                    "Base Symbol": (r.get("Pair","").split("/")[0] if r.get("Pair") else r.get("baseSymbol","")),
                 })
 
-        # --- Bubblemaps anti-cluster ---
+        # 2) Bubblemaps anti-cluster
         filtered = []
         for c in candidates:
             addr = c.get("Base Address") or ""
@@ -234,7 +234,7 @@ class TradeEngine:
                     bm = self.bm_check(addr)
                     if bm.get("is_high_risk"):
                         bm_ok = "HIGH"
-                        continue  # ESCLUSO dalle negoziazioni
+                        continue
                     else:
                         bm_ok = "OK"
                 except Exception:
@@ -242,19 +242,41 @@ class TradeEngine:
             c["BM Risk"] = bm_ok
             filtered.append(c)
 
-        df_signals = (pd.DataFrame(filtered)
-                        .sort_values(by=["Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
-                        .reset_index(drop=True)
-                      ) if filtered else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk"])
+        # 3) GetMoni — filtro social (facoltativo)
+        filtered2 = []
+        for c in filtered:
+            social = {"passes": True}
+            if self.sent_check:
+                try:
+                    social = self.sent_check(c.get("Base Symbol"), c.get("Base Address"))
+                except Exception:
+                    social = {"passes": True, "err": True}
+            # se non passa -> escludi
+            if not social.get("passes", True):
+                continue
+            # arricchisci riga
+            c["Moni User"] = social.get("username")
+            c["Mentions 24h"] = social.get("mentions_24h")
+            c["Smarts"] = social.get("smarts_count")
+            c["Sentiment"] = social.get("sentiment_score")
+            c["Moni Score"] = social.get("moni_score")
+            filtered2.append(c)
 
-        # 2) apri max 1 posizione per step
+        sort_cols = ["Score","Txns 1h","Liquidity (USD)","Mentions 24h","Smarts","Sentiment"]
+        df_signals = (pd.DataFrame(filtered2)
+                        .sort_values(by=[c for c in sort_cols if c in (filtered2[0].keys() if filtered2 else [])],
+                                     ascending=[False]*len(sort_cols) if filtered2 else True)
+                        .reset_index(drop=True)
+                      ) if filtered2 else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"])
+
+        # 4) apri max 1 posizione per step
         if not df_signals.empty and self.risk.can_open(len(self.broker.positions)):
             top = df_signals.iloc[0].to_dict()
             sym = top["Pair"]; px = float(top["Price (USD)"] or 0.0)
             if px > 0:
-                self.broker.open_long(sym, label=f"{top['DEX']} | S{top['Score']}", price=px, usd_amount=self.risk.cfg.position_usd)
+                self.broker.open_long(sym, label=f"{top.get('DEX','')} | S{top.get('Score',0)}", price=px, usd_amount=self.risk.cfg.position_usd)
 
-        # 3) mark-to-market & uscite
+        # 5) mark-to-market & uscite
         df_open, df_closed = self.broker.mark_to_market(prices)
         return df_signals, df_open, df_closed
 
