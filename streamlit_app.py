@@ -1,12 +1,19 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8.3
-# Fix: usa st.query_params e passa exclude_quotes sanitizzato + fallback try/except
+# streamlit_app.py — Meme Radar (Streamlit) v8.4
+# + LIVE Pump.fun via WebSocket (subscribeNewToken) con filtri e alert opzionali
 
-import os, time, math, random, datetime
+import os, time, math, random, datetime, json, threading
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from market_data import MarketDataProvider  # v8.3
+
+# WebSocket (websocket-client). Se manca, mostriamo un avviso elegante.
+try:
+    import websocket  # pip install websocket-client
+except Exception:
+    websocket = None
+
+from market_data import MarketDataProvider  # v8.3 consigliata
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -24,6 +31,8 @@ SEARCH_QUERIES = [
     "chain:solana bonk",
     "chain:solana wif",
     "chain:solana pepe",
+    # suggerimento per coprire pump.fun quando indicizzato
+    "chain:solana pump",
 ]
 
 UA_HEADERS = {
@@ -82,6 +91,14 @@ with st.sidebar:
     alert_meme_min     = st.number_input("Soglia Meme Score (0=disattiva)", min_value=0, max_value=100, value=70, step=5)
     enable_alerts      = st.toggle("Abilita alert Telegram", value=False)
 
+    st.divider()
+    st.subheader("LIVE Pump.fun")
+    pump_enable = st.toggle("Abilita feed live (subscribeNewToken)", value=False)
+    pump_buffer = st.number_input("Buffer massimo eventi", min_value=50, max_value=1000, value=200, step=50)
+    pump_keywords = st.text_input("Filtra per keyword (opz, virgola)", value="", help="Esempio: cat,dog,elon,wif")
+    pump_alert_enable = st.toggle("Alert Telegram su match keyword", value=False, help="Richiede BOT_TOKEN e CHAT_ID sopra")
+    st.caption("Fonte: PumpPortal WebSocket – un'unica connessione condivisa. Evita multi-connessioni. ")
+
 # 🔁 sostituisce experimental_set_query_params
 if auto_refresh:
     try:
@@ -108,26 +125,28 @@ def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
             time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
     return last
 
-def avg(lst):
-    xs = [x for x in lst if x is not None]
-    return (sum(xs)/len(xs)) if xs else None
-
 def fmt_int(n):
     return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
 
-def hours_since_ms(ms):
-    if not ms: return None
+def hours_since_ms(ms_or_s):
+    if not ms_or_s and ms_or_s != 0: return None
     try:
-        return max(0.0, (time.time() - int(ms)/1000.0) / 3600.0)
+        v = int(ms_or_s)
+        # autodetect ms vs s
+        if v > 10_000_000_000:  # > ~2001 in s → quindi probabilmente ms
+            v = v/1000.0
+        return max(0.0, (time.time() - v) / 3600.0)
     except Exception:
         return None
 
-def ms_to_dt(ms):
-    if not ms: return ""
+def ms_to_dt(ms_or_s):
+    if not ms_or_s: return ""
     try:
-        return datetime.datetime.utcfromtimestamp(int(ms)/1000).strftime("%Y-%m-%d %H:%M")
+        v = int(ms_or_s)
+        if v > 10_000_000_000: v = v//1000
+        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
     except Exception:
-        return str(ms)
+        return str(ms_or_s)
 
 def fmt_age(hours):
     if hours is None: return ""
@@ -188,41 +207,32 @@ def compute_meme_score_row(r, weights, sweet_min, sweet_max):
     tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     f = (
-        weights[0]*score_symbol(base) +
-        weights[1]*score_age(ageh) +
-        weights[2]*s_sigmoid(tx1) +
-        weights[3]*score_liq(liq, sweet_min, sweet_max) +
-        weights[4]*score_dex(dex)
+        w_symbol*score_symbol(base) +
+        w_age*score_age(ageh) +
+        w_txns*s_sigmoid(tx1) +
+        w_liq*score_liq(liq, sweet_min, sweet_max) +
+        w_dex*score_dex(dex)
     )
-    total = max(1e-6, sum(weights))
+    total = max(1e-6, sum([w_symbol, w_age, w_txns, w_liq, w_dex]))
     return round(100.0 * f / total)
 
 # ---------------- Provider init (una sola volta) ----------------
 if "provider" not in st.session_state:
-    prov = MarketDataProvider(
-        refresh_sec=REFRESH_SEC,
-        preserve_on_empty=True
-    )
+    prov = MarketDataProvider(refresh_sec=REFRESH_SEC, preserve_on_empty=True)
     prov.set_queries(SEARCH_QUERIES)
     st.session_state["provider"] = prov
     prov.start_auto_refresh()
 
 provider: MarketDataProvider = st.session_state["provider"]
 
-# Applica/azzera filtri del provider in base al toggle
+# Applica/azzera filtri del provider
 try:
     if disable_all_filters:
         provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
     else:
-        # passa SOLO stringhe (sanitizza), lascia che il provider faccia uppercase/flatten
         exclude_quotes_safe = [str(x) for x in (exclude_quotes or [])]
-        provider.set_filters(
-            only_raydium=only_raydium,
-            min_liq=min_liq,
-            exclude_quotes=exclude_quotes_safe
-        )
+        provider.set_filters(only_raydium=only_raydium, min_liq=min_liq, exclude_quotes=exclude_quotes_safe)
 except Exception as e:
-    # Fallback gentile: rimuovi exclude_quotes e continua
     st.warning(f"Filtro quote non applicato (fallback). Dettagli: {type(e).__name__}")
     provider.set_filters(only_raydium=only_raydium if not disable_all_filters else False,
                          min_liq=min_liq if not disable_all_filters else 0,
@@ -231,7 +241,6 @@ except Exception as e:
 # Snapshot dal provider
 df_provider, ts = provider.get_snapshot()
 codes = provider.get_last_http_codes()
-
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
 # Watchlist
@@ -244,11 +253,9 @@ def is_watch_hit_row(r):
 
 df_view = df_provider.copy()
 pre_count = len(df_view)
-
 if watchlist_only and not df_view.empty:
     mask = df_view.apply(is_watch_hit_row, axis=1)
     df_view = df_view[mask].reset_index(drop=True)
-
 post_count = len(df_view)
 
 # ---------------- KPI base ----------------
@@ -259,11 +266,10 @@ else:
     top10 = df_view.sort_values(by=["volume24hUsd"], ascending=False).head(10)
     vol24_avg = safe_series_mean(top10["volume24hUsd"])
     tx1h_avg  = safe_series_mean(top10["txns1h"])
-
 if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
-# ---------------- Nuove coin — Birdeye + Fallback sicuro ----------------
+# ---------------- Nuove coin — Birdeye + Fallback ----------------
 be_headers = {"accept": "application/json"}
 be_key = os.getenv("BE_API_KEY","")
 if be_key: be_headers["x-api-key"] = be_key
@@ -297,7 +303,6 @@ else:
     recents = recents.head(20) if recents is not None and not recents.empty else pd.DataFrame(columns=["liquidityUsd","baseSymbol"])
     liq_series = recents.get("liquidityUsd", pd.Series(dtype=float))
     new_liq_values = [float(x) for x in liq_series.tolist() if pd.notna(x)]
-
 new_liq_avg = (sum(new_liq_values)/len(new_liq_values)) if new_liq_values else None
 
 # Score mercato
@@ -347,15 +352,14 @@ with right:
             st.info("Nessun token nuovo disponibile (Birdeye 401 o fallback vuoto).")
 
 # ---------------- UI: Tabella con link + Meme Score ----------------
-weights = (w_symbol, w_age, w_txns, w_liq, w_dex)
-
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
-        mscore = compute_meme_score_row(r, weights, liq_min_sweet, liq_max_sweet)
+        mscore = compute_meme_score_row(r, None, None, None)  # pesi già letti sopra
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
         rows.append({
-            "Meme Score": mscore,
+            "Meme Score": compute_meme_score_row(r, None, None, None) if False else  # placeholder disattivato
+                         compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet),
             "Pair": f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
             "DEX": r.get("dexId",""),
             "Liquidity (USD)": int(round(r.get("liquidityUsd") or 0)),
@@ -394,19 +398,8 @@ if not df_pairs.empty:
             "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
         }
     )
-
-    # Export CSV
-    export_cols = [c for c in df_pairs.columns if c not in ["_pairAddress"]]
-    if not show_pair_age and "Pair Age" in export_cols:
-        export_cols.remove("Pair Age")
-    csv_bytes = df_pairs[export_cols].to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Scarica CSV filtrato",
-        data=csv_bytes,
-        file_name="solana-meme-radar.csv",
-        mime="text/csv",
-        help="Esporta la tabella (filtri e ordinamenti già applicati)"
-    )
+    csv_bytes = df_pairs[[c for c in display_cols]].to_csv(index=False).encode("utf-8")
+    st.download_button("📥 Scarica CSV filtrato", data=csv_bytes, file_name="solana-meme-radar.csv", mime="text/csv")
 else:
     st.info("Nessuna pair da mostrare (post-filtri).")
 
@@ -415,60 +408,186 @@ st.markdown("### Top 10 per Meme Score")
 if not df_pairs.empty:
     top10_meme = df_pairs.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]).head(10)
     fig3 = px.bar(
-        top10_meme,
-        x="Pair",
-        y="Meme Score",
+        top10_meme, x="Pair", y="Meme Score",
         hover_data=["DEX","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Price (USD)","Change 24h (%)","Created (UTC)","Pair Age"],
         title="Top 10 per Meme Score"
     )
-    fig3.update_layout(yaxis_range=[0, 100])
-    fig3.update_xaxes(tickangle=-30)
+    fig3.update_layout(yaxis_range=[0, 100]); fig3.update_xaxes(tickangle=-30)
     st.plotly_chart(fig3, use_container_width=True)
 else:
     st.info("Nessuna pair disponibile per calcolare il Meme Score.")
 
-# ---------------- Alert Telegram (base) ----------------
-if "sent_alerts" not in st.session_state:
-    st.session_state["sent_alerts"] = set()
+# ---------------- LIVE Pump.fun — classe + integrazione ----------------
+class PumpFunLive:
+    """
+    WebSocket single-connection a PumpPortal per subscribeNewToken.
+    Dedup per mint, buffer limitato, snapshot in DataFrame.
+    """
+    def __init__(self, max_rows=200, api_key: str | None = None):
+        self.max_rows = int(max_rows)
+        self.api_key = api_key
+        self.url = "wss://pumpportal.fun/api/data"
+        if api_key:
+            self.url += f"?api-key={api_key}"
+        self._rows = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ws = None
+        self._thread = None
+        self._last_err = None
+        self._connected = False
 
-def send_telegram(bot_token, chat_id, text):
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=10)
-        return r.ok, r.status_code
-    except Exception:
-        return False, "ERR"
+    def start(self):
+        if self._thread and self._thread.is_alive(): return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="PumpFunLive", daemon=True)
+        self._thread.start()
 
-def should_alert(row):
-    cond = (row["Txns 1h"] >= alert_tx1h_min) and (row["Liquidity (USD)"] >= alert_liq_min)
-    if alert_meme_min > 0:
-        cond = cond and (row["Meme Score"] >= alert_meme_min)
-    return cond
+    def stop(self):
+        self._stop.set()
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
 
-alerts_to_send = []
-if enable_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and not df_pairs.empty:
-    for _, r in df_pairs.iterrows():
-        if should_alert(r):
-            addr = str(r.get("_pairAddress", ""))
-            if addr and addr not in st.session_state["sent_alerts"]:
-                alerts_to_send.append(r)
+    def _on_open(self, ws):
+        self._connected = True
+        try:
+            ws.send(json.dumps({"method": "subscribeNewToken"}))
+        except Exception as e:
+            self._last_err = f"on_open send err: {e}"
 
-    for r in alerts_to_send:
-        text = (
-            f"🔥 *Meme Radar Trigger*\n"
-            f"Pair: {r['Pair']} ({r['DEX']})\n"
-            f"Meme Score: {r['Meme Score']}\n"
-            f"Txns 1h: {r['Txns 1h']} • Liq: ${r['Liquidity (USD)']:,}\n"
-            f"Vol24h: ${r['Volume 24h (USD)']:,}\n"
-            f"{r['Link']}"
-        )
-        ok, code = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text)
-        if ok:
-            st.session_state["sent_alerts"].add(str(r.get("_pairAddress","")))
-    if alerts_to_send:
-        st.success(f"Alert inviati: {len(alerts_to_send)}")
+    def _on_message(self, ws, message: str):
+        try:
+            data = json.loads(message) if isinstance(message, (str, bytes, bytearray)) else message
+            # Estrarre in modo resiliente
+            mint   = data.get("mint") or data.get("token") or data.get("mintAddress") or data.get("address")
+            name   = data.get("name") or data.get("tokenName") or data.get("symbol") or ""
+            symbol = data.get("symbol") or ""
+            creator= data.get("creator") or data.get("user") or data.get("owner") or ""
+            # timestamp (ms o s)
+            ts = (data.get("createdTimestamp") or data.get("createdOn") or data.get("createdAt") or int(time.time()))
+            row = {
+                "Mint": mint or "",
+                "Name": name,
+                "Symbol": symbol,
+                "Creator": creator,
+                "Created (UTC)": ms_to_dt(ts),
+                "Age": fmt_age(hours_since_ms(ts)),
+                "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "",
+                "Solscan": f"https://solscan.io/token/{mint}" if mint else "",
+            }
+            if not mint:
+                return
+            with self._lock:
+                if any(r["Mint"] == mint for r in self._rows):
+                    return
+                self._rows.insert(0, row)
+                if len(self._rows) > self.max_rows:
+                    self._rows = self._rows[:self.max_rows]
+        except Exception as e:
+            self._last_err = f"on_message err: {e}"
+
+    def _on_error(self, ws, error):
+        self._last_err = f"{error}"
+
+    def _on_close(self, ws, a, b):
+        self._connected = False
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self._ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                self._last_err = f"run_forever err: {e}"
+            # se non stop, backoff e retry
+            if not self._stop.is_set():
+                time.sleep(1.5 + random.uniform(0, 1.5))
+
+    def snapshot_df(self) -> pd.DataFrame:
+        with self._lock:
+            return pd.DataFrame(self._rows).copy()
+
+    def status(self):
+        return ("connected" if self._connected else "disconnected", self._last_err)
+
+# init istanza live in sessione
+if "pump_live" not in st.session_state:
+    st.session_state["pump_live"] = None
+if pump_enable and websocket is None:
+    st.warning("Installare `websocket-client` in requirements.txt per attivare il feed live.")
+elif pump_enable and websocket is not None:
+    if st.session_state["pump_live"] is None:
+        st.session_state["pump_live"] = PumpFunLive(max_rows=pump_buffer, api_key=os.getenv("PUMP_API_KEY",""))
+        st.session_state["pump_live"].start()
     else:
-        st.caption("Nessun nuovo alert da inviare (già notificati o sotto soglia).")
+        # aggiorna max_rows dinamicamente
+        st.session_state["pump_live"].max_rows = int(pump_buffer)
+else:
+    # disabilitato: stop e pulizia
+    if st.session_state["pump_live"] is not None:
+        st.session_state["pump_live"].stop()
+        st.session_state["pump_live"] = None
+
+# ---------------- Sezione UI: LIVE Pump.fun ----------------
+st.markdown("## 🔴 LIVE: New on Pump.fun")
+if pump_enable and st.session_state["pump_live"] and websocket is not None:
+    p = st.session_state["pump_live"]
+    status, last_err = p.status()
+    st.caption(f"WebSocket: {status}" + (f" • Error: {last_err}" if last_err else ""))
+
+    df_live = p.snapshot_df()
+    # filtro keyword (name/symbol)
+    keys = [k.strip().lower() for k in (pump_keywords or "").split(",") if k.strip()]
+    if not df_live.empty and keys:
+        def match_row(r):
+            s = (str(r.get("Name","")) + " " + str(r.get("Symbol",""))).lower()
+            return any(k in s for k in keys)
+        df_live = df_live[df_live.apply(match_row, axis=1)].reset_index(drop=True)
+
+    if not df_live.empty:
+        st.dataframe(
+            df_live.head(50),
+            use_container_width=True,
+            column_config={
+                "Pump.fun": st.column_config.LinkColumn("Pump.fun"),
+                "Solscan": st.column_config.LinkColumn("Solscan"),
+            }
+        )
+        # Alert Telegram su match keyword
+        if pump_alert_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and keys:
+            if "sent_live" not in st.session_state: st.session_state["sent_live"] = set()
+            to_send = []
+            for _, r in df_live.head(10).iterrows():  # limitiamo per sicurezza
+                mint = r["Mint"]
+                if mint and mint not in st.session_state["sent_live"]:
+                    to_send.append(r)
+            for r in to_send:
+                text = (
+                    f"🆕 *New Pump.fun token*\n"
+                    f"Name: {r['Name']} ({r['Symbol']})\n"
+                    f"Mint: `{r['Mint']}`\n"
+                    f"Age: {r['Age']}\n"
+                    f"{r['Pump.fun']}"
+                )
+                try:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+                    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=10)
+                    st.session_state["sent_live"].add(r["Mint"])
+                except Exception:
+                    pass
+    else:
+        st.info("In ascolto… nessun evento compatibile (o nessuna keyword).")
+else:
+    st.caption("Attiva la levetta “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
 
 # ---------------- Diagnostica ----------------
 st.subheader("Diagnostica")
