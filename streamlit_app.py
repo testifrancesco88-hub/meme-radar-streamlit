@@ -1,12 +1,12 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12 Live Mirror
+# streamlit_app.py — Meme Radar (Streamlit) v12.1 Live Mirror + Volume Filter
 # - Scanner Solana (DexScreener + Birdeye per nuove coin)
 # - KPI, Meme Score, grafici, watchlist
+# - Filtro Volume 24h (MIN/MAX) — NUOVO
 # - DEX consentiti (multiselect)
 # - StrategyMomentumV2 + Diagnostica + Adaptive Relax
 # - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
 # - Alert Telegram dalla tabella
 # - LIVE Trading (Jupiter): deeplink o autosign (locale)
-# - RIMOSSI: Bubblemaps / Social (GetMoni) / Pump.fun
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
 import os, time, math, random, datetime, json, threading, base64
@@ -16,7 +16,7 @@ import requests
 import streamlit as st
 
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine  # la tua Strategy V2 in trading.py
+from trading import RiskConfig, StratConfig, TradeEngine  # Strategy V2
 
 # =========================== Jupiter LIVE Connector (inline) ===========================
 JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
@@ -86,7 +86,6 @@ class JupiterConnector:
         if self.cfg.mode == "off":
             return ("off", "Live trading OFF")
 
-        # calcola amountIn in base al mint in input
         if quote_mint == MINT_USDC:
             dec = _TokenRegistry.decimals(MINT_USDC, 6)
             amount_in = int(round(amount_quote_usd * (10 ** dec)))
@@ -127,7 +126,6 @@ class JupiterConnector:
     def _autosign_swap(self, input_mint: str, output_mint: str, amount_in: int, swap_mode: str):
         if not (self.cfg.rpc_url and self.cfg.public_key and self.cfg.private_key_b58):
             return ("error", "Autosign richiede RPC_URL, PUBLIC_KEY e PRIVATE_KEY")
-        # quote
         q = _jget(JUP_QUOTE, params={
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -136,7 +134,6 @@ class JupiterConnector:
             "swapMode": swap_mode,
             "onlyDirectRoutes": "false",
         })
-        # swap build
         s = _jpost(JUP_SWAP, {
             "userPublicKey": self.cfg.public_key,
             "wrapAndUnwrapSol": True,
@@ -149,7 +146,6 @@ class JupiterConnector:
         if not tx_b64:
             return ("error", f"swapTransaction mancante: {s}")
 
-        # firma + invio (richiede solana + solders)
         try:
             from solana.rpc.api import Client
             from solana.keypair import Keypair
@@ -218,6 +214,11 @@ with st.sidebar:
     watchlist_only = st.toggle("Mostra solo watchlist", value=False)
 
     st.divider()
+    st.subheader("Filtro Volume 24h (USD) — NUOVO")
+    vol24_min = st.number_input("Volume 24h MIN", min_value=0, value=st.session_state.get("vol24_min", 0), step=10000, key="vol24_min")
+    vol24_max = st.number_input("Volume 24h MAX (0 = illimitato)", min_value=0, value=st.session_state.get("vol24_max", 0), step=100000, key="vol24_max")
+
+    st.divider()
     st.subheader("Meme Score")
     sort_by_meme = st.toggle("Ordina per Meme Score (desc)", value=True)
     liq_min_sweet = st.number_input("Sweet spot liquidity MIN", min_value=0, value=10000, step=1000)
@@ -253,13 +254,11 @@ with st.sidebar:
     enable_alerts      = st.toggle("Abilita alert Telegram", value=False)
     def _tg_send_test():
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            st.warning("Inserisci BOT_TOKEN e CHAT_ID prima del test.")
-            return
+            st.warning("Inserisci BOT_TOKEN e CHAT_ID prima del test."); return
         try:
             rq = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                               params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar — Telegram OK", "disable_web_page_preview": True}, timeout=15)
-            if rq.ok: st.success("Messaggio di test inviato ✅")
-            else: st.error(f"Telegram {rq.status_code}.")
+            st.success("Messaggio di test inviato ✅" if rq.ok else f"Telegram {rq.status_code}.")
         except Exception as e:
             st.error(f"Errore Telegram: {e}")
     if st.button("Test Telegram"): _tg_send_test()
@@ -326,12 +325,12 @@ with st.sidebar:
         allow_pyr = st.toggle("Abilita pyramiding", value=bool(st.session_state.get("allow_pyr", False)), key="allow_pyr")
     with colp2:
         add_on_pct = st.slider("Trigger add-on (%)", 1, 25, int(st.session_state.get("add_on_pct", 8)), key="add_on_pct",
-                               help="Apre un'add-on solo se il prezzo è già salito di almeno questa % dall'ultimo ingresso")
+                               help="Apre un'add-on solo se il prezzo è a favore di almeno questa %")
 
     st.divider()
     st.subheader("Live Trading (Jupiter)")
     live_mode = st.selectbox("Modalità", ["off","deeplink","autosign"], index=0,
-                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua, non cloud).")
+                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua).")
     slip_bps  = st.number_input("Slippage (bps)", min_value=10, value=100, step=10)
     rpc_url   = st.text_input("RPC URL (solo autosign)", value=os.getenv("SOL_RPC_URL",""))
     pub_key   = st.text_input("WALLET Public Key (solo autosign)", value=os.getenv("WALLET_PUB",""))
@@ -488,32 +487,45 @@ df_provider, ts = provider.get_snapshot()
 codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
-# Watchlist
+# Watchlist & Volume filter pipeline
+df_view = df_provider.copy()
+pre_count = len(df_view)
+
 def norm_list(s):
     out = []
     for part in (s or "").replace(" ", "").split(","):
         if not part: continue
         out.append(part.upper() if len(part) <= 8 else part)
     return out
-watchlist = norm_list(watchlist_input)
+watchlist = norm_list(st.session_state.get("watchlist_input", ""))  # not used directly
 def is_watch_hit_row(r):
     base = str(r.get("baseSymbol","")).upper() if hasattr(r,"get") else str(r["baseSymbol"]).upper()
     quote= str(r.get("quoteSymbol","")).upper() if hasattr(r,"get") else str(r["quoteSymbol"]).upper()
     addr = r.get("pairAddress","") if hasattr(r,"get") else r["pairAddress"]
     return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
 
-df_view = df_provider.copy()
-pre_count = len(df_view)
-if watchlist_only and not df_view.empty:
+# Applica watchlist_only
+watchlist_input = st.session_state.get("watchlist_input", "")
+watchlist = norm_list(watchlist_input)
+if st.session_state.get("watchlist_only", False) and not df_view.empty:
     mask = df_view.apply(is_watch_hit_row, axis=1)
     df_view = df_view[mask].reset_index(drop=True)
-post_count = len(df_view)
+post_watch_count = len(df_view)
 
-# ---------------- KPI base ----------------
-if df_view.empty:
+# Applica filtro Volume 24h (NUOVO)
+vmin = int(st.session_state.get("vol24_min", 0))
+vmax = int(st.session_state.get("vol24_max", 0))
+if not df_view.empty:
+    vol_series = pd.to_numeric(df_view["volume24hUsd"], errors="coerce").fillna(0)
+    mask_vol = (vol_series >= vmin) & ((vol_series <= vmax) if vmax > 0 else True)
+    df_view = df_view[mask_vol].reset_index(drop=True)
+post_vol_count = len(df_view)
+
+# ---------------- KPI base (calcolati prima del filtro volume per stabilità) ----------------
+if df_provider.empty:
     vol24_avg = None; tx1h_avg = None
 else:
-    top10 = df_view.sort_values(by=["volume24hUsd"], ascending=False).head(10)
+    top10 = df_provider.sort_values(by=["volume24hUsd"], ascending=False).head(10)
     vol24_avg = safe_series_mean(top10["volume24hUsd"])
     tx1h_avg  = safe_series_mean(top10["txns1h"])
 if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
@@ -567,7 +579,7 @@ with c2: st.metric("Volume 24h medio Top 10", fmt_int(vol24_avg))
 with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
-# ---------------- Charts ----------------
+# ---------------- Charts (post volume filter) ----------------
 left, right = st.columns(2)
 with left:
     if not df_view.empty:
@@ -641,31 +653,9 @@ def market_heat_value(df: pd.DataFrame, topN: int) -> float:
     top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(topN)))
     return float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
 
-def check_row_reasons(row: pd.Series, cfg) -> list[str]:
-    reasons = []
-    try:
-        liq = float(row.get("Liquidity (USD)", 0) or 0)
-        vol = float(row.get("Volume 24h (USD)", 0) or 0)
-        tx1 = int(row.get("Txns 1h", 0) or 0)
-        meme = int(row.get("Meme Score", 0) or 0)
-        chg = row.get("Change 24h (%)", None)
-        chg = float(chg) if chg is not None else 0.0
-        dex = str(row.get("DEX", "")).lower()
-    except Exception:
-        return ["parse"]
-
-    if not (float(liq_min_sweet) <= liq <= float(liq_max_sweet)): reasons.append("liq")
-    if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex: reasons.append("dex")
-    if meme < int(st.session_state.get("strat_meme", cfg.meme_score_min)): reasons.append("meme")
-    if tx1 < int(st.session_state.get("strat_txns", cfg.txns1h_min)): reasons.append("tx1h")
-    turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
-    if turnover < float(st.session_state.get("strat_turnover", cfg.turnover_min)): reasons.append("turnover")
-    if chg < float(st.session_state.get("chg_min", cfg.chg24_min)) or chg > float(st.session_state.get("chg_max", cfg.chg24_max)): reasons.append("chg24")
-    return reasons
-
 st.markdown("### Diagnostica strategia")
 if df_pairs is None or df_pairs.empty:
-    st.caption("Nessuna coppia post-filtri provider.")
+    st.caption("Nessuna coppia post-filtri provider/watchlist/volume.")
 else:
     heat_val = market_heat_value(df_pairs, int(st.session_state.get("heat_topN", 10)))
     heat_thr = float(st.session_state.get("strat_heat_avg", 120))
@@ -685,59 +675,29 @@ else:
         except Exception: return 0
 
     c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
-    c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))  # noqa
+    c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
+    # Vol24 OK sul dataset attuale (già filtrato): utile a colpo d'occhio
+    vmin = int(st.session_state.get("vol24_min", 0)); vmax = int(st.session_state.get("vol24_max", 0))
+    if vmax > 0:
+        c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vmax))
+    else:
+        c_vol = cnt((s["Volume 24h (USD)"] >= vmin))
     c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
     c_chg  = cnt((chg_series >= float(st.session_state.get("chg_min", -8))) & (chg_series <= float(st.session_state.get("chg_max", 180))))
 
-    cols = st.columns(7)
+    cols = st.columns(8)
     cols[0].metric("Totale", total)
     cols[1].metric("Liq OK", c_liq)
     cols[2].metric("DEX OK", c_dex)
     cols[3].metric("Meme OK", c_meme)
     cols[4].metric("Tx1h OK", c_tx)
-    cols[5].metric("Turnover OK", c_turn)
-    cols[6].metric("Change24 OK", c_chg)
+    cols[5].metric("Vol24 OK", c_vol)
+    cols[6].metric("Turnover OK", c_turn)
+    cols[7].metric("Change24 OK", c_chg)
 
-    try:
-        cfg_tmp = StratConfig(
-            meme_score_min=int(st.session_state.get("strat_meme",70)),
-            txns1h_min=int(st.session_state.get("strat_txns",250)),
-            liq_min=float(liq_min_sweet),
-            liq_max=float(liq_max_sweet),
-            turnover_min=float(st.session_state.get("strat_turnover",1.2)),
-            chg24_min=float(st.session_state.get("chg_min",-8)),
-            chg24_max=float(st.session_state.get("chg_max",180)),
-            allow_dex=tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])),
-            heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
-            heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
-        )
-    except Exception:
-        cfg_tmp = None
-
-    reasons_all = [check_row_reasons(r, cfg_tmp) for _, r in s.iterrows()] if cfg_tmp else []
-    tech_pass = sum(1 for rs in reasons_all if len(rs) == 0)
-    st.caption(f"Candidati tecnici: **{tech_pass}**")
-
-    near = []
-    for (_, r), rs in zip(s.iterrows(), reasons_all):
-        if len(rs) == 1:
-            near.append({
-                "Pair": r.get("Pair",""),
-                "DEX": r.get("DEX",""),
-                "Meme": int(r.get("Meme Score",0) or 0),
-                "Tx1h": int(r.get("Txns 1h",0) or 0),
-                "Liq": int(r.get("Liquidity (USD)",0) or 0),
-                "Vol24h": int(r.get("Volume 24h (USD)",0) or 0),
-                "Fail": rs[0]
-            })
-    if near:
-        df_near = pd.DataFrame(near).sort_values(by=["Meme","Tx1h","Liq"], ascending=[False,False,False]).head(10)
-        st.markdown("**Bocciati da UN solo filtro (top 10)**")
-        st.dataframe(df_near, use_container_width=True)
-
-# === Adaptive Relax ============================================================
+# === Adaptive Relax (invariato) ================================================
 def _count_candidates(df: pd.DataFrame, cfg) -> int:
     if df is None or df.empty: 
         return 0
@@ -948,7 +908,6 @@ live_cfg = LiveConfig(mode=live_mode, slippage_bps=int(slip_bps),
 jup = JupiterConnector(live_cfg)
 
 def find_mints_for_symbol(symbol: str) -> tuple[str | None, str | None]:
-    # symbol come "BASE/QUOTE"
     try:
         base_sym, quote_sym = (symbol or "").split("/", 1)
     except Exception:
@@ -984,7 +943,7 @@ for tid in list(new_ids):
             continue
         size_usd = float(st.session_state.get("pos_usd", 50.0))
         px_usd   = float(r.get("entry") or r.get("last") or 0.0)
-        mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd, )
+        mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd)
         qty_base_est = size_usd / max(px_usd, 1e-9) if px_usd else 0.0
         st.session_state["live_positions"][tid] = {"symbol":symbol, "base_mint": base_mint, "quote_mint": quote_mint,
                                                    "qty_base": qty_base_est, "last_sig": None, "last_url": None}
@@ -1029,11 +988,12 @@ else:
 
 # ---------------- Diagnostica finale ----------------
 st.subheader("Diagnostica")
-d1, d2, d3, d4 = st.columns(4)
+d1, d2, d3, d4, d5 = st.columns(5)
 with d1: st.text(f"Query provider: {len(SEARCH_QUERIES)}  •  HTTP: {codes if codes else '—'}")
 with d2: st.text(f"Righe provider (post-filtri provider): {pre_count}")
-with d3: st.text(f"Righe dopo watchlist: {post_count}")
-with d4:
+with d3: st.text(f"Righe dopo watchlist: {post_watch_count}")
+with d4: st.text(f"Righe dopo filtro volume: {post_vol_count}")
+with d5:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
 st.caption(f"Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
