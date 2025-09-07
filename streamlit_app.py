@@ -1,5 +1,5 @@
-# streamlit_app.py — Meme Radar (Streamlit) v10.1
-# Novità v10.1: auto-refresh lato client con streamlit-autorefresh (fallback incluso).
+# streamlit_app.py — Meme Radar (Streamlit) v10.2
+# Novità v10.2: auto-refresh lato client + countdown "Prossimo refresh" + pulsante "Aggiorna ora".
 # Confermati: Bubblemaps anti-cluster, GetMoni social filter, anti-duplicati, cooldown, time-stop,
 # LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, Telegram base.
 
@@ -38,6 +38,10 @@ UA_HEADERS = {
 
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
+
+# Stato per stimare il prossimo refresh
+if "last_refresh_ts" not in st.session_state:
+    st.session_state["last_refresh_ts"] = time.time()
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -175,11 +179,17 @@ def _tick_query_param():
     except Exception:
         pass
 
+# Stima countdown: prossimo refresh = ultimo_rerun + REFRESH_SEC
+_prev_ts = float(st.session_state.get("last_refresh_ts", time.time()))
+_next_ts = _prev_ts + max(1, REFRESH_SEC)
+secs_left = max(0, int(round(_next_ts - time.time())))
+
 if auto_refresh and not pump_enable:
     if st_autorefresh:
+        # vero timer lato client
         st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
     else:
-        # Fallback senza libreria: rerun asincrono con thread
+        # fallback: rerun asincrono con thread
         import threading
         def _delayed_rerun():
             time.sleep(max(1, REFRESH_SEC))
@@ -195,6 +205,14 @@ if auto_refresh and not pump_enable:
 else:
     if pump_enable:
         st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
+
+# Barra utility: countdown + refresh manuale
+util_col1, util_col2 = st.columns([5, 1])
+with util_col1:
+    st.caption(f"Prossimo refresh ~{secs_left}s")
+with util_col2:
+    if st.button("Aggiorna ora", use_container_width=True):
+        st.rerun()
 
 # ---------------- Helpers ----------------
 def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
@@ -769,3 +787,6 @@ with d4:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
 st.caption(f"Refresh: {REFRESH_SEC}s • GetMoni calls: {st.session_state.get('gm_calls',0)} • Ticket proxy: ${PROXY_TICKET:.0f}")
+
+# 🔚 Aggiorna il timestamp dell'ultimo run per il prossimo countdown
+st.session_state["last_refresh_ts"] = time.time()
