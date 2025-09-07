@@ -1,5 +1,5 @@
 # market_data.py — Provider dati live per token/pairs (Solana) con aggiornamento continuo
-# v8.2: schema stabile anche a DF vuoto + filtri robusti su exclude_quotes
+# v8.3: schema stabile a DF vuoto + exclude_quotes iper-robusto
 
 from __future__ import annotations
 
@@ -63,22 +63,38 @@ def _txns1h(p: Dict[str, Any]) -> int:
     return int((h1.get("buys") or 0) + (h1.get("sells") or 0))
 
 def _normalize_exclude_quotes(exclude_quotes: Optional[Iterable[Any]]) -> set[str]:
+    """
+    Converte qualunque input in un set UPPERCASE di stringhe.
+    Accetta: list/tuple/set annidati, singoli valori, numeri, None, NaN, ecc.
+    """
     out: set[str] = set()
-    if not exclude_quotes:
+    if exclude_quotes is None:
         return out
     try:
-        for item in exclude_quotes:
+        iterator = exclude_quotes  # se è iterabile lo useremo nel for sotto
+        # Se è una stringa singola, trattiamola comunque come singolo valore
+        if isinstance(exclude_quotes, (str, bytes)):
+            iterator = [exclude_quotes]
+        for item in iterator:
             if item is None:
                 continue
             if isinstance(item, (list, tuple, set)):
                 for sub in item:
                     if sub is None:
                         continue
-                    out.add(str(sub).upper())
+                    try:
+                        s = sub.decode() if isinstance(sub, (bytes, bytearray)) else str(sub)
+                        out.add(s.upper())
+                    except Exception:
+                        out.add(str(sub).upper())
             else:
-                out.add(str(item).upper())
+                try:
+                    s = item.decode() if isinstance(item, (bytes, bytearray)) else str(item)
+                    out.add(s.upper())
+                except Exception:
+                    out.add(str(item).upper())
     except TypeError:
-        # Non iterabile: converto direttamente
+        # Non-iterabile: converto direttamente
         out.add(str(exclude_quotes).upper())
     return out
 
