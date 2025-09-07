@@ -4,5 +4,7 @@ requests
 plotly
 websocket-client==1.8.0
 streamlit-autorefresh
+solana
+solders
 
 
