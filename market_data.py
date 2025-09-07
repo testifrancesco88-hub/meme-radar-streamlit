@@ -1,291 +1,294 @@
-# market_data.py — Provider dati live per token/pairs (Solana) con aggiornamento continuo
-# v8.4: aggiunta colonna 'baseAddress' (mint SPL) per integrazione Bubblemaps
+# market_data.py — Provider DexScreener v3 (nested priceChange safe)
+# - search multipla su DexScreener
+# - normalizza record mantenendo priceChange (h1,h4,h6,h24)
+# - filtri: only_raydium, min_liq, exclude_quotes
+# - thread di auto-refresh opzionale
+# - snapshot in DataFrame con campi usati dalla UI
 
 from __future__ import annotations
+import time
+import threading
+import random
+import math
+from typing import Iterable, Optional, Tuple, Dict, Any, List
 
-import math, random, threading, time, logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-import pandas as pd
 import requests
+import pandas as pd
 
-DEFAULT_QUERIES = [
-    "chain:solana raydium",
-    "chain:solana orca",
-    "chain:solana meteora",
-    "chain:solana lifinity",
-    "chain:solana usdc",
-    "chain:solana usdt",
-    "chain:solana sol",
-    "chain:solana bonk",
-    "chain:solana wif",
-    "chain:solana pepe",
-]
-
-DEXSEARCH_BASE = "https://api.dexscreener.com/latest/dex/search?q="
+DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search"
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MemeRadar/1.0 Chrome/120 Safari/537.36",
+    "User-Agent": "MemeRadar/1.0 (+https://github.com/) Python/Requests",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
 }
 
-LOG = logging.getLogger("MarketDataProvider")
-if not LOG.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-    LOG.addHandler(h)
-    LOG.setLevel(logging.INFO)
-
-EXPECTED_COLS = [
-    "pairAddress","url","dexId","baseSymbol","quoteSymbol",
-    "priceUsd","liquidityUsd","volume24hUsd","priceChange24hPct",
-    "pairCreatedAt","txns1h","baseAddress",  # <--- AGGIUNTO
-]
-
-def _first_num(*vals) -> Optional[float]:
-    for v in vals:
-        try:
-            if v is None: 
-                continue
-            n = float(v)
-            if math.isnan(n):
-                continue
-            return n
-        except Exception:
-            continue
-    return None
-
-def _is_solana_pair(p: Dict[str, Any]) -> bool:
-    return str((p or {}).get("chainId", "solana")).lower() == "solana"
-
-def _txns1h(p: Dict[str, Any]) -> int:
-    h1 = ((p or {}).get("txns") or {}).get("h1") or {}
-    return int((h1.get("buys") or 0) + (h1.get("sells") or 0))
-
-def _normalize_exclude_quotes(exclude_quotes):
-    out: set[str] = set()
-    if exclude_quotes is None:
-        return out
+def _to_float(x, default=None):
+    if x is None:
+        return default
     try:
-        if isinstance(exclude_quotes, (str, bytes, bytearray)):
-            exclude_quotes = [exclude_quotes]
-        for item in exclude_quotes:
-            if item is None: continue
-            if isinstance(item, (list, tuple, set)):
-                for sub in item:
-                    if sub is None: continue
-                    s = sub.decode() if isinstance(sub, (bytes, bytearray)) else str(sub)
-                    out.add(s.upper())
-            else:
-                s = item.decode() if isinstance(item, (bytes, bytearray)) else str(item)
-                out.add(s.upper())
-    except TypeError:
-        out.add(str(exclude_quotes).upper())
-    return out
+        s = str(x).replace(",", "").strip()
+        if s.endswith("%"):
+            s = s[:-1]
+        return float(s)
+    except Exception:
+        return default
+
+def _sum_tx1h(txns: Dict[str, Any] | None) -> int:
+    """DexScreener txns: {'h1': {'buys': int, 'sells': int}, ...}"""
+    try:
+        h1 = (txns or {}).get("h1") or {}
+        b, s = int(h1.get("buys", 0) or 0), int(h1.get("sells", 0) or 0)
+        return max(0, b + s)
+    except Exception:
+        return 0
+
+def _liq_usd(liq: Dict[str, Any] | None) -> float | None:
+    try:
+        v = (liq or {}).get("usd")
+        return _to_float(v, None)
+    except Exception:
+        return None
+
+def _vol24_usd(vol: Dict[str, Any] | None) -> float | None:
+    try:
+        # DexScreener: 'volume': {'h24': <usd>}
+        v = (vol or {}).get("h24")
+        return _to_float(v, None)
+    except Exception:
+        return None
+
+def _safe_get_price_change(obj: Dict[str, Any] | None, key: str) -> float | None:
+    """obj può essere priceChange dict; key es. 'h1', 'h4', 'h6', 'h24'"""
+    try:
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get(key, None)
+        return _to_float(v, None)
+    except Exception:
+        return None
+
+def _norm_pair(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalizza un singolo pair DexScreener in un record piatto + nested 'priceChange'."""
+    base = (p.get("baseToken") or {})
+    quote = (p.get("quoteToken") or {})
+    rec: Dict[str, Any] = {}
+
+    rec["baseSymbol"]   = base.get("symbol") or ""
+    rec["quoteSymbol"]  = quote.get("symbol") or ""
+    rec["baseAddress"]  = base.get("address") or ""
+    rec["quoteAddress"] = quote.get("address") or ""
+    rec["pairAddress"]  = p.get("pairAddress") or p.get("pairAddress") or ""
+
+    rec["dexId"]        = p.get("dexId") or ""
+    rec["url"]          = p.get("url") or ""
+
+    # prezzi e metriche
+    rec["priceUsd"]       = _to_float(p.get("priceUsd"), None)
+    rec["liquidityUsd"]   = _liq_usd(p.get("liquidity"))
+    rec["volume24hUsd"]   = _vol24_usd(p.get("volume"))
+    rec["txns1h"]         = _sum_tx1h(p.get("txns"))
+
+    # timestamps
+    # Dexscreener usa ms epoch in 'pairCreatedAt' se disponibile
+    rec["pairCreatedAt"]  = p.get("pairCreatedAt") or p.get("createdAt") or None
+
+    # Manteniamo priceChange annidato (se esiste)
+    price_change = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else None
+    rec["priceChange"] = price_change
+
+    # Valori "flat" (se presenti) — NON indispensabili per la UI (che legge anche nested)
+    rec["priceChange1hPct"]  = (
+        _to_float(p.get("priceChange1hPct"), None)
+        or _safe_get_price_change(price_change, "h1")
+        or _to_float(p.get("pc1h"), None)
+    )
+    # Dexscreener non sempre espone h4; la UI ha fallback a h6
+    rec["priceChange4hPct"]  = (
+        _to_float(p.get("priceChange4hPct"), None)
+        or _safe_get_price_change(price_change, "h4")
+        or _to_float(p.get("pc4h"), None)
+    )
+    rec["priceChange6hPct"]  = (
+        _to_float(p.get("priceChange6hPct"), None)
+        or _safe_get_price_change(price_change, "h6")
+        or _to_float(p.get("pc6h"), None)
+    )
+    rec["priceChange24hPct"] = (
+        _to_float(p.get("priceChange24hPct"), None)
+        or _safe_get_price_change(price_change, "h24")
+        or _to_float(p.get("pc24h"), None)
+    )
+
+    return rec
 
 class MarketDataProvider:
-    def __init__(
-        self,
-        queries: Iterable[str] = DEFAULT_QUERIES,
-        refresh_sec: int = 60,
-        session: Optional[requests.Session] = None,
-        on_update: Optional[Callable[[pd.DataFrame, float], None]] = None,
-        max_retries: int = 3,
-        backoff_base: float = 0.7,
-        timeout_sec: int = 15,
-        only_raydium: bool = False,
-        min_liq: float = 0.0,
-        exclude_quotes: Optional[Iterable[str]] = None,
-        preserve_on_empty: bool = False,
-    ) -> None:
-        self.queries = list(queries)
-        self.refresh_sec = max(5, int(refresh_sec))
-        self.max_retries = max_retries
-        self.backoff_base = backoff_base
-        self.timeout_sec = timeout_sec
+    """
+    Recupera e normalizza i pairs da DexScreener su Solana (tramite /search?q=).
+    Conserva un DataFrame unificato (dedup per pairAddress).
+    """
 
-        self._session = session or requests.Session()
-        self._session.headers.update(UA_HEADERS)
-
-        self._df: pd.DataFrame = pd.DataFrame(columns=EXPECTED_COLS)
-        self._last_updated: float = 0.0
-        self._last_http_codes: List[int] = []
-        self._lock = threading.Lock()
-
-        self._stop_evt = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._on_update = on_update
-
-        self.only_raydium = bool(only_raydium)
-        self.min_liq = float(min_liq) if min_liq else 0.0
-        self.exclude_quotes = _normalize_exclude_quotes(exclude_quotes)
+    def __init__(self, refresh_sec: int = 60, preserve_on_empty: bool = True):
+        self.refresh_sec = int(refresh_sec)
         self.preserve_on_empty = bool(preserve_on_empty)
 
-    # -------- Public API --------
-    def update(self) -> Tuple[pd.DataFrame, float]:
-        pairs, codes = self._multi_search(self.queries)
-        self._last_http_codes = codes
-        df_raw = self._pairs_to_df(pairs)
-        df = self._apply_filters(df_raw)
+        self._queries: List[str] = ["chain:solana"]
+        self.only_raydium: bool = False
+        self.min_liq: float = 0.0
+        self.exclude_quotes: set[str] = set()
 
-        if self.preserve_on_empty and df.empty and not df_raw.empty:
-            with self._lock:
-                df_prev = self._df.copy()
-                ts_prev = self._last_updated
-            if not df_prev.empty:
-                LOG.warning("Fetch filtrato vuoto — preservo snapshot precedente (%d righe).", len(df_prev))
-                return df_prev, ts_prev
+        self._last_df: pd.DataFrame = pd.DataFrame()
+        self._last_ts: float = 0.0
+        self._http_codes: List[int | str] = []
 
-        ts = time.time()
+        self._lock = threading.RLock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+        self._session = requests.Session()
+        self._session.headers.update(UA_HEADERS)
+
+    # ---------------- Public API ----------------
+
+    def set_queries(self, queries: Iterable[str]) -> None:
+        q = list(queries) if queries else []
+        if not q:
+            q = ["chain:solana"]
         with self._lock:
-            self._df = df
-            self._last_updated = ts
+            self._queries = q[:]
 
-        if self._on_update:
-            try: self._on_update(df, ts)
-            except Exception as e: LOG.warning("on_update callback error: %s", e)
-        return df.copy(), ts
+    def set_filters(self, only_raydium: bool = False, min_liq: float = 0, exclude_quotes: Iterable[str] | None = None) -> None:
+        """exclude_quotes: lista/set di symbol (case-insensitive) da escludere come quote (es. USDC, USDT, SOL)"""
+        self.only_raydium = bool(only_raydium)
+        try:
+            self.min_liq = float(min_liq or 0.0)
+        except Exception:
+            self.min_liq = 0.0
+        if exclude_quotes is not None:
+            try:
+                self.exclude_quotes = {str(x).upper() for x in exclude_quotes if str(x).strip()}
+            except Exception:
+                self.exclude_quotes = set()
+        else:
+            self.exclude_quotes = set()
+
+    def start_auto_refresh(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run_loop, name="MarketDataProviderLoop", daemon=True)
+        self._thread.start()
+
+    def stop_auto_refresh(self) -> None:
+        self._stop.set()
+
+    def force_refresh(self) -> Tuple[pd.DataFrame, float]:
+        df, ts = self._collect_all()
+        with self._lock:
+            if not df.empty or not self.preserve_on_empty:
+                self._last_df = df
+                self._last_ts = ts
+        return self._last_df.copy(), self._last_ts
 
     def get_snapshot(self) -> Tuple[pd.DataFrame, float]:
         with self._lock:
-            df = self._df.copy()
-            for col in EXPECTED_COLS:
-                if col not in df.columns:
-                    df[col] = None
-            return df[EXPECTED_COLS].copy(), self._last_updated
+            return self._last_df.copy(), self._last_ts
 
-    def get_last_http_codes(self) -> List[int]:
+    def get_last_http_codes(self) -> List[int | str]:
         with self._lock:
-            return list(self._last_http_codes)
+            return list(self._http_codes)
 
-    def start_auto_refresh(self) -> None:
-        if self._thread and self._thread.is_alive(): return
-        self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._loop, name="MarketDataProviderLoop", daemon=True)
-        self._thread.start()
+    # ---------------- Internal ----------------
 
-    def stop(self, join: bool = False) -> None:
-        self._stop_evt.set()
-        if join and self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-
-    def set_queries(self, queries: Iterable[str]) -> None:
-        self.queries = list(queries)
-
-    def set_refresh_interval(self, seconds: int) -> None:
-        self.refresh_sec = max(5, int(seconds))
-
-    def set_filters(
-        self,
-        *,
-        only_raydium: Optional[bool] = None,
-        min_liq: Optional[float] = None,
-        exclude_quotes: Optional[Iterable[Any]] = None,
-    ) -> None:
-        if only_raydium is not None: self.only_raydium = bool(only_raydium)
-        if min_liq is not None: self.min_liq = float(min_liq) if min_liq else 0.0
-        if exclude_quotes is not None: self.exclude_quotes = _normalize_exclude_quotes(exclude_quotes)
-
-    def get_top_by(self, field: str, n: int = 10) -> pd.DataFrame:
-        df, _ = self.get_snapshot()
-        if df.empty or field not in df.columns: return pd.DataFrame(columns=EXPECTED_COLS)
-        return df.sort_values(by=[field], ascending=False).head(n).reset_index(drop=True)
-
-    def find_by_symbol(self, symbol: str) -> pd.DataFrame:
-        df, _ = self.get_snapshot()
-        if df.empty: return df
-        s = (symbol or "").upper()
-        return df[df["baseSymbol"].str.upper() == s].reset_index(drop=True)
-
-    def export_csv(self, path: str) -> None:
-        df, _ = self.get_snapshot()
-        df.to_csv(path, index=False)
-
-    # -------- Internal --------
-    def _loop(self) -> None:
-        try: self.update()
-        except Exception as e: LOG.warning("Initial update() failed: %s", e)
-        while not self._stop_evt.is_set():
-            jitter = random.uniform(0.0, 0.35)
-            wait_s = self.refresh_sec * (1.0 + jitter)
-            end = time.time() + wait_s
-            while not self._stop_evt.is_set() and time.time() < end:
-                time.sleep(0.25)
-            if self._stop_evt.is_set(): break
-            try: self.update()
-            except Exception as e: LOG.warning("update() failed: %s", e)
-
-    def _multi_search(self, queries: Iterable[str]) -> Tuple[List[dict], List[int]]:
-        all_pairs: List[dict] = []
-        seen = set()
-        codes: List[int] = []
-        for q in queries:
-            url = DEXSEARCH_BASE + requests.utils.quote(q, safe="")
-            data, code = self._fetch_with_retry(url)
-            codes.append(code)
-            pairs = (data or {}).get("pairs", []) if data else []
-            for p in pairs:
-                if not _is_solana_pair(p): continue
-                addr = p.get("pairAddress") or p.get("url") or (p.get("baseToken", {}).get("address"))
-                key = str(addr)
-                if key and key not in seen:
-                    seen.add(key)
-                    all_pairs.append(p)
-        return all_pairs, codes
-
-    def _fetch_with_retry(self, url: str) -> Tuple[Optional[dict], int]:
-        last: Tuple[Optional[dict], int] = (None, 0)
-        for i in range(self.max_retries):
+    def _run_loop(self):
+        jitter = 0.15
+        while not self._stop.is_set():
             try:
-                r = self._session.get(url, timeout=self.timeout_sec)
-                code = r.status_code
-                if r.ok: return r.json(), code
-                last = (None, code)
-                if code in (429, 500, 502, 503, 504):
-                    time.sleep(self.backoff_base * (i + 1) + random.uniform(0, 0.4))
-                    continue
-                break
+                self.force_refresh()
             except Exception:
-                last = (None, -1)
-                time.sleep(self.backoff_base * (i + 1) + random.uniform(0, 0.4))
-        return last
+                # non blocchiamo il loop su eccezioni momentanee
+                pass
+            wait = max(3, int(self.refresh_sec * (1.0 + random.uniform(-jitter, jitter))))
+            self._stop.wait(wait)
 
-    def _pairs_to_df(self, pairs: List[dict]) -> pd.DataFrame:
-        rows: List[Dict[str, Any]] = []
-        for p in pairs:
-            base = ((p.get("baseToken") or {}).get("symbol")) or ""
-            quote = ((p.get("quoteToken") or {}).get("symbol")) or ""
-            rows.append({
-                "pairAddress": p.get("pairAddress") or "",
-                "url": p.get("url") or "",
-                "dexId": (p.get("dexId") or ""),
-                "baseSymbol": base,
-                "quoteSymbol": quote,
-                "priceUsd": _first_num(p.get("priceUsd")),
-                "liquidityUsd": _first_num(((p.get("liquidity") or {}).get("usd"))),
-                "volume24hUsd": _first_num(((p.get("volume") or {}).get("h24"))),
-                "priceChange24hPct": _first_num(((p.get("priceChange") or {}).get("h24"))),
-                "pairCreatedAt": p.get("pairCreatedAt") or 0,
-                "txns1h": _txns1h(p),
-                "baseAddress": (p.get("baseToken") or {}).get("address") or "",  # <--- AGGIUNTO
-            })
-        if not rows:
-            return pd.DataFrame(columns=EXPECTED_COLS)
-        df = pd.DataFrame(rows)
-        for c in EXPECTED_COLS:
-            if c not in df.columns: df[c] = None
-        df = df.sort_values(by=["volume24hUsd","txns1h","liquidityUsd"], ascending=[False, False, False]).reset_index(drop=True)
-        return df
+    def _fetch_query(self, q: str) -> Tuple[List[Dict[str, Any]], int | str]:
+        try:
+            r = self._session.get(DEX_SEARCH, params={"q": q}, timeout=20)
+            code = r.status_code
+            if not r.ok:
+                return ([], code)
+            data = r.json()
+            pairs = data.get("pairs") or []
+            if not isinstance(pairs, list):
+                pairs = []
+            return (pairs, code)
+        except Exception:
+            return ([], "ERR")
 
-    def _apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty: return df[EXPECTED_COLS]
-        out = df.copy()
-        if self.only_raydium:
-            out = out[out["dexId"].str.lower() == "raydium"]
-        if self.min_liq:
-            out = out[(out["liquidityUsd"].fillna(0) >= float(self.min_liq))]
-        if self.exclude_quotes:
-            out = out[~out["quoteSymbol"].str.upper().isin(self.exclude_quotes)]
-        for c in EXPECTED_COLS:
-            if c not in out.columns: out[c] = None
-        return out.reset_index(drop=True)[EXPECTED_COLS]
+    def _apply_filters(self, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for r in recs:
+            # only_raydium
+            if self.only_raydium:
+                if str(r.get("dexId", "")).lower() != "raydium":
+                    continue
+            # min_liq
+            try:
+                liq = _to_float(r.get("liquidityUsd"), 0.0) or 0.0
+                if liq < float(self.min_liq):
+                    continue
+            except Exception:
+                pass
+            # exclude_quotes
+            try:
+                qsym = str(r.get("quoteSymbol") or "").upper()
+                if qsym and qsym in self.exclude_quotes:
+                    continue
+            except Exception:
+                pass
+            out.append(r)
+        return out
+
+    def _dedup_by_pair(self, recs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = set()
+        out = []
+        for r in recs:
+            pid = r.get("pairAddress") or r.get("url") or (r.get("baseAddress"), r.get("quoteAddress"), r.get("dexId"))
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(r)
+        return out
+
+    def _collect_all(self) -> Tuple[pd.DataFrame, float]:
+        all_recs: List[Dict[str, Any]] = []
+        codes: List[int | str] = []
+
+        # fetch per query
+        with self._lock:
+            queries = self._queries[:]
+        if not queries:
+            queries = ["chain:solana"]
+
+        for q in queries:
+            pairs, code = self._fetch_query(q)
+            codes.append(code)
+            if pairs:
+                for p in pairs:
+                    all_recs.append(_norm_pair(p))
+
+        # filtri provider
+        all_recs = self._apply_filters(all_recs)
+        # dedup
+        all_recs = self._dedup_by_pair(all_recs)
+
+        df = pd.DataFrame(all_recs) if all_recs else pd.DataFrame(columns=[
+            "baseSymbol","quoteSymbol","baseAddress","quoteAddress","pairAddress",
+            "dexId","url","priceUsd","liquidityUsd","volume24hUsd","txns1h",
+            "pairCreatedAt","priceChange","priceChange1hPct","priceChange4hPct","priceChange6hPct","priceChange24hPct",
+        ])
+
+        ts = time.time()
+        with self._lock:
+            self._http_codes = codes[-10:]  # mantieni ultimi 10
+        return df, ts
