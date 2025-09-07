@@ -39,7 +39,7 @@ if not LOG.handlers:
 EXPECTED_COLS = [
     "pairAddress","url","dexId","baseSymbol","quoteSymbol",
     "priceUsd","liquidityUsd","volume24hUsd","priceChange24hPct",
-    "pairCreatedAt","txns1h",
+    "pairCreatedAt","txns1h","baseAddress",
 ]
 
 def _first_num(*vals) -> Optional[float]:
@@ -256,6 +256,7 @@ class MarketDataProvider:
             base = ((p.get("baseToken") or {}).get("symbol")) or ""
             quote = ((p.get("quoteToken") or {}).get("symbol")) or ""
             rows.append({
+                "baseAddress": (p.get("baseToken") or {}).get("address") or "",
                 "pairAddress": p.get("pairAddress") or "",
                 "url": p.get("url") or "",
                 "dexId": (p.get("dexId") or ""),
