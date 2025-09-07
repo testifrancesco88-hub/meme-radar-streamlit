@@ -1,5 +1,5 @@
 # market_data.py — Provider dati live per token/pairs (Solana) con aggiornamento continuo
-# v8.3: schema stabile a DF vuoto + exclude_quotes iper-robusto
+# v8.4: aggiunta colonna 'baseAddress' (mint SPL) per integrazione Bubblemaps
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ if not LOG.handlers:
 EXPECTED_COLS = [
     "pairAddress","url","dexId","baseSymbol","quoteSymbol",
     "priceUsd","liquidityUsd","volume24hUsd","priceChange24hPct",
-    "pairCreatedAt","txns1h","baseAddress",
+    "pairCreatedAt","txns1h","baseAddress",  # <--- AGGIUNTO
 ]
 
 def _first_num(*vals) -> Optional[float]:
@@ -256,7 +256,6 @@ class MarketDataProvider:
             base = ((p.get("baseToken") or {}).get("symbol")) or ""
             quote = ((p.get("quoteToken") or {}).get("symbol")) or ""
             rows.append({
-                "baseAddress": (p.get("baseToken") or {}).get("address") or "",
                 "pairAddress": p.get("pairAddress") or "",
                 "url": p.get("url") or "",
                 "dexId": (p.get("dexId") or ""),
@@ -268,6 +267,7 @@ class MarketDataProvider:
                 "priceChange24hPct": _first_num(((p.get("priceChange") or {}).get("h24"))),
                 "pairCreatedAt": p.get("pairCreatedAt") or 0,
                 "txns1h": _txns1h(p),
+                "baseAddress": (p.get("baseToken") or {}).get("address") or "",  # <--- AGGIUNTO
             })
         if not rows:
             return pd.DataFrame(columns=EXPECTED_COLS)
