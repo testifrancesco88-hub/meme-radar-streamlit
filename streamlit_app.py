@@ -1,6 +1,7 @@
-# streamlit_app.py — Meme Radar (Streamlit) v10
-# Novità v10: anti-duplicati + cooldown + time-stop + pyramiding opz.
-# Confermati: Bubblemaps anti-cluster, GetMoni social filter, LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, Telegram base.
+# streamlit_app.py — Meme Radar (Streamlit) v10.1
+# Novità v10.1: auto-refresh lato client con streamlit-autorefresh (fallback incluso).
+# Confermati: Bubblemaps anti-cluster, GetMoni social filter, anti-duplicati, cooldown, time-stop,
+# LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, Telegram base.
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -161,12 +162,39 @@ with st.sidebar:
         height=100
     )
 
-# 🔁 Auto-refresh (pausa se WS attivo)
+# 🔁 Auto-refresh (pausa se WS attivo). Usa streamlit-autorefresh se disponibile.
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
+def _tick_query_param():
+    # Mantiene un "tick" nell'URL per evitare cache e aiutare la diagnosi
+    try:
+        st.query_params.update({"_": str(int(time.time() // max(1, REFRESH_SEC)))})
+    except Exception:
+        pass
+
 if auto_refresh and not pump_enable:
-    try: st.query_params.update({"_": str(int(time.time() // REFRESH_SEC))})
-    except Exception: pass
+    if st_autorefresh:
+        st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
+    else:
+        # Fallback senza libreria: rerun asincrono con thread
+        import threading
+        def _delayed_rerun():
+            time.sleep(max(1, REFRESH_SEC))
+            try:
+                st.rerun()
+            except Exception:
+                pass
+        if "fallback_rerun_thread" not in st.session_state:
+            t = threading.Thread(target=_delayed_rerun, daemon=True)
+            t.start()
+            st.session_state["fallback_rerun_thread"] = True
+    _tick_query_param()
 else:
-    if pump_enable: st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
+    if pump_enable:
+        st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
 
 # ---------------- Helpers ----------------
 def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
@@ -657,6 +685,7 @@ elif pump_enable and websocket is not None:
     if st.session_state["pump_live"] is None:
         st.session_state["pump_live"] = PumpFunLive(max_rows=pump_buffer, api_key=os.getenv("PUMP_API_KEY","")); st.session_state["pump_live"].start()
     else:
+        st.session_state["pump_live"] = st.session_state["pump_live"]
         st.session_state["pump_live"].max_rows = int(pump_buffer)
 else:
     if st.session_state["pump_live"] is not None:
