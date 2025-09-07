@@ -1,7 +1,9 @@
-# streamlit_app.py — Meme Radar (Streamlit) v10.2
-# Novità v10.2: auto-refresh lato client + countdown "Prossimo refresh" + pulsante "Aggiorna ora".
-# Confermati: Bubblemaps anti-cluster, GetMoni social filter, anti-duplicati, cooldown, time-stop,
-# LIVE Pump.fun, fallback Moralis, Meme Score, grafici, watchlist, Telegram base.
+# streamlit_app.py — Meme Radar (Streamlit) v11.2 (no Pump.fun / no Moralis)
+# - Auto-refresh, countdown, "Aggiorna ora"
+# - StrategyMomentumV2 (turnover, market heat, change range, break-even lock)
+# - KPI, Meme Score, grafici, watchlist
+# - Bubblemaps + GetMoni integrati
+# - NUOVO: Alert Telegram dalla tabella (soglie + cooldown + test)
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -9,13 +11,8 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-try:
-    import websocket  # pip install websocket-client
-except Exception:
-    websocket = None
-
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine
+from trading import RiskConfig, StratConfig, TradeEngine  # Strategy V2 in trading.py
 from bubblemaps_client import check_wallet_clusters
 from getmoni_client import SocialSentimentAnalyzer
 
@@ -39,7 +36,7 @@ UA_HEADERS = {
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
 
-# Stato per stimare il prossimo refresh
+# Stato per countdown refresh
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
 
@@ -80,27 +77,32 @@ with st.sidebar:
     show_pair_age = st.toggle("Mostra colonna 'Pair Age' (min/ore)", value=True)
 
     st.divider()
-    st.subheader("Alert Telegram (base)")
+    st.subheader("Alert Telegram (tabella)")
     TELEGRAM_BOT_TOKEN = st.text_input("Bot Token", value=os.getenv("TELEGRAM_BOT_TOKEN",""), type="password")
     TELEGRAM_CHAT_ID   = st.text_input("Chat ID", value=os.getenv("TELEGRAM_CHAT_ID",""))
     alert_tx1h_min     = st.number_input("Soglia txns 1h", min_value=0, value=200, step=10)
     alert_liq_min      = st.number_input("Soglia liquidity USD", min_value=0, value=20000, step=1000)
     alert_meme_min     = st.number_input("Soglia Meme Score (0=disattiva)", min_value=0, max_value=100, value=70, step=5)
+    alert_cooldown_min = st.number_input("Cooldown alert (min)", min_value=1, value=30, step=5,
+                                         help="Intervallo minimo tra alert per lo stesso token")
+    alert_max_per_run  = st.number_input("Max alert per refresh", min_value=1, value=3, step=1)
     enable_alerts      = st.toggle("Abilita alert Telegram", value=False)
-
-    st.divider()
-    st.subheader("LIVE Pump.fun")
-    pump_enable = st.toggle("Abilita feed live (subscribeNewToken)", value=False)
-    pump_buffer = st.number_input("Buffer massimo eventi", min_value=50, max_value=1000, value=200, step=50)
-    pump_keywords = st.text_input("Filtra per keyword (opz, virgola)", value="", help="Esempio: cat,dog,elon,wif")
-    pump_alert_enable = st.toggle("Alert Telegram su match keyword", value=False, help="Richiede BOT_TOKEN e CHAT_ID sopra")
-
-    st.divider()
-    st.subheader("Fallback HTTP (Moralis)")
-    moralis_enable = st.toggle("Mostra ultimi token via Moralis se WS è vuoto", value=True)
-    MORALIS_API_KEY = st.text_input("MORALIS_API_KEY", value=os.getenv("MORALIS_API_KEY",""), type="password")
-    moralis_exchange = st.selectbox("Exchange", options=["pumpfun","pump"], index=0)
-    moralis_limit = st.slider("Quanti token recenti (fallback)", 10, 50, 20, step=5)
+    # Test Telegram
+    def _tg_send_test():
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            st.warning("Inserisci BOT_TOKEN e CHAT_ID prima del test.")
+            return
+        try:
+            rq = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar — Telegram OK", "disable_web_page_preview": True}, timeout=15)
+            if rq.ok:
+                st.success("Messaggio di test inviato ✅")
+            else:
+                st.error(f"Telegram ha risposto {rq.status_code}. Controlla credenziali/permessi.")
+        except Exception as e:
+            st.error(f"Errore Telegram: {e}")
+    if st.button("Test Telegram"):
+        _tg_send_test()
 
     st.divider()
     st.subheader("Trading (Paper) + Bubblemaps + GetMoni")
@@ -108,11 +110,14 @@ with st.sidebar:
     preset = st.selectbox("Preset strategia", ["Prudente","Neutra","Aggressiva"], index=1)
     if st.button("Applica preset"):
         if preset == "Prudente":
-            st.session_state.update({"pos_usd":30.0,"max_pos":2,"stop_pct":25,"tp_pct":60,"trail_pct":15,"day_loss":150.0,"strat_meme":75,"strat_txns":200})
+            st.session_state.update({"pos_usd":30.0,"max_pos":2,"stop_pct":25,"tp_pct":60,"trail_pct":15,"day_loss":150.0,
+                                     "strat_meme":75,"strat_txns":250,"strat_turnover":1.4,"strat_heat_avg":140})
         elif preset == "Neutra":
-            st.session_state.update({"pos_usd":50.0,"max_pos":3,"stop_pct":20,"tp_pct":40,"trail_pct":15,"day_loss":200.0,"strat_meme":65,"strat_txns":150})
+            st.session_state.update({"pos_usd":50.0,"max_pos":3,"stop_pct":20,"tp_pct":40,"trail_pct":15,"day_loss":200.0,
+                                     "strat_meme":65,"strat_txns":200,"strat_turnover":1.2,"strat_heat_avg":120})
         else:
-            st.session_state.update({"pos_usd":60.0,"max_pos":4,"stop_pct":18,"tp_pct":35,"trail_pct":12,"day_loss":250.0,"strat_meme":55,"strat_txns":100})
+            st.session_state.update({"pos_usd":60.0,"max_pos":4,"stop_pct":18,"tp_pct":35,"trail_pct":12,"day_loss":250.0,
+                                     "strat_meme":55,"strat_txns":150,"strat_turnover":1.0,"strat_heat_avg":100})
         st.rerun()
 
     colA, colB = st.columns(2)
@@ -124,8 +129,21 @@ with st.sidebar:
         tp_pct   = st.slider("Take Profit %", 10, 200, st.session_state.get("tp_pct", 40), key="tp_pct")
         trail_pct= st.slider("Trailing %", 5, 60, st.session_state.get("trail_pct", 15), key="trail_pct")
         day_loss = st.number_input("Daily loss limit (USD)", min_value=50.0, value=st.session_state.get("day_loss", 200.0), step=50.0, key="day_loss")
-    strat_meme = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 75), key="strat_meme")
-    strat_txns = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 300), step=50, key="strat_txns")
+    # --- Strategy V2 ---
+    st.markdown("**Strategia V2 — parametri chiave**")
+    strat_meme     = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 70), key="strat_meme")
+    strat_txns     = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 250), step=25, key="strat_txns")
+    strat_turnover = st.number_input("Turnover minimo (Vol24h / Liq)", min_value=0.0, value=float(st.session_state.get("strat_turnover", 1.2)), step=0.1, key="strat_turnover")
+    colh1, colh2 = st.columns(2)
+    with colh1:
+        heat_topN = st.number_input("Heat TopN (per volume)", min_value=3, max_value=20, value=int(st.session_state.get("heat_topN", 10)), step=1, key="heat_topN")
+    with colh2:
+        heat_avg  = st.number_input("Heat: media Txns1h minima", min_value=0, value=int(st.session_state.get("strat_heat_avg", 120)), step=10, key="strat_heat_avg")
+    colchg1, colchg2 = st.columns(2)
+    with colchg1:
+        chg_min = st.number_input("Change 24h minimo (%)", value=-8, step=1, key="chg_min")
+    with colchg2:
+        chg_max = st.number_input("Change 24h massimo (%)", value=180, step=10, key="chg_max")
 
     # --- Regole anti-duplicato & timing ---
     st.markdown("**Regole anti-duplicato & timing**")
@@ -137,6 +155,16 @@ with st.sidebar:
     with colx3:
         time_stop_min = st.number_input("Time-stop (min, 0=off)", min_value=0, value=int(st.session_state.get("time_stop_min", 60)), step=5, key="time_stop_min")
 
+    # --- Break-even lock ---
+    st.markdown("**Break-even lock (difesa profitto)**")
+    colbe1, colbe2, colbe3 = st.columns(3)
+    with colbe1:
+        be_trig = st.slider("Trigger BE (%)", 5, 40, 10, key="be_trig")
+    with colbe2:
+        be_lock = st.slider("Lock minimo (%)", 0, 20, 2, key="be_lock")
+    with colbe3:
+        dd_lock = st.slider("Drawdown lock (%)", 2, 30, 6, key="dd_lock")
+
     colp1, colp2 = st.columns(2)
     with colp1:
         allow_pyr = st.toggle("Abilita pyramiding", value=bool(st.session_state.get("allow_pyr", False)), key="allow_pyr")
@@ -146,7 +174,7 @@ with st.sidebar:
 
     BUBBLEMAPS_API_KEY = st.text_input("BUBBLEMAPS_API_KEY", value=os.getenv("BUBBLEMAPS_API_KEY",""), type="password", help="Filtro anti-cluster")
 
-    # ---------- GetMoni (nuovo) ----------
+    # ---------- GetMoni ----------
     st.markdown("**GetMoni — Social Filter**")
     GETMONI_API_KEY = st.text_input("GETMONI_API_KEY", value=os.getenv("GETMONI_API_KEY",""), type="password")
     gm_header = st.selectbox("Header auth", ["X-API-Key","Authorization"], index=0, help="Se 'Authorization', usa Bearer <key>")
@@ -166,45 +194,35 @@ with st.sidebar:
         height=100
     )
 
-# 🔁 Auto-refresh (pausa se WS attivo). Usa streamlit-autorefresh se disponibile.
+# 🔁 Auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
 
 def _tick_query_param():
-    # Mantiene un "tick" nell'URL per evitare cache e aiutare la diagnosi
     try:
         st.query_params.update({"_": str(int(time.time() // max(1, REFRESH_SEC)))})
     except Exception:
         pass
 
-# Stima countdown: prossimo refresh = ultimo_rerun + REFRESH_SEC
 _prev_ts = float(st.session_state.get("last_refresh_ts", time.time()))
 _next_ts = _prev_ts + max(1, REFRESH_SEC)
 secs_left = max(0, int(round(_next_ts - time.time())))
 
-if auto_refresh and not pump_enable:
+if auto_refresh:
     if st_autorefresh:
-        # vero timer lato client
         st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
     else:
-        # fallback: rerun asincrono con thread
-        import threading
         def _delayed_rerun():
             time.sleep(max(1, REFRESH_SEC))
-            try:
-                st.rerun()
-            except Exception:
-                pass
+            try: st.rerun()
+            except Exception: pass
         if "fallback_rerun_thread" not in st.session_state:
             t = threading.Thread(target=_delayed_rerun, daemon=True)
             t.start()
             st.session_state["fallback_rerun_thread"] = True
     _tick_query_param()
-else:
-    if pump_enable:
-        st.caption("Auto-refresh sospeso mentre il LIVE Pump.fun è attivo.")
 
 # Barra utility: countdown + refresh manuale
 util_col1, util_col2 = st.columns([5, 1])
@@ -485,30 +503,7 @@ if not df_pairs.empty:
     fig3.update_layout(yaxis_range=[0, 100]); fig3.update_xaxes(tickangle=-30)
     st.plotly_chart(fig3, use_container_width=True)
 
-# ---------------- Trading (Paper) + Bubblemaps + GetMoni ----------------
-st.markdown("## 🧪 Trading — Paper Mode (Bubblemaps + GetMoni)")
-
-if "trade_engine" not in st.session_state:
-    st.session_state["trade_engine"] = None
-if "bm_cache" not in st.session_state:
-    st.session_state["bm_cache"] = {}
-if "gm_analyzer" not in st.session_state:
-    st.session_state["gm_analyzer"] = None
-if "gm_calls" not in st.session_state:
-    st.session_state["gm_calls"] = 0
-
-def bm_check_cached(addr: str):
-    key = f"{addr}"
-    hit = st.session_state["bm_cache"].get(key)
-    now = time.time()
-    if hit and now - hit["ts"] < 3600:  # 1h TTL
-        return hit["res"]
-    if not BUBBLEMAPS_API_KEY:
-        return {"is_high_risk": False, "reason": "no-key", "top1": None, "top3": None, "score": None}
-    res = check_wallet_clusters(addr, chain="solana", api_key=BUBBLEMAPS_API_KEY)
-    st.session_state["bm_cache"][key] = {"ts": now, "res": res}
-    return res
-
+# ---------------- GetMoni setup ----------------
 def parse_map(text: str) -> dict:
     mp = {}
     for line in (text or "").splitlines():
@@ -524,7 +519,11 @@ def parse_map(text: str) -> dict:
         mp[sym.strip().upper()] = user.strip()
     return mp
 
-# init SocialSentimentAnalyzer
+if "gm_analyzer" not in st.session_state:
+    st.session_state["gm_analyzer"] = None
+if "gm_calls" not in st.session_state:
+    st.session_state["gm_calls"] = 0
+
 if gm_enable and GETMONI_API_KEY:
     mapping = parse_map(gm_map_text)
     if st.session_state["gm_analyzer"] is None:
@@ -554,7 +553,25 @@ def sent_check(symbol: str, base_addr: str):
     st.session_state["gm_calls"] += 1
     return st.session_state["gm_analyzer"].analyze(symbol)
 
-# costruzione TradeEngine
+# ---------------- Bubblemaps cache ----------------
+if "bm_cache" not in st.session_state:
+    st.session_state["bm_cache"] = {}
+
+def bm_check_cached(addr: str):
+    key = f"{addr}"
+    hit = st.session_state["bm_cache"].get(key)
+    now = time.time()
+    if hit and now - hit["ts"] < 3600:  # 1h TTL
+        return hit["res"]
+    if not BUBBLEMAPS_API_KEY:
+        return {"is_high_risk": False, "reason": "no-key", "top1": None, "top3": None, "score": None}
+    res = check_wallet_clusters(addr, chain="solana", api_key=BUBBLEMAPS_API_KEY)
+    st.session_state["bm_cache"][key] = {"ts": now, "res": res}
+    return res
+
+# ---------------- Trading (Paper) + Bubblemaps + GetMoni ----------------
+st.markdown("## 🧪 Trading — Paper Mode (Bubblemaps + GetMoni)")
+
 r_cfg = RiskConfig(
     position_usd=float(st.session_state.get("pos_usd",50.0)),
     max_positions=int(st.session_state.get("max_pos",3)),
@@ -562,220 +579,189 @@ r_cfg = RiskConfig(
     take_profit_pct=float(st.session_state.get("tp_pct",40))/100.0,
     trailing_pct=float(st.session_state.get("trail_pct",15))/100.0,
     daily_loss_limit_usd=float(st.session_state.get("day_loss",200.0)),
-    # NEW anti-duplicati
     max_positions_per_symbol=int(st.session_state.get("max_per_symbol",1)),
     symbol_cooldown_min=int(st.session_state.get("cooldown_min",20)),
     allow_pyramiding=bool(st.session_state.get("allow_pyr", False)),
     pyramid_add_on_trigger_pct=float(st.session_state.get("add_on_pct",8))/100.0,
     time_stop_min=int(st.session_state.get("time_stop_min",60)),
+    # Break-even lock
+    be_trigger_pct=float(st.session_state.get("be_trig",10))/100.0,
+    be_lock_profit_pct=float(st.session_state.get("be_lock",2))/100.0,
+    dd_lock_pct=float(st.session_state.get("dd_lock",6))/100.0,
 )
-s_cfg = StratConfig(meme_score_min=int(st.session_state.get("strat_meme",75)), txns1h_min=int(st.session_state.get("strat_txns",300)),
-                    liq_min=float(liq_min_sweet), liq_max=float(liq_max_sweet),
-                    allow_dex=("raydium","orca","meteora"))
 
-if st.session_state["trade_engine"] is None:
+s_cfg = StratConfig(
+    meme_score_min=int(st.session_state.get("strat_meme",70)),
+    txns1h_min=int(st.session_state.get("strat_txns",250)),
+    liq_min=float(liq_min_sweet),
+    liq_max=float(liq_max_sweet),
+    turnover_min=float(st.session_state.get("strat_turnover",1.2)),
+    chg24_min=float(st.session_state.get("chg_min",-8)),
+    chg24_max=float(st.session_state.get("chg_max",180)),
+    allow_dex=("raydium","orca","meteora"),
+    heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
+    heat_tx1h_avg_min=int(st.session_state.get("strat_heat_avg",120)),
+)
+
+if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
     st.session_state["trade_engine"] = TradeEngine(r_cfg, s_cfg, bm_check=bm_check_cached, sent_check=sent_check)
 else:
-    eng = st.session_state["trade_engine"]
-    eng.risk.cfg = r_cfg
-    eng.strategy.cfg = s_cfg
-    eng.bm_check = bm_check_cached
-    eng.sent_check = sent_check
+    eng_tmp = st.session_state["trade_engine"]
+    eng_tmp.risk.cfg = r_cfg
+    eng_tmp.strategy.cfg = s_cfg
+    eng_tmp.bm_check = bm_check_cached
+    eng_tmp.sent_check = sent_check
 
 eng = st.session_state["trade_engine"]
+
 if df_pairs is None or df_pairs.empty:
     st.info("Nessun dato per la strategia al momento.")
+    df_signals = pd.DataFrame()
+    df_open = pd.DataFrame()
+    df_closed = pd.DataFrame()
 else:
     df_signals, df_open, df_closed = eng.step(df_pairs)
 
-    st.markdown("**Segnali (candidati all'ingresso)**")
-    if not df_signals.empty:
-        st.dataframe(df_signals.head(12), use_container_width=True)
-    else:
-        st.caption("Nessun segnale valido: filtri tecnici, Bubblemaps e/o GetMoni possono aver escluso i candidati.")
-
-    st.markdown("**Posizioni aperte (Paper)**")
-    if not df_open.empty:
-        cols = st.columns([3,2,2,2,2,2,2])
-        cols[0].write("Pair"); cols[1].write("Entry"); cols[2].write("Last"); cols[3].write("PnL $"); cols[4].write("PnL %"); cols[5].write("Aperta da"); cols[6].write("Azioni")
-        for _, r in df_open.iterrows():
-            c = st.columns([3,2,2,2,2,2,2])
-            c[0].write(f"{r['symbol']} ({r['label']})")
-            c[1].write(f"{r['entry']:.8f}")
-            c[2].write(f"{r['last']:.8f}")
-            c[3].write(f"{r['pnl_usd']:.2f}")
-            c[4].write(f"{r['pnl_pct']*100:.2f}%")
-            c[5].write(r['opened_ago'])
-            if c[6].button("Chiudi", key=f"close_{r['id']}"):
-                try:
-                    px = float(r["last"]); eng.close_by_id(str(r["id"]), px)
-                except Exception:
-                    pass
-        st.caption(f"Posizioni aperte: {len(df_open)} / max {st.session_state['max_pos']}")
-    else:
-        st.caption("Nessuna posizione aperta.")
-
-    st.markdown("**Ultime chiusure**")
-    if not df_closed.empty:
-        st.dataframe(df_closed, use_container_width=True)
-    else:
-        st.caption("Nessuna chiusura registrata (ancora).")
-
-    # Performance rapida
-    st.markdown("**Performance (Paper)**")
-    st.metric("Daily PnL", f"{eng.risk.state.daily_pnl:.2f} USD",
-              help=f"Stop nuove entrate se PnL giornaliero ≤ -{eng.risk.cfg.daily_loss_limit_usd:.0f} USD")
-    if not df_closed.empty:
-        try:
-            pnl_series = pd.to_numeric(df_closed["pnl_usd"], errors="coerce").fillna(0).cumsum()
-            perf_df = pd.DataFrame({"Trade #": range(1, len(pnl_series)+1), "CumPnL": pnl_series})
-            figp = px.line(perf_df, x="Trade #", y="CumPnL", title="Cumulative PnL (closed)")
-            st.plotly_chart(figp, use_container_width=True)
-        except Exception:
-            st.caption("Impossibile generare la curva PnL.")
-    else:
-        st.caption("Nessuna chiusura → curva PnL in attesa.")
-
-# ---------------- LIVE Pump.fun (WS) + Fallback Moralis ----------------
-class PumpFunLive:
-    def __init__(self, max_rows=200, api_key: str | None = None, ua: str | None = None):
-        self.max_rows = int(max_rows); self.api_key = api_key
-        base = "wss://pumpportal.fun/api/data"
-        self.url = f"{base}?api-key={api_key}" if api_key else base
-        self.headers = ["Origin: https://pumpportal.fun", f"User-Agent: {ua or 'MemeRadar/1.0 (+streamlit)'}"]
-        self._rows = []; self._lock = threading.Lock(); self._stop = threading.Event()
-        self._ws = None; self._thread = None; self._last_err = None; self._connected = False; self._last_close = None
-    def start(self):
-        if self._thread and self._thread.is_alive(): return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="PumpFunLive", daemon=True); self._thread.start()
-    def reconnect_now(self):
-        self.stop(); time.sleep(0.2); self.start()
-    def stop(self):
-        self._stop.set()
-        try:
-            if self._ws: self._ws.close()
-        except Exception: pass
-    def _on_open(self, ws):
-        self._connected = True; self._last_err = None
-        try: ws.send(json.dumps({"method": "subscribeNewToken"}))
-        except Exception as e: self._last_err = f"on_open send err: {e}"
-    def _on_message(self, ws, message: str):
-        try:
-            data = json.loads(message) if isinstance(message, (str, bytes, bytearray)) else message
-            mint   = data.get("mint") or data.get("token") or data.get("mintAddress") or data.get("address")
-            name   = data.get("name") or data.get("tokenName") or data.get("symbol") or ""
-            symbol = data.get("symbol") or ""
-            creator= data.get("creator") or data.get("user") or data.get("owner") or ""
-            ts = (data.get("createdTimestamp") or data.get("createdOn") or data.get("createdAt") or int(time.time()))
-            if not mint: return
-            row = {"Mint": mint,"Name": name,"Symbol": symbol,"Creator": creator,
-                   "Created (UTC)": ms_to_dt(ts),"Age": fmt_age(hours_since_ms(ts)),
-                   "Pump.fun": f"https://pump.fun/coin/{mint}","Solscan": f"https://solscan.io/token/{mint}"}
-            with self._lock:
-                if any(r["Mint"] == mint for r in self._rows): return
-                self._rows.insert(0, row); 
-                if len(self._rows) > self.max_rows: self._rows = self._rows[:self.max_rows]
-        except Exception as e: self._last_err = f"on_message err: {e}"
-    def _on_error(self, ws, error): self._last_err = f"{error}"
-    def _on_close(self, ws, code, msg): self._connected = False; self._last_close = f"code={code}, reason={msg}"
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                self._ws = websocket.WebSocketApp(self.url, header=self.headers,
-                    on_open=self._on_open, on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
-                self._ws.run_forever(ping_interval=20, ping_timeout=10, ping_payload="ping")
-            except Exception as e: self._last_err = f"run_forever err: {e}"
-            if not self._stop.is_set(): time.sleep(1.5 + random.uniform(0, 2.0))
-    def snapshot_df(self) -> pd.DataFrame:
-        with self._lock: return pd.DataFrame(self._rows).copy()
-    def status(self):
-        info = []
-        if self._last_err: info.append(f"err={self._last_err}")
-        if self._last_close: info.append(f"close={self._last_close}")
-        return ("connected" if self._connected else "disconnected", " • ".join(info) if info else None)
-
-# init live
-if "pump_live" not in st.session_state: st.session_state["pump_live"] = None
-if pump_enable and websocket is None:
-    st.warning("Installa `websocket-client` in requirements.txt per attivare il feed live.")
-elif pump_enable and websocket is not None:
-    if st.session_state["pump_live"] is None:
-        st.session_state["pump_live"] = PumpFunLive(max_rows=pump_buffer, api_key=os.getenv("PUMP_API_KEY","")); st.session_state["pump_live"].start()
-    else:
-        st.session_state["pump_live"] = st.session_state["pump_live"]
-        st.session_state["pump_live"].max_rows = int(pump_buffer)
+# Segnali
+st.markdown("**Segnali (candidati all'ingresso)**")
+if not df_signals.empty:
+    st.dataframe(df_signals.head(12), use_container_width=True)
 else:
-    if st.session_state["pump_live"] is not None:
-        st.session_state["pump_live"].stop(); st.session_state["pump_live"] = None
+    st.caption("Nessun segnale valido: filtri tecnici, Bubblemaps e/o GetMoni possono aver escluso i candidati.")
 
-def moralis_new_tokens(exchange: str, limit: int = 20, api_key: str | None = None) -> pd.DataFrame:
-    if not api_key:
-        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
-    url = f"https://solana-gateway.moralis.io/token/mainnet/exchange/{exchange}/new?limit={int(limit)}"
-    headers = {"X-API-Key": api_key, **UA_HEADERS}
-    data, code = fetch_with_retry(url, headers=headers)
-    if not data:
-        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
-    items = data.get("result") or data.get("data") or data.get("tokens") or data.get("items") or data
-    if not isinstance(items, list): items = []
-    rows = []
-    for t in items:
-        mint = t.get("mint") or t.get("tokenAddress") or t.get("token_address") or t.get("address") or t.get("id")
-        name = t.get("name") or t.get("tokenName") or t.get("symbol") or ""
-        symbol = t.get("symbol") or ""
-        ts = t.get("createdAt") or t.get("created_time") or t.get("creationTime") or t.get("createdTimestamp") or 0
-        rows.append({"Mint": mint or "", "Name": name, "Symbol": symbol,
-                     "Created (UTC)": ms_to_dt(ts) if ts else "", "Age": fmt_age(hours_since_ms(ts)) if ts else "",
-                     "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "", "Solscan": f"https://solscan.io/token/{mint}" if mint else ""})
-    df = pd.DataFrame(rows)
-    if not df.empty: df = df.drop_duplicates(subset=["Mint"]).reset_index(drop=True)
-    return df
-
-st.markdown("## 🔴 LIVE: New on Pump.fun")
-if pump_enable and st.session_state["pump_live"] and websocket is not None:
-    p = st.session_state["pump_live"]
-    status, last_info = p.status()
-    col_stat, col_btn = st.columns([3,1])
-    with col_stat:
-        st.caption(f"WebSocket: {status}" + (f" • {last_info}" if last_info else ""))
-    with col_btn:
-        if st.button("🔁 Riconnetti WS"): p.reconnect_now()
-
-    df_live = p.snapshot_df()
-    keys = [k.strip().lower() for k in (pump_keywords or "").split(",") if k.strip()]
-    if not df_live.empty and keys:
-        def match_row(r):
-            s = (str(r.get("Name","")) + " " + str(r.get("Symbol",""))).lower()
-            return any(k in s for k in keys)
-        df_live = df_live[df_live.apply(match_row, axis=1)].reset_index(drop=True)
-
-    if not df_live.empty:
-        st.dataframe(df_live.head(50), use_container_width=True,
-                     column_config={"Pump.fun": st.column_config.LinkColumn("Pump.fun"),
-                                    "Solscan": st.column_config.LinkColumn("Solscan")})
-        # (opz) invio Telegram su match keyword
-        if pump_alert_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and keys:
+# Posizioni aperte
+st.markdown("**Posizioni aperte (Paper)**")
+if not df_open.empty:
+    cols = st.columns([3,2,2,2,2,2,2])
+    cols[0].write("Pair"); cols[1].write("Entry"); cols[2].write("Last"); cols[3].write("PnL $ (aperto)"); cols[4].write("PnL % (aperto)"); cols[5].write("Aperta da"); cols[6].write("Azioni")
+    for _, r in df_open.iterrows():
+        c = st.columns([3,2,2,2,2,2,2])
+        c[0].write(f"{r['symbol']} ({r['label']})")
+        c[1].write(f"{r['entry']:.8f}")
+        c[2].write(f"{r['last']:.8f}")
+        c[3].write(f"{r['pnl_usd']:.2f}")
+        c[4].write(f"{r['pnl_pct']*100:.2f}%")
+        c[5].write(r['opened_ago'])
+        if c[6].button("Chiudi", key=f"close_{r['id']}"):
             try:
-                hit = df_live.iloc[0].to_dict()
-                text = f"🆕 Pump.fun: {hit.get('Name','')} ({hit.get('Symbol','')})\n{hit.get('Pump.fun','')}"
-                requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                             params={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+                px = float(r["last"]); eng.close_by_id(str(r["id"]), px)
             except Exception:
                 pass
-    else:
-        st.info("In ascolto… nessun evento finora.")
-        if moralis_enable and MORALIS_API_KEY:
-            df_fb = moralis_new_tokens(moralis_exchange, moralis_limit, MORALIS_API_KEY)
-            if not df_fb.empty:
-                st.markdown("**Ultimi token (HTTP fallback — Moralis)**")
-                st.dataframe(df_fb.head(moralis_limit), use_container_width=True,
-                             column_config={"Pump.fun": st.column_config.LinkColumn("Pump.fun"),
-                                            "Solscan": st.column_config.LinkColumn("Solscan")})
-        elif moralis_enable and not MORALIS_API_KEY:
-            st.caption("Per il fallback Moralis inserisci una MORALIS_API_KEY (free).")
+    st.caption(f"Posizioni aperte: {len(df_open)} / max {st.session_state['max_pos']}")
 else:
-    st.caption("Attiva “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
+    st.caption("Nessuna posizione aperta.")
+
+# Ultime chiusure
+st.markdown("**Ultime chiusure**")
+if not df_closed.empty:
+    st.dataframe(df_closed, use_container_width=True)
+else:
+    st.caption("Nessuna chiusura registrata (ancora).")
+
+# Performance rapida — PnL aperto/realizzato/totale
+st.markdown("**Performance (Paper)**")
+open_pnl = float(pd.to_numeric(df_open["pnl_usd"], errors="coerce").fillna(0).sum()) if not df_open.empty else 0.0
+realized = float(eng.risk.state.daily_pnl) if eng else 0.0
+total_today = open_pnl + realized
+m1, m2, m3 = st.columns(3)
+with m1:
+    st.metric("PnL Aperto (Unrealized)", f"{open_pnl:.2f} USD")
+with m2:
+    st.metric("PnL Giornaliero (Realizzato)", f"{realized:.2f} USD",
+              help="Si aggiorna quando chiudi una posizione.")
+with m3:
+    st.metric("Totale Oggi", f"{total_today:.2f} USD",
+              help=f"Somma di aperto + realizzato. Il daily risk limit resta su PnL realizzato (−{r_cfg.daily_loss_limit_usd:.0f} USD).")
+
+if not df_closed.empty:
+    try:
+        pnl_series = pd.to_numeric(df_closed["pnl_usd"], errors="coerce").fillna(0).cumsum()
+        perf_df = pd.DataFrame({"Trade #": range(1, len(pnl_series)+1), "CumPnL": pnl_series})
+        figp = px.line(perf_df, x="Trade #", y="CumPnL", title="Cumulative PnL (closed)")
+        st.plotly_chart(figp, use_container_width=True)
+    except Exception:
+        st.caption("Impossibile generare la curva PnL.")
+else:
+    st.caption("Nessuna chiusura → curva PnL in attesa.")
+
+# ---------------- ALERT TELEGRAM dalla tabella ----------------
+def tg_send(text: str) -> tuple[bool, str | None]:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False, "missing-credentials"
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
+            timeout=15
+        )
+        return (True, None) if r.ok else (False, f"status={r.status_code}")
+    except Exception as e:
+        return False, str(e)
+
+if "tg_sent" not in st.session_state:
+    st.session_state["tg_sent"] = {}  # {baseAddress: ts_last_sent}
+
+tg_sent_now = 0
+if enable_alerts:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        st.warning("Alert attivi ma credenziali Telegram mancanti: compila Bot Token e Chat ID nella sidebar.")
+    elif df_pairs is None or df_pairs.empty:
+        st.caption("Alert attivi, ma non ci sono coppie post-filtri.")
+    else:
+        try:
+            df_alert = df_pairs.copy()
+            # Applica soglie
+            mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & \
+                   (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
+            if int(alert_meme_min) > 0:
+                mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
+            df_alert = df_alert[mask]
+            # Ordina per priorità
+            if not df_alert.empty:
+                df_alert = df_alert.sort_values(
+                    by=["Meme Score", "Txns 1h", "Liquidity (USD)"],
+                    ascending=[False, False, False]
+                )
+                # Cooldown anti-spam
+                now = time.time()
+                cooldown = int(alert_cooldown_min) * 60
+                max_send = int(alert_max_per_run)
+                for _, row in df_alert.head(max_send*2).iterrows():  # scansiona un po' di più del max_send
+                    addr = str(row.get("Base Address","")) or row.get("Pair")
+                    last_ts = st.session_state["tg_sent"].get(addr, 0)
+                    if now - last_ts < cooldown:
+                        continue
+                    # Compose message
+                    pair = row.get("Pair","")
+                    dex  = row.get("DEX","")
+                    ms   = int(row.get("Meme Score", 0) or 0)
+                    tx1  = int(row.get("Txns 1h", 0) or 0)
+                    liq  = int(row.get("Liquidity (USD)", 0) or 0)
+                    vol  = int(row.get("Volume 24h (USD)", 0) or 0)
+                    px   = row.get("Price (USD)", None)
+                    chg  = row.get("Change 24h (%)", None)
+                    link = row.get("Link","")
+                    txt = (
+                        f"⚡️ Radar Hit — {pair}\n"
+                        f"DEX: {dex}  |  MemeScore: {ms}\n"
+                        f"Txns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}\n"
+                        f"Price: {px:.8f}" if isinstance(px,(int,float)) and px else ""
+                    )
+                    if chg is not None:
+                        try:
+                            txt += f"  |  24h: {float(chg):.2f}%"
+                        except Exception:
+                            pass
+                    if link:
+                        txt += f"\n{link}"
+                    ok, err = tg_send(txt)
+                    if ok:
+                        st.session_state["tg_sent"][addr] = now
+                        tg_sent_now += 1
+                        if tg_sent_now >= max_send:
+                            break
+        except Exception as e:
+            st.caption(f"Alert Telegram: errore durante la scansione — {e}")
 
 # ---------------- Diagnostica ----------------
 st.subheader("Diagnostica")
@@ -783,10 +769,10 @@ d1, d2, d3, d4 = st.columns(4)
 with d1: st.text(f"Query provider: {len(SEARCH_QUERIES)}  •  HTTP: {codes if codes else '—'}")
 with d2: st.text(f"Righe provider (post-filtri provider): {pre_count}")
 with d3: st.text(f"Righe dopo watchlist: {post_count}")
-with d4: 
+with d4:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
-st.caption(f"Refresh: {REFRESH_SEC}s • GetMoni calls: {st.session_state.get('gm_calls',0)} • Ticket proxy: ${PROXY_TICKET:.0f}")
+st.caption(f"Refresh: {REFRESH_SEC}s • GetMoni calls: {st.session_state.get('gm_calls',0)} • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
 
-# 🔚 Aggiorna il timestamp dell'ultimo run per il prossimo countdown
+# 🔚 aggiorna timestamp per countdown
 st.session_state["last_refresh_ts"] = time.time()
