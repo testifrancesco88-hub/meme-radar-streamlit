@@ -1,12 +1,14 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12.1 Live Mirror + Volume Filter
+# streamlit_app.py — Meme Radar (Streamlit) v12.2
 # - Scanner Solana (DexScreener + Birdeye per nuove coin)
 # - KPI, Meme Score, grafici, watchlist
-# - Filtro Volume 24h (MIN/MAX) — NUOVO
+# - Filtro Volume 24h (MIN/MAX)
 # - DEX consentiti (multiselect)
 # - StrategyMomentumV2 + Diagnostica + Adaptive Relax
 # - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
 # - Alert Telegram dalla tabella
 # - LIVE Trading (Jupiter): deeplink o autosign (locale)
+# - Toggle Top10 tabella + Change 1h + Change 4h con fallback H6
+# - Start / Stop: pausa globale (strategia, alert, live mirror)
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
 import os, time, math, random, datetime, json, threading, base64
@@ -190,12 +192,34 @@ UA_HEADERS = {
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
 
+# Stato esecuzione
+if "app_running" not in st.session_state:
+    st.session_state["app_running"] = True  # default ON
+running = bool(st.session_state.get("app_running", True))
+st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
+
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("Impostazioni")
+
+    # --- Controllo esecuzione (Start / Stop) ---
+    st.subheader("Esecuzione")
+    col_run1, col_run2 = st.columns(2)
+    if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
+        st.session_state["app_running"] = True
+        st.toast("Esecuzione avviata", icon="✅")
+        # opzionale: mantieni live_positions
+    if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
+        st.session_state["app_running"] = False
+        # opzionale (prudente): svuota live mirror
+        st.session_state["live_positions"] = {}
+        st.toast("Esecuzione in pausa", icon="⏸️")
+    running = bool(st.session_state["app_running"])
+
+    st.divider()
     auto_refresh = st.toggle("Auto-refresh", value=True)
     disable_all_filters = st.toggle("Disattiva filtri provider (mostra tutto)", value=False)
     only_raydium = st.toggle("Solo Raydium (dexId=raydium)", value=False, disabled=disable_all_filters)
@@ -210,11 +234,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Watchlist")
     wl_default = os.getenv("WATCHLIST", "")
-    watchlist_input = st.text_input("Simboli o address (comma-separated)", value=wl_default, help="Es: WIF,BONK,So111...,<pairAddress>")
-    watchlist_only = st.toggle("Mostra solo watchlist", value=False)
+    watchlist_input = st.text_input("Simboli o address (comma-separated)", value=wl_default,
+                                    help="Es: WIF,BONK,So111...,<pairAddress>", key="watchlist_input")
+    watchlist_only = st.toggle("Mostra solo watchlist", value=False, key="watchlist_only")
 
     st.divider()
-    st.subheader("Filtro Volume 24h (USD) — NUOVO")
+    st.subheader("Filtro Volume 24h (USD)")
     vol24_min = st.number_input("Volume 24h MIN", min_value=0, value=st.session_state.get("vol24_min", 0), step=10000, key="vol24_min")
     vol24_max = st.number_input("Volume 24h MAX (0 = illimitato)", min_value=0, value=st.session_state.get("vol24_max", 0), step=100000, key="vol24_max")
 
@@ -238,9 +263,12 @@ with st.sidebar:
     )
     st.session_state["allowed_dex"] = allowed_dex
 
+    # --- Tabella ---
     st.divider()
     st.subheader("Tabella")
     show_pair_age = st.toggle("Mostra colonna 'Pair Age' (min/ore)", value=True)
+    show_top10_table = st.toggle("Tabella: mostra solo Top 10 per Volume 24h", value=True)
+    show_h6_fallback = st.toggle("Fallback: mostra Change H6 se H4 mancante", value=True)
 
     st.divider()
     st.subheader("Alert Telegram (tabella)")
@@ -330,13 +358,13 @@ with st.sidebar:
     st.divider()
     st.subheader("Live Trading (Jupiter)")
     live_mode = st.selectbox("Modalità", ["off","deeplink","autosign"], index=0,
-                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua).")
+                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua, non cloud).")
     slip_bps  = st.number_input("Slippage (bps)", min_value=10, value=100, step=10)
     rpc_url   = st.text_input("RPC URL (solo autosign)", value=os.getenv("SOL_RPC_URL",""))
     pub_key   = st.text_input("WALLET Public Key (solo autosign)", value=os.getenv("WALLET_PUB",""))
     priv_b58  = st.text_input("WALLET Private Key (base58) • NON su cloud", value=os.getenv("WALLET_PRIV",""), type="password")
 
-# 🔁 Auto-refresh
+# 🔁 Auto-refresh (condizionato a Running)
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -352,7 +380,8 @@ _prev_ts = float(st.session_state.get("last_refresh_ts", time.time()))
 _next_ts = _prev_ts + max(1, REFRESH_SEC)
 secs_left = max(0, int(round(_next_ts - time.time())))
 
-if auto_refresh:
+effective_auto_refresh = auto_refresh and running
+if effective_auto_refresh:
     if st_autorefresh:
         st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
     else:
@@ -497,7 +526,10 @@ def norm_list(s):
         if not part: continue
         out.append(part.upper() if len(part) <= 8 else part)
     return out
-watchlist = norm_list(st.session_state.get("watchlist_input", ""))  # not used directly
+
+watchlist_input_val = st.session_state.get("watchlist_input", "")
+watchlist = norm_list(watchlist_input_val)
+
 def is_watch_hit_row(r):
     base = str(r.get("baseSymbol","")).upper() if hasattr(r,"get") else str(r["baseSymbol"]).upper()
     quote= str(r.get("quoteSymbol","")).upper() if hasattr(r,"get") else str(r["quoteSymbol"]).upper()
@@ -505,14 +537,12 @@ def is_watch_hit_row(r):
     return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
 
 # Applica watchlist_only
-watchlist_input = st.session_state.get("watchlist_input", "")
-watchlist = norm_list(watchlist_input)
 if st.session_state.get("watchlist_only", False) and not df_view.empty:
     mask = df_view.apply(is_watch_hit_row, axis=1)
     df_view = df_view[mask].reset_index(drop=True)
 post_watch_count = len(df_view)
 
-# Applica filtro Volume 24h (NUOVO)
+# Applica filtro Volume 24h
 vmin = int(st.session_state.get("vol24_min", 0))
 vmax = int(st.session_state.get("vol24_max", 0))
 if not df_view.empty:
@@ -600,11 +630,28 @@ with right:
         st.plotly_chart(fig2, use_container_width=True)
 
 # ---------------- Tabella pairs con Meme Score ----------------
+def _first_or_none(d, keys):
+    for k in keys:
+        try:
+            v = d.get(k) if hasattr(d, "get") else d[k]
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    return None
+
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
         mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
+
+        # Change 1h / 4h con fallback H6 se richiesto
+        chg_1h = _first_or_none(r, ["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"])
+        chg_4h = _first_or_none(r, ["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"])
+        if chg_4h is None and show_h6_fallback:
+            chg_4h = _first_or_none(r, ["priceChange6hPct","priceChangeH6Pct","pc6h","priceChange6h"])
+
         rows.append({
             "Meme Score": mscore,
             "Pair": f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
@@ -613,6 +660,8 @@ def build_table(df):
             "Txns 1h": int(r.get("txns1h") or 0),
             "Volume 24h (USD)": int(round(r.get("volume24hUsd") or 0)),
             "Price (USD)": r.get("priceUsd"),
+            "Change 1h (%)": chg_1h,
+            "Change 4h/6h (%)": chg_4h,
             "Change 24h (%)": r.get("priceChange24hPct"),
             "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
             "Pair Age": fmt_age(ageh),
@@ -630,11 +679,15 @@ df_pairs = build_table(df_view)
 
 st.markdown("### Pairs (post-filtri)")
 if not df_pairs.empty:
-    display_cols = [c for c in df_pairs.columns if c not in ("baseSymbol","quoteSymbol")]
+    # Vista "Top 10 per Volume 24h" SOLO per la resa tabellare se richiesto
+    df_pairs_for_view = df_pairs.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else df_pairs
+
+    display_cols = [c for c in df_pairs_for_view.columns if c not in ("baseSymbol","quoteSymbol")]
     if not show_pair_age and "Pair Age" in display_cols:
         display_cols.remove("Pair Age")
+
     st.dataframe(
-        df_pairs[display_cols],
+        df_pairs_for_view[display_cols],
         use_container_width=True,
         column_config={
             "Link": st.column_config.LinkColumn("Link", help="Apri su DexScreener"),
@@ -642,9 +695,16 @@ if not df_pairs.empty:
             "Volume 24h (USD)": st.column_config.NumberColumn(format="%,d"),
             "Meme Score": st.column_config.NumberColumn(help="0–100: più alto = più 'meme' + momentum"),
             "Price (USD)": st.column_config.NumberColumn(format="%.8f"),
+            "Change 1h (%)": st.column_config.NumberColumn(format="%.2f"),
+            "Change 4h/6h (%)": st.column_config.NumberColumn(format="%.2f"),
             "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
         }
     )
+    cap = "Top 10 per Volume 24h." if show_top10_table else "Tutte le coppie post-filtri."
+    cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
+    st.caption(cap)
+else:
+    st.caption("Nessuna coppia disponibile con i filtri attuali.")
 
 # ---------------- Diagnostica Strategia ----------------
 def market_heat_value(df: pd.DataFrame, topN: int) -> float:
@@ -679,7 +739,7 @@ else:
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
     # Vol24 OK sul dataset attuale (già filtrato): utile a colpo d'occhio
-    vmin = int(st.session_state.get("vol24_min", 0)); vmax = int(st.session_state.get("vol24_max", 0))
+    if vmin is None: vmin = 0
     if vmax > 0:
         c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vmax))
     else:
@@ -697,7 +757,7 @@ else:
     cols[6].metric("Turnover OK", c_turn)
     cols[7].metric("Change24 OK", c_chg)
 
-# === Adaptive Relax (invariato) ================================================
+# === Adaptive Relax ============================================================
 def _count_candidates(df: pd.DataFrame, cfg) -> int:
     if df is None or df.empty: 
         return 0
@@ -803,11 +863,16 @@ else:
 
 eng = st.session_state["trade_engine"]
 
+# In pausa: non eseguire step
 if df_pairs is None or df_pairs.empty:
     st.info("Nessun dato per la strategia al momento.")
     df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
 else:
-    df_signals, df_open, df_closed = eng.step(df_pairs)
+    if running:
+        df_signals, df_open, df_closed = eng.step(df_pairs)
+    else:
+        df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
+        st.info("Strategia in pausa — premi ▶️ Start per riattivare.")
 
 st.markdown("**Segnali (candidati all'ingresso)**")
 if not df_signals.empty: st.dataframe(df_signals.head(12), use_container_width=True)
@@ -866,7 +931,7 @@ def tg_send(text: str) -> tuple[bool, str | None]:
 if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
 
 tg_sent_now = 0
-if enable_alerts and (df_pairs is not None) and not df_pairs.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+if running and enable_alerts and (df_pairs is not None) and not df_pairs.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
     try:
         df_alert = df_pairs.copy()
         mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
@@ -924,67 +989,70 @@ def find_mints_for_symbol(symbol: str) -> tuple[str | None, str | None]:
         quote_mint = MINT_USDC if qs in ("USDC","USDT") else (MINT_SOL if qs in ("SOL","WSOL") else MINT_USDC)
     return (base_mint, quote_mint)
 
-live_log = []
-
-curr_ids = set()
-if not df_open.empty and "id" in df_open.columns:
-    curr_ids = set(str(x) for x in df_open["id"].tolist())
-prev_ids = set(st.session_state["live_positions"].keys())
-
-# APERTURE
-new_ids = curr_ids - prev_ids
-for tid in list(new_ids):
-    try:
-        r = df_open[df_open["id"].astype(str) == tid].iloc[0]
-        symbol = r.get("symbol","")
-        base_mint, quote_mint = find_mints_for_symbol(symbol)
-        if not base_mint:
-            live_log.append(f"BUY {symbol} → mint base non trovato")
-            continue
-        size_usd = float(st.session_state.get("pos_usd", 50.0))
-        px_usd   = float(r.get("entry") or r.get("last") or 0.0)
-        mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd)
-        qty_base_est = size_usd / max(px_usd, 1e-9) if px_usd else 0.0
-        st.session_state["live_positions"][tid] = {"symbol":symbol, "base_mint": base_mint, "quote_mint": quote_mint,
-                                                   "qty_base": qty_base_est, "last_sig": None, "last_url": None}
-        if mode == "deeplink":
-            st.session_state["live_positions"][tid]["last_url"] = payload
-            live_log.append(f"BUY {symbol} → [Jupiter link]({payload})")
-        elif mode == "sent":
-            st.session_state["live_positions"][tid]["last_sig"] = payload
-            live_log.append(f"BUY {symbol} → tx: `{payload}`")
-        else:
-            live_log.append(f"BUY {symbol} → {payload}")
-    except Exception as e:
-        live_log.append(f"BUY error: {e}")
-
-# CHIUSURE
-closed_ids = prev_ids - curr_ids
-for tid in list(closed_ids):
-    info = st.session_state["live_positions"].get(tid)
-    if not info: 
-        continue
-    try:
-        symbol = info.get("symbol","?")
-        base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
-        mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
-        if mode == "deeplink":
-            live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
-        elif mode == "sent":
-            live_log.append(f"SELL {symbol} → tx: `{payload}`")
-        else:
-            live_log.append(f"SELL {symbol} → {payload}")
-    except Exception as e:
-        live_log.append(f"SELL error: {e}")
-    finally:
-        st.session_state["live_positions"].pop(tid, None)
-
-if live_cfg.mode == "off":
-    st.caption("Live: OFF")
-elif not live_log:
-    st.caption("Live: nessuna operazione da replicare in questo tick.")
+if not running:
+    st.caption("Live: app in pausa — nessuna operazione verrà replicata finché non riattivi ▶️ Start.")
 else:
-    for line in live_log: st.write("• " + line)
+    live_log = []
+
+    curr_ids = set()
+    if not df_open.empty and "id" in df_open.columns:
+        curr_ids = set(str(x) for x in df_open["id"].tolist())
+    prev_ids = set(st.session_state["live_positions"].keys())
+
+    # APERTURE
+    new_ids = curr_ids - prev_ids
+    for tid in list(new_ids):
+        try:
+            r = df_open[df_open["id"].astype(str) == tid].iloc[0]
+            symbol = r.get("symbol","")
+            base_mint, quote_mint = find_mints_for_symbol(symbol)
+            if not base_mint:
+                live_log.append(f"BUY {symbol} → mint base non trovato")
+                continue
+            size_usd = float(st.session_state.get("pos_usd", 50.0))
+            px_usd   = float(r.get("entry") or r.get("last") or 0.0)
+            mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd)
+            qty_base_est = size_usd / max(px_usd, 1e-9) if px_usd else 0.0
+            st.session_state["live_positions"][tid] = {"symbol":symbol, "base_mint": base_mint, "quote_mint": quote_mint,
+                                                       "qty_base": qty_base_est, "last_sig": None, "last_url": None}
+            if mode == "deeplink":
+                st.session_state["live_positions"][tid]["last_url"] = payload
+                live_log.append(f"BUY {symbol} → [Jupiter link]({payload})")
+            elif mode == "sent":
+                st.session_state["live_positions"][tid]["last_sig"] = payload
+                live_log.append(f"BUY {symbol} → tx: `{payload}`")
+            else:
+                live_log.append(f"BUY {symbol} → {payload}")
+        except Exception as e:
+            live_log.append(f"BUY error: {e}")
+
+    # CHIUSURE
+    closed_ids = prev_ids - curr_ids
+    for tid in list(closed_ids):
+        info = st.session_state["live_positions"].get(tid)
+        if not info: 
+            continue
+        try:
+            symbol = info.get("symbol","?")
+            base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
+            mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
+            if mode == "deeplink":
+                live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
+            elif mode == "sent":
+                live_log.append(f"SELL {symbol} → tx: `{payload}`")
+            else:
+                live_log.append(f"SELL {symbol} → {payload}")
+        except Exception as e:
+            live_log.append(f"SELL error: {e}")
+        finally:
+            st.session_state["live_positions"].pop(tid, None)
+
+    if live_cfg.mode == "off":
+        st.caption("Live: OFF")
+    elif not live_log:
+        st.caption("Live: nessuna operazione da replicare in questo tick.")
+    else:
+        for line in live_log: st.write("• " + line)
 
 # ---------------- Diagnostica finale ----------------
 st.subheader("Diagnostica")
@@ -996,6 +1064,6 @@ with d4: st.text(f"Righe dopo filtro volume: {post_vol_count}")
 with d5:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
-st.caption(f"Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
+st.caption(f"Stato esecuzione: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
 
 st.session_state["last_refresh_ts"] = time.time()
