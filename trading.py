@@ -1,6 +1,6 @@
-# trading.py — motore di paper trading + risk manager + strategia momentum per meme coin
+# trading.py — motore di paper trading + strategia Momentum V2 + break-even lock
 from __future__ import annotations
-import time, uuid
+import time, math, uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -16,12 +16,16 @@ class RiskConfig:
     trailing_pct: float = 0.15
     daily_loss_limit_usd: float = 200.0
     slippage_pct: float = 0.01
-    # --- anti-duplicati / timing ---
+    # anti-duplicati & timing
     max_positions_per_symbol: int = 1
     symbol_cooldown_min: int = 20
     allow_pyramiding: bool = False
-    pyramid_add_on_trigger_pct: float = 0.08  # 8% sopra ultimo ingresso
-    time_stop_min: int = 60                   # 0 = disattivo
+    pyramid_add_on_trigger_pct: float = 0.08
+    time_stop_min: int = 60
+    # --- NEW: Break-even lock (difesa utile del profitto) ---
+    be_trigger_pct: float = 0.10       # quando PnL% >= 10% abilita il lock
+    be_lock_profit_pct: float = 0.02   # non mollare sotto +2% complessivi
+    dd_lock_pct: float = 0.06          # se drawdown dal max >=6% mentre BE è attivo -> chiudi
 
 @dataclass
 class RiskState:
@@ -72,6 +76,7 @@ class Position:
     side: str = "long"
     opened_ts: float = field(default_factory=lambda: time.time())
     max_price_seen: float = 0.0
+    be_armed: bool = False  # NEW: break-even lock abilitato?
 
 class PaperBroker:
     def __init__(self, risk: RiskManager):
@@ -108,23 +113,32 @@ class PaperBroker:
             pnl_pct = (px / pos.entry_price - 1.0) if pos.entry_price > 0 else 0.0
             rows.append(self._row(pos, px, pnl))
 
-            # --- NEW: time-stop (se attivo) ---
+            # Time-stop (se attivo) chiude posizioni in perdita oltre X minuti
             age_sec = time.time() - pos.opened_ts
             if self.risk.cfg.time_stop_min and age_sec >= self.risk.cfg.time_stop_min * 60 and pnl <= 0:
                 to_close.append((pos, px, "TIME"))
                 continue
 
-            # SL / TP
+            # Break-even lock (nuovo): dopo un certo guadagno, non concedere più di X drawdown e non scendere sotto +Y%
+            if pnl_pct >= abs(self.risk.cfg.be_trigger_pct):
+                pos.be_armed = True
+            if pos.be_armed and pos.max_price_seen > 0:
+                drawdown = 1.0 - (px / pos.max_price_seen)
+                if (drawdown >= abs(self.risk.cfg.dd_lock_pct)) and (pnl_pct <= abs(self.risk.cfg.be_lock_profit_pct)):
+                    to_close.append((pos, px, "BE_LOCK"))
+                    continue
+
+            # SL / TP canonici
             if pnl_pct <= -abs(self.risk.cfg.stop_loss_pct):
-                to_close.append((pos, px, "SL"))
-            elif pnl_pct >= abs(self.risk.cfg.take_profit_pct):
-                to_close.append((pos, px, "TP"))
-            else:
-                # trailing stop
-                if pos.max_price_seen > 0:
-                    drawdown = 1 - (px / pos.max_price_seen)
-                    if drawdown >= abs(self.risk.cfg.trailing_pct):
-                        to_close.append((pos, px, "TRAIL"))
+                to_close.append((pos, px, "SL")); continue
+            if pnl_pct >= abs(self.risk.cfg.take_profit_pct):
+                to_close.append((pos, px, "TP")); continue
+
+            # Trailing stop classico
+            if pos.max_price_seen > 0:
+                drawdown = 1 - (px / pos.max_price_seen)
+                if drawdown >= abs(self.risk.cfg.trailing_pct):
+                    to_close.append((pos, px, "TRAIL"))
 
         for pos, px, reason in to_close:
             self.close(pos.id, px, reason)
@@ -168,13 +182,27 @@ class PaperBroker:
 # ---------------- Strategia ----------------
 @dataclass
 class StratConfig:
-    meme_score_min: int = 75
-    txns1h_min: int = 300
-    liq_min: float = 10000.0
-    liq_max: float = 200000.0
+    meme_score_min: int = 70
+    txns1h_min: int = 250
+    liq_min: float = 8000.0
+    liq_max: float = 250000.0
+    turnover_min: float = 1.2            # NEW: Volume24h/Liquidity minimo
+    chg24_min: float = -8.0              # NEW: evitare dump profondi
+    chg24_max: float = 180.0             # NEW: evitare eccesso di estensione
     allow_dex: Tuple[str,...] = ("raydium","orca","meteora")
+    heat_tx1h_topN: int = 10             # NEW: mercato "heat" su topN per volume
+    heat_tx1h_avg_min: int = 120         # NEW: media Txns1h minima su topN
 
-class StrategyMomentumV1:
+class StrategyMomentumV2:
+    """
+    Regole d'ingresso:
+      - Meme Score >= soglia
+      - Txns1h >= soglia
+      - Liquidity tra [liq_min, liq_max]
+      - Turnover (Vol24h/Liq) >= turnover_min
+      - Change24h entro [chg24_min, chg24_max]
+      - DEX whitelisted
+    """
     def __init__(self, cfg: StratConfig):
         self.cfg = cfg
 
@@ -183,23 +211,30 @@ class StrategyMomentumV1:
             meme = int(row.get("Meme Score", 0) or 0)
             tx1h = int(row.get("Txns 1h", 0) or 0)
             liq  = float(row.get("Liquidity (USD)", 0) or 0.0)
+            vol  = float(row.get("Volume 24h (USD)", 0) or 0.0)
             dex  = str(row.get("DEX","")).lower()
-            chg  = float(row.get("Change 24h (%)", 0) or 0.0)
+            chg  = row.get("Change 24h (%)")
+            chg  = float(chg) if chg is not None else 0.0
         except Exception:
             return False
 
-        if liq < self.cfg.liq_min or liq > self.cfg.liq_max: 
+        if not (self.cfg.liq_min <= liq <= self.cfg.liq_max):
             return False
-        if self.cfg.allow_dex and dex not in self.cfg.allow_dex: 
+        if self.cfg.allow_dex and dex not in self.cfg.allow_dex:
+            return False
+        if meme < self.cfg.meme_score_min:
+            return False
+        if tx1h < self.cfg.txns1h_min:
             return False
 
-        if meme >= self.cfg.meme_score_min and tx1h >= self.cfg.txns1h_min and (chg is None or chg >= -5.0):
-            return True
-        if meme >= self.cfg.meme_score_min + 10 and tx1h >= int(self.cfg.txns1h_min * 0.6) and (chg is None or chg >= -8.0):
-            return True
-        if tx1h >= self.cfg.txns1h_min + 150 and (chg is None or chg >= -10.0):
-            return True
-        return False
+        turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
+        if turnover < self.cfg.turnover_min:
+            return False
+
+        if chg < self.cfg.chg24_min or chg > self.cfg.chg24_max:
+            return False
+
+        return True
 
 # ---------------- Trade Engine ----------------
 class TradeEngine:
@@ -212,15 +247,34 @@ class TradeEngine:
     def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig, bm_check=None, sent_check=None):
         self.risk = RiskManager(risk_cfg)
         self.broker = PaperBroker(self.risk)
-        self.strategy = StrategyMomentumV1(strat_cfg)
+        self.strategy = StrategyMomentumV2(strat_cfg)
         self.bm_check = bm_check
         self.sent_check = sent_check
-        # anti-duplicati
         self.last_entry_by_symbol: Dict[str, float] = {}
 
+    def _market_heat_ok(self, df_pairs: pd.DataFrame) -> bool:
+        """
+        Usa la media Txns1h dei top N per volume come proxy del momentum di mercato.
+        """
+        try:
+            N = max(3, int(self.strategy.cfg.heat_tx1h_topN))
+            top = df_pairs.sort_values(by=["Volume 24h (USD)"], ascending=False).head(N)
+            if top.empty: return False
+            avg_tx = float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
+            return avg_tx >= float(self.strategy.cfg.heat_tx1h_avg_min)
+        except Exception:
+            return True  # in caso di errore non bloccare
     def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         prices: Dict[str, float] = {}
         candidates: List[Dict] = []
+
+        # 0) filtro di mercato (heat)
+        if not self._market_heat_ok(df_pairs):
+            # aggiorna comunque marcatura PnL / trailing / stop
+            for r in df_pairs.to_dict(orient="records"):
+                prices[r.get("Pair","")] = float(r.get("Price (USD)") or 0.0)
+            df_open, df_closed = self.broker.mark_to_market(prices)
+            return pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"]), df_open, df_closed
 
         # 1) scan segnali (tecnici)
         for r in df_pairs.to_dict(orient="records"):
@@ -234,10 +288,12 @@ class TradeEngine:
                     "Score": int(r.get("Meme Score", 0) or 0),
                     "Txns 1h": int(r.get("Txns 1h", 0) or 0),
                     "Liquidity (USD)": int(r.get("Liquidity (USD)", 0) or 0),
+                    "Volume 24h (USD)": int(r.get("Volume 24h (USD)", 0) or 0),
                     "Price (USD)": last,
+                    "Change 24h (%)": r.get("Change 24h (%)"),
                     "Link": r.get("Link",""),
-                    "Base Address": r.get("Base Address","") or r.get("baseAddress",""),
-                    "Base Symbol": (r.get("Pair","").split("/")[0] if r.get("Pair") else r.get("baseSymbol","")),
+                    "Base Address": r.get("Base Address",""),
+                    "Base Symbol": (sym.split("/")[0] if sym else r.get("baseSymbol","")),
                 })
 
         # 2) Bubblemaps anti-cluster
@@ -278,13 +334,10 @@ class TradeEngine:
 
         sort_cols = ["Score","Txns 1h","Liquidity (USD)","Mentions 24h","Smarts","Sentiment"]
         df_signals = (pd.DataFrame(filtered2)
-                        .sort_values(by=[c for c in sort_cols if filtered2 and c in filtered2[0].keys()],
-                                     ascending=[False]*len([c for c in sort_cols if filtered2 and c in filtered2[0].keys()]))
+                        .sort_values(by=[c for c in sort_cols if (filtered2 and c in filtered2[0].keys())],
+                                     ascending=[False]*len(sort_cols) if filtered2 else True)
                         .reset_index(drop=True)
-                      ) if filtered2 else pd.DataFrame(columns=[
-                          "Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link",
-                          "Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"
-                      ])
+                      ) if filtered2 else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Price (USD)","Change 24h (%)","Link","Base Address","BM Risk","Moni User","Mentions 24h","Smarts","Sentiment","Moni Score"])
 
         # 4) apri max 1 posizione per step (rispettando vincoli per-simbolo)
         if not df_signals.empty and self.risk.can_open(len(self.broker.positions)):
@@ -293,6 +346,7 @@ class TradeEngine:
             px = float(top["Price (USD)"] or 0.0)
             if px > 0:
                 now = time.time()
+                # quante posizioni già aperte su questo simbolo?
                 open_count_sym = sum(1 for p in self.broker.positions.values() if p.symbol == sym)
                 open_allowed = True
 
@@ -300,7 +354,7 @@ class TradeEngine:
                 if open_count_sym >= max(1, int(self.risk.cfg.max_positions_per_symbol)):
                     open_allowed = False
 
-                # cooldown per simbolo
+                # cooldown
                 last_ts = self.last_entry_by_symbol.get(sym, 0)
                 if self.risk.cfg.symbol_cooldown_min and (now - last_ts) < self.risk.cfg.symbol_cooldown_min * 60:
                     open_allowed = False
