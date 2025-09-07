@@ -1,5 +1,6 @@
-# streamlit_app.py — Meme Radar (Streamlit) v5
-# Multi-search DexScreener + Tabella con link + Watchlist + Alert Telegram (base)
+# streamlit_app.py — Meme Radar (Streamlit) v7
+# Multi-search DexScreener + Tabella con link + Watchlist + Alert Telegram + Meme Score
+# + Grafico "Top 10 per Meme Score" + Export CSV + Toggle "Pair Age (min/ore)"
 
 import os, time, math, random, datetime
 import requests
@@ -52,9 +53,27 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Watchlist")
-    wl_default = os.getenv("WATCHLIST", "")  # es: "WIF,BONK,So11111111111111111111111111111111111111112"
-    watchlist_input = st.text_input("Simboli o address (comma-separated)", value=wl_default, help="Esempio: WIF,BONK,So111...,<pairAddress>")
+    wl_default = os.getenv("WATCHLIST", "")  # es: "WIF,BONK,So111...,<pairAddress>"
+    watchlist_input = st.text_input("Simboli o address (comma-separated)", value=wl_default, help="Es: WIF,BONK,So111...,<pairAddress>")
     watchlist_only = st.toggle("Mostra solo watchlist", value=False)
+
+    st.divider()
+    st.subheader("Meme Score")
+    sort_by_meme = st.toggle("Ordina per Meme Score (desc)", value=True)
+    liq_min_sweet = st.number_input("Sweet spot liquidity MIN", min_value=0, value=10000, step=1000)
+    liq_max_sweet = st.number_input("Sweet spot liquidity MAX", min_value=0, value=150000, step=5000)
+
+    with st.expander("Pesi avanzati (0–100)"):
+        w_symbol = st.slider("Peso: Nome 'meme'", 0, 100, 20)
+        w_age    = st.slider("Peso: Freschezza (pairCreatedAt)", 0, 100, 20)
+        w_txns   = st.slider("Peso: Txns 1h", 0, 100, 25)
+        w_liq    = st.slider("Peso: Sweet spot di Liquidity", 0, 100, 20)
+        w_dex    = st.slider("Peso: DEX (Raydium > altri)", 0, 100, 15)
+
+    st.divider()
+    st.subheader("Tabella")
+    show_pair_age = st.toggle("Mostra colonna 'Pair Age' (min/ore)", value=True)
+    st.caption("Se attivo, mostra l'età della pair (tempo dalla creazione).")
 
     st.divider()
     st.subheader("Alert Telegram (base)")
@@ -62,6 +81,7 @@ with st.sidebar:
     TELEGRAM_CHAT_ID   = st.text_input("Chat ID", value=os.getenv("TELEGRAM_CHAT_ID",""))
     alert_tx1h_min     = st.number_input("Soglia txns 1h", min_value=0, value=200, step=10)
     alert_liq_min      = st.number_input("Soglia liquidity USD", min_value=0, value=20000, step=1000)
+    alert_meme_min     = st.number_input("Soglia Meme Score (0=disattiva)", min_value=0, max_value=100, value=70, step=5)
     enable_alerts      = st.toggle("Abilita alert Telegram", value=False)
 
 if auto_refresh:
@@ -114,21 +134,6 @@ def first_num(*vals):
             pass
     return None
 
-def filter_pairs(pairs, only_raydium=False, min_liq=0, exclude_quotes=None):
-    if not pairs: return []
-    if disable_all_filters:
-        return [p for p in pairs if is_solana_pair(p)]
-    out, exq = [], set(map(str.upper, exclude_quotes or []))
-    for p in pairs:
-        if not is_solana_pair(p): continue
-        if only_raydium and (p.get("dexId") or "").lower() != "raydium": continue
-        qsym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
-        if qsym in exq: continue
-        liq = liq_usd_from_pair(p)
-        if min_liq and (liq is None or liq < min_liq): continue
-        out.append(p)
-    return out
-
 def avg(lst):
     xs = [x for x in lst if x is not None]
     return (sum(xs)/len(xs)) if xs else None
@@ -143,15 +148,35 @@ def ms_to_dt(ms):
     except Exception:
         return str(ms)
 
+def hours_since_ms(ms):
+    if not ms: return None
+    try:
+        return max(0.0, (time.time() - int(ms)/1000.0) / 3600.0)
+    except Exception:
+        return None
+
+def fmt_age(hours):
+    if hours is None:
+        return ""
+    if hours < 1:
+        m = int(round(hours*60))
+        return f"{m}m"
+    if hours < 48:
+        h = int(hours)
+        m = int(round((hours - h) * 60))
+        return f"{h}h {m}m"
+    d = int(hours // 24)
+    h = int(hours % 24)
+    return f"{d}d {h}h"
+
 def norm_list(s):
-    """split per virgola/spazi; upper per simboli; mantiene address/lunghi così com’è."""
     out = []
     for part in (s or "").replace(" ", "").split(","):
         if not part: continue
         if len(part) <= 8:
             out.append(part.upper())
         else:
-            out.append(part)  # presumibilmente address
+            out.append(part)
     return out
 
 # Telegram
@@ -165,6 +190,65 @@ def send_telegram(bot_token, chat_id, text):
 
 if "sent_alerts" not in st.session_state:
     st.session_state["sent_alerts"] = set()  # pairAddress inviati in questa sessione
+
+# ---------------- Meme Score ----------------
+STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
+WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
+
+DEX_WEIGHTS = {  # peso di attendibilità del DEX
+    "raydium": 1.0,
+    "orca":    0.9,
+    "meteora": 0.85,
+    "lifinity":0.8
+}
+
+def s_sigmoid(x, k=0.02):  # morbida per txns
+    try:
+        return 1.0 / (1.0 + math.exp(-k * (x - 200)))  # centrata ~200 txns/h
+    except Exception:
+        return 0.0
+
+def score_symbol(symbol: str) -> float:
+    s = (symbol or "").upper()
+    if not s: return 0.0
+    if any(tag in s for tag in STRONG_MEMES): return 1.0
+    if any(tag in s for tag in WEAK_MEMES):   return 0.6
+    return 0.3  # default: un pizzico di meme-ness
+
+def score_age(hours: float) -> float:
+    if hours is None: return 0.5
+    # 0h → 1.0 ; 72h → 0.0 (lineare clamp)
+    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
+
+def score_liq(liq: float, sweet_min: float, sweet_max: float) -> float:
+    if liq is None or liq <= 0: return 0.0
+    if sweet_min <= liq <= sweet_max: return 1.0
+    if liq < sweet_min:
+        return max(0.0, liq / sweet_min)  # cresce linearmente fino alla soglia
+    # sopra sweet_max decresce
+    return max(0.0, sweet_max / liq)
+
+def score_dex(dexid: str) -> float:
+    if not dexid: return 0.6
+    return DEX_WEIGHTS.get(dexid.lower(), 0.6)
+
+def compute_meme_score(p, weights, sweet_min, sweet_max):
+    base = ((p.get("baseToken") or {}).get("symbol") or "")
+    dex  = (p.get("dexId") or "")
+    liq  = liq_usd_from_pair(p)
+    tx1  = txns1h(p)
+    ageh = hours_since_ms(p.get("pairCreatedAt"))
+
+    f_symbol = score_symbol(base)
+    f_age    = score_age(ageh)
+    f_tx     = s_sigmoid(tx1)   # 0..1 saturazione morbida
+    f_liq    = score_liq(liq, sweet_min, sweet_max)
+    f_dex    = score_dex(dex)
+
+    w_sym, w_age, w_tx, w_liq, w_dex = weights
+    total_w = max(1e-6, w_sym+w_age+w_tx+w_liq+w_dex)
+    score_0_100 = 100.0 * (w_sym*f_symbol + w_age*f_age + w_tx*f_tx + w_liq*f_liq + w_dex*f_dex) / total_w
+    return round(score_0_100)
 
 # ---------------- Multi-search DexScreener ----------------
 def run_multi_search(queries):
@@ -187,34 +271,44 @@ def run_multi_search(queries):
 pairs_all, http_codes = run_multi_search(SEARCH_QUERIES)
 pre_filter_count = len(pairs_all)
 
-# ---------------- Watchlist filtering/highlight ----------------
+# ---------------- Watchlist ----------------
 watchlist = norm_list(watchlist_input)
+
 def is_watch_hit(p):
     base = ((p.get("baseToken") or {}).get("symbol") or "")
     quote = ((p.get("quoteToken") or {}).get("symbol") or "")
     addr  = p.get("pairAddress") or ""
     base_addr = (p.get("baseToken") or {}).get("address") or ""
     if not watchlist: return False
-    # match per symbol (upper) o address/pairAddress
-    if base.upper() in watchlist or quote.upper() in watchlist:
-        return True
-    if addr in watchlist or base_addr in watchlist:
-        return True
+    if base.upper() in watchlist or quote.upper() in watchlist: return True
+    if addr in watchlist or base_addr in watchlist: return True
     return False
 
-# Applica filtri di mercato
+# ---------------- Filtri mercato ----------------
+def filter_pairs(pairs, only_raydium=False, min_liq=0, exclude_quotes=None):
+    if not pairs: return []
+    if disable_all_filters:
+        return [p for p in pairs if is_solana_pair(p)]
+    out, exq = [], set(map(str.upper, exclude_quotes or []))
+    for p in pairs:
+        if not is_solana_pair(p): continue
+        if only_raydium and (p.get("dexId") or "").lower() != "raydium": continue
+        qsym = ((p.get("quoteToken") or {}).get("symbol") or "").upper()
+        if qsym in exq: continue
+        liq = liq_usd_from_pair(p)
+        if min_liq and (liq is None or liq < min_liq): continue
+        out.append(p)
+    return out
+
 pairs_filtered = filter_pairs(pairs_all, only_raydium=only_raydium, min_liq=min_liq, exclude_quotes=exclude_quotes)
-if watchlist_only:
-    pairs = [p for p in pairs_filtered if is_watch_hit(p)]
-else:
-    pairs = pairs_filtered
+pairs = [p for p in pairs_filtered if is_watch_hit(p)] if watchlist_only else pairs_filtered
 post_filter_count = len(pairs)
 
 # ---------------- Nuove Coin ----------------
 be_headers = {"accept": "application/json"}
-be_key = os.getenv("BE_API_KEY","")
-if be_key:
-    be_headers["x-api-key"] = be_key
+be_key_env = os.getenv("BE_API_KEY","")
+if be_key_env:
+    be_headers["x-api-key"] = be_key_env
 bird_data, bird_code = fetch_with_retry(BIRDEYE_URL, headers={**UA_HEADERS, **be_headers})
 bird_tokens, bird_ok = [], False
 if bird_data and "data" in bird_data:
@@ -231,7 +325,7 @@ if (not bird_ok) or (bird_code == 401) or (len(bird_tokens) == 0):
     recents.sort(key=lambda p: (p.get("pairCreatedAt") or 0), reverse=True)
     dex_new_pairs = recents[:20]
 
-# ---------------- KPI ----------------
+# ---------------- KPI base ----------------
 top = sorted([{
         "base": (((p or {}).get("baseToken") or {}).get("symbol")) or "",
         "vol24": first_num(vol24(p)),
@@ -240,7 +334,6 @@ top = sorted([{
 
 vols = [x["vol24"] for x in top if x["vol24"] is not None]
 txs  = [x["tx1h"]  for x in top if x["tx1h"]  is not None]
-
 vol24_avg = avg(vols)
 tx1h_avg  = avg(txs)
 if (vol24_avg is None or vol24_avg == 0) and (tx1h_avg is not None and tx1h_avg > 0):
@@ -307,8 +400,8 @@ with right:
     else:
         st.info("Nessun token nuovo disponibile (Birdeye 401 e fallback vuoto).")
 
-# ---------------- UI: Tabella con link ----------------
-def row_for_table(p):
+# ---------------- UI: Tabella con link + Meme Score ----------------
+def row_for_table(p, meme_score):
     base = ((p.get("baseToken") or {}).get("symbol") or "")
     quote = ((p.get("quoteToken") or {}).get("symbol") or "")
     dex  = (p.get("dexId") or "")
@@ -317,47 +410,99 @@ def row_for_table(p):
     v24  = first_num(vol24(p)) or 0
     created = p.get("pairCreatedAt") or 0
     url = p.get("url") or ""
+    ageh = hours_since_ms(created)
     return {
+        "Meme Score": meme_score,
         "Pair": f"{base}/{quote}",
         "DEX": dex,
         "Liquidity (USD)": int(round(liq)),
         "Txns 1h": int(tx1),
         "Volume 24h (USD)": int(round(v24)),
         "Created (UTC)": ms_to_dt(created),
+        "Pair Age": fmt_age(ageh),
         "Link": url,
         "Watch": "✅" if is_watch_hit(p) else "",
         "_pairAddress": p.get("pairAddress") or "",
+        "_base": base,
     }
 
-table_rows = [row_for_table(p) for p in pairs]
+weights = (w_symbol, w_age, w_txns, w_liq, w_dex)
+table_rows = []
+for p in pairs:
+    mscore = compute_meme_score(p, weights, liq_min_sweet, liq_max_sweet)
+    table_rows.append(row_for_table(p, mscore))
+
 df_pairs = pd.DataFrame(table_rows)
+if not df_pairs.empty and sort_by_meme:
+    df_pairs = df_pairs.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
 
 st.markdown("### Pairs (post-filtri)")
 if not df_pairs.empty:
-    # evidenziazione watchlist con stile semplice
-    def highlight_watch(s):
-        return ['background-color: #d1fae5' if v == "✅" else '' for v in s]
+    # scegli quali colonne mostrare (opzionalmente nascondi Pair Age)
+    display_cols = [c for c in df_pairs.columns if c not in ["_pairAddress", "_base"]]
+    if not show_pair_age and "Pair Age" in display_cols:
+        display_cols.remove("Pair Age")
+
     st.dataframe(
-        df_pairs.drop(columns=["_pairAddress"]),
+        df_pairs[display_cols],
         use_container_width=True,
         column_config={
             "Link": st.column_config.LinkColumn("Link", help="Apri su DexScreener"),
             "Liquidity (USD)": st.column_config.NumberColumn(format="%,d"),
             "Volume 24h (USD)": st.column_config.NumberColumn(format="%,d"),
+            "Meme Score": st.column_config.NumberColumn(help="0–100: più alto = più 'meme' + momentum"),
         }
     )
+
+    # ---------------- Export CSV ----------------
+    export_cols = [c for c in df_pairs.columns if c not in ["_pairAddress", "_base"]]
+    if not show_pair_age and "Pair Age" in export_cols:
+        export_cols.remove("Pair Age")
+    csv_bytes = df_pairs[export_cols].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Scarica CSV filtrato",
+        data=csv_bytes,
+        file_name="solana-meme-radar.csv",
+        mime="text/csv",
+        help="Esporta la tabella (filtri e ordinamenti già applicati)"
+    )
+
 else:
     st.info("Nessuna pair da mostrare (post-filtri).")
 
+# ---------------- UI: Top 10 per Meme Score (nuovo grafico) ----------------
+st.markdown("### Top 10 per Meme Score")
+if not df_pairs.empty:
+    top10_meme = (
+        df_pairs
+        .sort_values(by=["Meme Score", "Txns 1h", "Liquidity (USD)"], ascending=[False, False, False])
+        .head(10)
+        .copy()
+    )
+    fig3 = px.bar(
+        top10_meme,
+        x="Pair",
+        y="Meme Score",
+        hover_data=["DEX", "Txns 1h", "Liquidity (USD)", "Volume 24h (USD)", "Created (UTC)", "Pair Age"],
+        title="Top 10 per Meme Score"
+    )
+    fig3.update_layout(yaxis_range=[0, 100])
+    fig3.update_xaxes(tickangle=-30)
+    st.plotly_chart(fig3, use_container_width=True)
+else:
+    st.info("Nessuna pair disponibile per calcolare il Meme Score.")
+
 # ---------------- Alert Telegram (base) ----------------
 def should_alert(row):
-    return (row["Txns 1h"] >= alert_tx1h_min) and (row["Liquidity (USD)"] >= alert_liq_min)
+    cond = (row["Txns 1h"] >= alert_tx1h_min) and (row["Liquidity (USD)"] >= alert_liq_min)
+    if alert_meme_min > 0:
+        cond = cond and (row["Meme Score"] >= alert_meme_min)
+    return cond
 
 alerts_to_send = []
 if enable_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and not df_pairs.empty:
     for _, r in df_pairs.iterrows():
         if should_alert(r):
-            # dedup per sessione su pairAddress
             addr = str(r.get("_pairAddress", ""))
             if addr and addr not in st.session_state["sent_alerts"]:
                 alerts_to_send.append(r)
@@ -366,6 +511,7 @@ if enable_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and not df_pairs.em
         text = (
             f"🔥 *Meme Radar Trigger*\n"
             f"Pair: {r['Pair']} ({r['DEX']})\n"
+            f"Meme Score: {r['Meme Score']}\n"
             f"Txns 1h: {r['Txns 1h']} • Liq: ${r['Liquidity (USD)']:,}\n"
             f"Vol24h: ${r['Volume 24h (USD)']:,}\n"
             f"{r['Link']}"
@@ -373,7 +519,6 @@ if enable_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and not df_pairs.em
         ok, code = send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, text)
         if ok:
             st.session_state["sent_alerts"].add(str(r.get("_pairAddress","")))
-        # feedback minimale in UI
     if alerts_to_send:
         st.success(f"Alert inviati: {len(alerts_to_send)}")
     else:
