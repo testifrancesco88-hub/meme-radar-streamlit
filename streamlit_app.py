@@ -1,6 +1,6 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8.4.2
-# Fix: st.query_params; provider robusto; LIVE Pump.fun con header, backoff, bottone Riconnetti;
-# auto-refresh sospeso quando LIVE attivo; Meme Score, watchlist, grafici, CSV, alert Telegram.
+# streamlit_app.py — Meme Radar (Streamlit) v8.6
+# Novità: Fallback HTTP Moralis (ultimi token creati su Pump.fun) se il WS è “vuoto”
+# Confermato: WS PumpPortal con header, backoff, Riconnetti; auto-refresh sospeso quando LIVE attivo.
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -8,7 +8,7 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-# WebSocket (websocket-client). Se manca, mostriamo un avviso elegante.
+# WebSocket (websocket-client)
 try:
     import websocket  # pip install websocket-client
 except Exception:
@@ -98,6 +98,13 @@ with st.sidebar:
     pump_keywords = st.text_input("Filtra per keyword (opz, virgola)", value="", help="Esempio: cat,dog,elon,wif")
     pump_alert_enable = st.toggle("Alert Telegram su match keyword", value=False, help="Richiede BOT_TOKEN e CHAT_ID sopra")
     st.caption("Fonte: PumpPortal WebSocket – un'unica connessione condivisa. Evita multi-connessioni. ")
+
+    st.divider()
+    st.subheader("Fallback HTTP (Moralis)")
+    moralis_enable = st.toggle("Mostra ultimi token via Moralis se WS è vuoto", value=True)
+    MORALIS_API_KEY = st.text_input("MORALIS_API_KEY", value=os.getenv("MORALIS_API_KEY",""), type="password")
+    moralis_exchange = st.selectbox("Exchange", options=["pumpfun","pump"], index=0, help="Valore per :exchange nell’endpoint Moralis")
+    moralis_limit = st.slider("Quanti token recenti (fallback)", 10, 50, 20, step=5)
 
 # 🔁 Rerun solo se LIVE Pump.fun NON è attivo (evita di troncare il WS)
 if auto_refresh and not pump_enable:
@@ -197,7 +204,6 @@ def score_age(hours):
     return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
 
 def score_liq(liq, mn, mx):
-    # robusto a None e inf
     if liq is None or liq <= 0: return 0.0
     try: mn = float(mn) if mn is not None else 0.0
     except Exception: mn = 0.0
@@ -567,6 +573,45 @@ else:
         st.session_state["pump_live"].stop()
         st.session_state["pump_live"] = None
 
+# --------- Fallback HTTP (Moralis) ----------
+def moralis_new_tokens(exchange: str, limit: int = 20, api_key: str | None = None) -> pd.DataFrame:
+    """
+    Chiama GET https://solana-gateway.moralis.io/token/mainnet/exchange/:exchange/new
+    Restituisce DF con colonne: Mint, Name, Symbol, Created (UTC), Age, Pump.fun, Solscan
+    È resiliente a variazioni di campo (tokenAddress/mint/address, createdAt/creationTime,...).
+    """
+    if not api_key:
+        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
+    url = f"https://solana-gateway.moralis.io/token/mainnet/exchange/{exchange}/new?limit={int(limit)}"
+    headers = {"X-API-Key": api_key, **UA_HEADERS}
+    data, code = fetch_with_retry(url, headers=headers)
+    if not data:
+        return pd.DataFrame(columns=["Mint","Name","Symbol","Created (UTC)","Age","Pump.fun","Solscan"])
+    items = data.get("result") or data.get("data") or data.get("tokens") or data.get("items") or data
+    if not isinstance(items, list):
+        items = []
+    rows = []
+    for t in items:
+        mint = t.get("mint") or t.get("tokenAddress") or t.get("token_address") or t.get("address") or t.get("id")
+        name = t.get("name") or t.get("tokenName") or t.get("symbol") or ""
+        symbol = t.get("symbol") or ""
+        # created timestamp field (copriamo varianti)
+        ts = t.get("createdAt") or t.get("created_time") or t.get("creationTime") or t.get("createdTimestamp") or 0
+        rows.append({
+            "Mint": mint or "",
+            "Name": name,
+            "Symbol": symbol,
+            "Created (UTC)": ms_to_dt(ts) if ts else "",
+            "Age": fmt_age(hours_since_ms(ts)) if ts else "",
+            "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "",
+            "Solscan": f"https://solscan.io/token/{mint}" if mint else "",
+        })
+    df = pd.DataFrame(rows)
+    # dedup per sicurezza
+    if not df.empty:
+        df = df.drop_duplicates(subset=["Mint"]).reset_index(drop=True)
+    return df
+
 # ---------------- Sezione UI: LIVE Pump.fun ----------------
 st.markdown("## 🔴 LIVE: New on Pump.fun")
 if pump_enable and st.session_state["pump_live"] and websocket is not None:
@@ -582,6 +627,7 @@ if pump_enable and st.session_state["pump_live"] and websocket is not None:
     df_live = p.snapshot_df()
     # filtro keyword (name/symbol)
     keys = [k.strip().lower() for k in (pump_keywords or "").split(",") if k.strip()]
+
     if not df_live.empty and keys:
         def match_row(r):
             s = (str(r.get("Name","")) + " " + str(r.get("Symbol",""))).lower()
@@ -597,30 +643,30 @@ if pump_enable and st.session_state["pump_live"] and websocket is not None:
                 "Solscan": st.column_config.LinkColumn("Solscan"),
             }
         )
-        # Alert Telegram su match keyword
-        if pump_alert_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and keys:
-            if "sent_live" not in st.session_state: st.session_state["sent_live"] = set()
-            to_send = []
-            for _, r in df_live.head(10).iterrows():  # limite invii
-                mint = r["Mint"]
-                if mint and mint not in st.session_state["sent_live"]:
-                    to_send.append(r)
-            for r in to_send:
-                text = (
-                    f"🆕 *New Pump.fun token*\n"
-                    f"Name: {r['Name']} ({r['Symbol']})\n"
-                    f"Mint: `{r['Mint']}`\n"
-                    f"Age: {r['Age']}\n"
-                    f"{r['Pump.fun']}"
-                )
-                try:
-                    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=10)
-                    st.session_state["sent_live"].add(r["Mint"])
-                except Exception:
-                    pass
     else:
-        st.info("In ascolto… nessun evento compatibile (o nessuna keyword).")
+        # messaggio più chiaro
+        if keys:
+            st.info("In ascolto… nessun evento che matchi le keyword attuali.")
+        else:
+            st.info("In ascolto… nessun token creato durante questa sessione (finora).")
+
+        # Fallback HTTP (Moralis)
+        if moralis_enable and MORALIS_API_KEY:
+            df_fb = moralis_new_tokens(moralis_exchange, moralis_limit, MORALIS_API_KEY)
+            if not df_fb.empty:
+                st.markdown("**Ultimi token (HTTP fallback — Moralis)**")
+                st.dataframe(
+                    df_fb.head(moralis_limit),
+                    use_container_width=True,
+                    column_config={
+                        "Pump.fun": st.column_config.LinkColumn("Pump.fun"),
+                        "Solscan": st.column_config.LinkColumn("Solscan"),
+                    }
+                )
+            else:
+                st.caption("Fallback Moralis attivo ma nessun dato ottenuto (verifica API key/plan).")
+        elif moralis_enable and not MORALIS_API_KEY:
+            st.caption("Per il fallback Moralis inserisci una MORALIS_API_KEY (free).")
 else:
     st.caption("Attiva “Abilita feed live (subscribeNewToken)” nella sidebar per ascoltare i nuovi token Pump.fun in tempo reale.")
 
