@@ -1,22 +1,180 @@
-# streamlit_app.py — Meme Radar (Streamlit) v11.4
-# - Auto-refresh, countdown, "Aggiorna ora"
-# - StrategyMomentumV2 (turnover, market heat, change range, break-even lock)
+# streamlit_app.py — Meme Radar (Streamlit) v12 Live Mirror
+# - Scanner Solana (DexScreener + Birdeye per nuove coin)
 # - KPI, Meme Score, grafici, watchlist
-# - Alert Telegram sulla tabella (soglie + cooldown + test)
-# - NEW: DEX consentiti (multiselect)
-# - NEW: Adaptive Relax (sblocca candidati se 0)
+# - DEX consentiti (multiselect)
+# - StrategyMomentumV2 + Diagnostica + Adaptive Relax
+# - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
+# - Alert Telegram dalla tabella
+# - LIVE Trading (Jupiter): deeplink o autosign (locale)
 # - RIMOSSI: Bubblemaps / Social (GetMoni) / Pump.fun
+# - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
-import os, time, math, random, datetime, json, threading
+import os, time, math, random, datetime, json, threading, base64
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
 
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine  # Strategy V2 in trading.py
+from trading import RiskConfig, StratConfig, TradeEngine  # la tua Strategy V2 in trading.py
 
-# ---------------- Config ----------------
+# =========================== Jupiter LIVE Connector (inline) ===========================
+JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
+JUP_SWAP  = "https://quote-api.jup.ag/v6/swap"
+JUP_TOKENS= "https://token.jup.ag/all"
+JUP_PRICE = "https://price.jup.ag/v6/price?ids=SOL"
+
+MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+MINT_SOL  = "So11111111111111111111111111111111111111112"  # wSOL
+
+def _jget(url, params=None, timeout=20):
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _jpost(url, data, timeout=20):
+    r = requests.post(url, headers={"Content-Type":"application/json"}, data=json.dumps(data), timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+class _TokenRegistry:
+    _cache = None
+    _by_mint = {}
+    _ts = 0
+
+    @classmethod
+    def _ensure(cls):
+        if cls._cache and time.time()-cls._ts < 3600:
+            return
+        data = _jget(JUP_TOKENS)
+        cls._cache = data
+        cls._by_mint = {t["address"]: t for t in data}
+        cls._ts = time.time()
+
+    @classmethod
+    def decimals(cls, mint: str, default: int = 9) -> int:
+        cls._ensure()
+        t = cls._by_mint.get(mint)
+        return int(t.get("decimals", default)) if t else default
+
+    @classmethod
+    def symbol(cls, mint: str, default: str = "?") -> str:
+        cls._ensure()
+        t = cls._by_mint.get(mint)
+        return t.get("symbol", default) if t else default
+
+def get_sol_usd(default=150.0) -> float:
+    try:
+        j = _jget(JUP_PRICE)
+        return float(j["data"]["SOL"]["price"])
+    except Exception:
+        return float(default)
+
+class LiveConfig:
+    def __init__(self, mode: str, slippage_bps: int = 100, rpc_url: str | None = None, public_key: str | None = None, private_key_b58: str | None = None):
+        self.mode = mode              # "off" | "deeplink" | "autosign"
+        self.slippage_bps = int(slippage_bps)
+        self.rpc_url = rpc_url
+        self.public_key = public_key
+        self.private_key_b58 = private_key_b58
+
+class JupiterConnector:
+    def __init__(self, cfg: LiveConfig):
+        self.cfg = cfg
+
+    def build_buy(self, quote_mint: str, base_mint: str, amount_quote_usd: float, price_usd_base: float | None):
+        if self.cfg.mode == "off":
+            return ("off", "Live trading OFF")
+
+        # calcola amountIn in base al mint in input
+        if quote_mint == MINT_USDC:
+            dec = _TokenRegistry.decimals(MINT_USDC, 6)
+            amount_in = int(round(amount_quote_usd * (10 ** dec)))
+            input_mint = MINT_USDC
+        elif quote_mint == MINT_SOL:
+            sol_usd = get_sol_usd()
+            sol_amount = amount_quote_usd / max(0.01, sol_usd)
+            dec = 9
+            amount_in = int(round(sol_amount * (10 ** dec)))
+            input_mint = MINT_SOL
+        else:
+            dec = _TokenRegistry.decimals(MINT_USDC, 6)
+            amount_in = int(round(amount_quote_usd * (10 ** dec)))
+            input_mint = MINT_USDC
+
+        if self.cfg.mode == "deeplink":
+            human = amount_in / (10 ** dec)
+            url = f"https://jup.ag/swap/{_TokenRegistry.symbol(input_mint) or 'USDC'}-{_TokenRegistry.symbol(base_mint)}?amount={human}&slippageBps={self.cfg.slippage_bps}"
+            return ("deeplink", url)
+
+        if self.cfg.mode == "autosign":
+            return self._autosign_swap(input_mint, base_mint, amount_in, "ExactIn")
+
+        return ("off", "Unsupported mode")
+
+    def build_sell(self, base_mint: str, quote_mint: str, base_amount_tokens: float):
+        if self.cfg.mode == "off":
+            return ("off", "Live trading OFF")
+        dec = _TokenRegistry.decimals(base_mint, 9)
+        amount_in = int(round(base_amount_tokens * (10 ** dec)))
+        if self.cfg.mode == "deeplink":
+            url = f"https://jup.ag/swap/{_TokenRegistry.symbol(base_mint)}-{_TokenRegistry.symbol(quote_mint)}?amount={base_amount_tokens}&slippageBps={self.cfg.slippage_bps}"
+            return ("deeplink", url)
+        if self.cfg.mode == "autosign":
+            return self._autosign_swap(base_mint, quote_mint, amount_in, "ExactIn")
+        return ("off", "Unsupported mode")
+
+    def _autosign_swap(self, input_mint: str, output_mint: str, amount_in: int, swap_mode: str):
+        if not (self.cfg.rpc_url and self.cfg.public_key and self.cfg.private_key_b58):
+            return ("error", "Autosign richiede RPC_URL, PUBLIC_KEY e PRIVATE_KEY")
+        # quote
+        q = _jget(JUP_QUOTE, params={
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": amount_in,
+            "slippageBps": self.cfg.slippage_bps,
+            "swapMode": swap_mode,
+            "onlyDirectRoutes": "false",
+        })
+        # swap build
+        s = _jpost(JUP_SWAP, {
+            "userPublicKey": self.cfg.public_key,
+            "wrapAndUnwrapSol": True,
+            "quoteResponse": q,
+            "asLegacyTransaction": True,
+            "dynamicComputeUnitLimit": True,
+            "useSharedAccounts": True,
+        })
+        tx_b64 = s.get("swapTransaction")
+        if not tx_b64:
+            return ("error", f"swapTransaction mancante: {s}")
+
+        # firma + invio (richiede solana + solders)
+        try:
+            from solana.rpc.api import Client
+            from solana.keypair import Keypair
+            from solders.keypair import Keypair as SKeypair
+            from solana.transaction import Transaction
+        except Exception as e:
+            return ("error", f"Librerie non presenti (solana, solders). Aggiungi a requirements.txt. Dettagli: {e}")
+
+        try:
+            client = Client(self.cfg.rpc_url)
+            raw = base64.b64decode(tx_b64)
+            tx  = Transaction.deserialize(raw)
+            try:
+                kp = SKeypair.from_base58_string(self.cfg.private_key_b58)
+                secret = bytes(kp)
+                keypair = Keypair.from_secret_key(secret)
+            except Exception:
+                keypair = Keypair.from_secret_key(base64.b64decode(self.cfg.private_key_b58))
+            tx.sign(keypair)
+            sig = client.send_raw_transaction(tx.serialize(), skip_preflight=False).value
+            return ("sent", str(sig))
+        except Exception as e:
+            return ("error", f"Invio fallito: {e}")
+
+# =============================== App Config/UI =================================
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
 PROXY_TICKET  = float(os.getenv("PROXY_TICKET_USD", "150"))
 BIRDEYE_URL   = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
@@ -36,7 +194,6 @@ UA_HEADERS = {
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
 
-# Stato per countdown refresh
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
 
@@ -72,7 +229,7 @@ with st.sidebar:
         w_liq    = st.slider("Peso: Sweet spot di Liquidity", 0, 100, 20)
         w_dex    = st.slider("Peso: DEX (Raydium > altri)", 0, 100, 15)
 
-    # --- DEX consentiti (NUOVO) ---
+    # --- DEX consentiti ---
     allowed_dex = st.multiselect(
         "DEX consentiti",
         ["raydium", "orca", "meteora", "lifinity"],
@@ -91,11 +248,9 @@ with st.sidebar:
     alert_tx1h_min     = st.number_input("Soglia txns 1h", min_value=0, value=200, step=10)
     alert_liq_min      = st.number_input("Soglia liquidity USD", min_value=0, value=20000, step=1000)
     alert_meme_min     = st.number_input("Soglia Meme Score (0=disattiva)", min_value=0, max_value=100, value=70, step=5)
-    alert_cooldown_min = st.number_input("Cooldown alert (min)", min_value=1, value=30, step=5,
-                                         help="Intervallo minimo tra alert per lo stesso token")
+    alert_cooldown_min = st.number_input("Cooldown alert (min)", min_value=1, value=30, step=5)
     alert_max_per_run  = st.number_input("Max alert per refresh", min_value=1, value=3, step=1)
     enable_alerts      = st.toggle("Abilita alert Telegram", value=False)
-    # Test Telegram
     def _tg_send_test():
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             st.warning("Inserisci BOT_TOKEN e CHAT_ID prima del test.")
@@ -103,18 +258,14 @@ with st.sidebar:
         try:
             rq = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                               params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar — Telegram OK", "disable_web_page_preview": True}, timeout=15)
-            if rq.ok:
-                st.success("Messaggio di test inviato ✅")
-            else:
-                st.error(f"Telegram ha risposto {rq.status_code}. Controlla credenziali/permessi.")
+            if rq.ok: st.success("Messaggio di test inviato ✅")
+            else: st.error(f"Telegram {rq.status_code}.")
         except Exception as e:
             st.error(f"Errore Telegram: {e}")
-    if st.button("Test Telegram"):
-        _tg_send_test()
+    if st.button("Test Telegram"): _tg_send_test()
 
     st.divider()
     st.subheader("Trading (Paper)")
-    # preset strategia
     preset = st.selectbox("Preset strategia", ["Prudente","Neutra","Aggressiva"], index=1)
     if st.button("Applica preset"):
         if preset == "Prudente":
@@ -137,7 +288,6 @@ with st.sidebar:
         tp_pct   = st.slider("Take Profit %", 10, 200, st.session_state.get("tp_pct", 40), key="tp_pct")
         trail_pct= st.slider("Trailing %", 5, 60, st.session_state.get("trail_pct", 15), key="trail_pct")
         day_loss = st.number_input("Daily loss limit (USD)", min_value=50.0, value=st.session_state.get("day_loss", 200.0), step=50.0, key="day_loss")
-    # --- Strategy V2 ---
     st.markdown("**Strategia V2 — parametri chiave**")
     strat_meme     = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 70), key="strat_meme")
     strat_txns     = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 250), step=25, key="strat_txns")
@@ -153,7 +303,6 @@ with st.sidebar:
     with colchg2:
         chg_max = st.number_input("Change 24h massimo (%)", value=180, step=10, key="chg_max")
 
-    # --- Regole anti-duplicato & timing ---
     st.markdown("**Regole anti-duplicato & timing**")
     colx1, colx2, colx3 = st.columns(3)
     with colx1:
@@ -163,7 +312,6 @@ with st.sidebar:
     with colx3:
         time_stop_min = st.number_input("Time-stop (min, 0=off)", min_value=0, value=int(st.session_state.get("time_stop_min", 60)), step=5, key="time_stop_min")
 
-    # --- Break-even lock ---
     st.markdown("**Break-even lock (difesa profitto)**")
     colbe1, colbe2, colbe3 = st.columns(3)
     with colbe1:
@@ -179,6 +327,15 @@ with st.sidebar:
     with colp2:
         add_on_pct = st.slider("Trigger add-on (%)", 1, 25, int(st.session_state.get("add_on_pct", 8)), key="add_on_pct",
                                help="Apre un'add-on solo se il prezzo è già salito di almeno questa % dall'ultimo ingresso")
+
+    st.divider()
+    st.subheader("Live Trading (Jupiter)")
+    live_mode = st.selectbox("Modalità", ["off","deeplink","autosign"], index=0,
+                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua, non cloud).")
+    slip_bps  = st.number_input("Slippage (bps)", min_value=10, value=100, step=10)
+    rpc_url   = st.text_input("RPC URL (solo autosign)", value=os.getenv("SOL_RPC_URL",""))
+    pub_key   = st.text_input("WALLET Public Key (solo autosign)", value=os.getenv("WALLET_PUB",""))
+    priv_b58  = st.text_input("WALLET Private Key (base58) • NON su cloud", value=os.getenv("WALLET_PRIV",""), type="password")
 
 # 🔁 Auto-refresh
 try:
@@ -210,13 +367,10 @@ if auto_refresh:
             st.session_state["fallback_rerun_thread"] = True
     _tick_query_param()
 
-# Barra utility: countdown + refresh manuale
 util_col1, util_col2 = st.columns([5, 1])
-with util_col1:
-    st.caption(f"Prossimo refresh ~{secs_left}s")
+with util_col1: st.caption(f"Prossimo refresh ~{secs_left}s")
 with util_col2:
-    if st.button("Aggiorna ora", use_container_width=True):
-        st.rerun()
+    if st.button("Aggiorna ora", use_container_width=True): st.rerun()
 
 # ---------------- Helpers ----------------
 def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
@@ -453,6 +607,7 @@ def build_table(df):
             "Link": r.get("url",""),
             "Base Address": r.get("baseAddress",""),
             "baseSymbol": r.get("baseSymbol",""),
+            "quoteSymbol": r.get("quoteSymbol",""),
         })
     out = pd.DataFrame(rows)
     if not out.empty and sort_by_meme:
@@ -463,7 +618,7 @@ df_pairs = build_table(df_view)
 
 st.markdown("### Pairs (post-filtri)")
 if not df_pairs.empty:
-    display_cols = [c for c in df_pairs.columns if c != "baseSymbol"]
+    display_cols = [c for c in df_pairs.columns if c not in ("baseSymbol","quoteSymbol")]
     if not show_pair_age and "Pair Age" in display_cols:
         display_cols.remove("Pair Age")
     st.dataframe(
@@ -479,7 +634,7 @@ if not df_pairs.empty:
         }
     )
 
-# ---------------- Diagnostica Strategia (in-app) ----------------
+# ---------------- Diagnostica Strategia ----------------
 def market_heat_value(df: pd.DataFrame, topN: int) -> float:
     if df is None or df.empty: 
         return 0.0
@@ -499,24 +654,18 @@ def check_row_reasons(row: pd.Series, cfg) -> list[str]:
     except Exception:
         return ["parse"]
 
-    if not (float(liq_min_sweet) <= liq <= float(liq_max_sweet)):
-        reasons.append("liq")
-    if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex:
-        reasons.append("dex")
-    if meme < int(st.session_state.get("strat_meme", cfg.meme_score_min)):
-        reasons.append("meme")
-    if tx1 < int(st.session_state.get("strat_txns", cfg.txns1h_min)):
-        reasons.append("tx1h")
+    if not (float(liq_min_sweet) <= liq <= float(liq_max_sweet)): reasons.append("liq")
+    if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex: reasons.append("dex")
+    if meme < int(st.session_state.get("strat_meme", cfg.meme_score_min)): reasons.append("meme")
+    if tx1 < int(st.session_state.get("strat_txns", cfg.txns1h_min)): reasons.append("tx1h")
     turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
-    if turnover < float(st.session_state.get("strat_turnover", cfg.turnover_min)):
-        reasons.append("turnover")
-    if chg < float(st.session_state.get("chg_min", cfg.chg24_min)) or chg > float(st.session_state.get("chg_max", cfg.chg24_max)):
-        reasons.append("chg24")
+    if turnover < float(st.session_state.get("strat_turnover", cfg.turnover_min)): reasons.append("turnover")
+    if chg < float(st.session_state.get("chg_min", cfg.chg24_min)) or chg > float(st.session_state.get("chg_max", cfg.chg24_max)): reasons.append("chg24")
     return reasons
 
 st.markdown("### Diagnostica strategia")
 if df_pairs is None or df_pairs.empty:
-    st.caption("Nessuna coppia post-filtri provider: allarga i filtri nel pannello a sinistra (DEX, Min Liquidity, ecc.).")
+    st.caption("Nessuna coppia post-filtri provider.")
 else:
     heat_val = market_heat_value(df_pairs, int(st.session_state.get("heat_topN", 10)))
     heat_thr = float(st.session_state.get("strat_heat_avg", 120))
@@ -536,7 +685,7 @@ else:
         except Exception: return 0
 
     c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
-    c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
+    c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))  # noqa
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
     c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
@@ -588,7 +737,7 @@ else:
         st.markdown("**Bocciati da UN solo filtro (top 10)**")
         st.dataframe(df_near, use_container_width=True)
 
-# === Adaptive Relax (NUOVO) =========================================
+# === Adaptive Relax ============================================================
 def _count_candidates(df: pd.DataFrame, cfg) -> int:
     if df is None or df.empty: 
         return 0
@@ -621,51 +770,28 @@ def relax_strategy_if_empty(df: pd.DataFrame, cfg):
         heat_tx1h_avg_min=cfg.heat_tx1h_avg_min,
     )
     steps = [
-        cfg,  # step 0 (strict)
-        StratConfig(**base,
-            meme_score_min=max(0, int(cfg.meme_score_min) - 10),
-            txns1h_min=int(cfg.txns1h_min),
-            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-            turnover_min=float(cfg.turnover_min),
-            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
-        ),
-        StratConfig(**base,
-            meme_score_min=int(cfg.meme_score_min),
-            txns1h_min=max(0, int(cfg.txns1h_min * 0.8)),
-            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-            turnover_min=float(cfg.turnover_min),
-            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
-        ),
-        StratConfig(**base,
-            meme_score_min=int(cfg.meme_score_min),
-            txns1h_min=int(cfg.txns1h_min),
-            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-            turnover_min=max(0.0, float(cfg.turnover_min) * 0.8),
-            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
-        ),
-        StratConfig(**base,
-            meme_score_min=int(cfg.meme_score_min),
-            txns1h_min=int(cfg.txns1h_min),
-            liq_min=max(0.0, float(cfg.liq_min) * 0.5), 
-            liq_max=float(cfg.liq_max) * 1.5,
-            turnover_min=float(cfg.turnover_min),
-            chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max),
-        ),
-        StratConfig(**base,
-            meme_score_min=int(cfg.meme_score_min),
-            txns1h_min=int(cfg.txns1h_min),
-            liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-            turnover_min=float(cfg.turnover_min),
-            chg24_min=float(cfg.chg24_min) - 10, 
-            chg24_max=float(cfg.chg24_max) + 50,
-        ),
+        cfg,
+        StratConfig(**base, meme_score_min=max(0, int(cfg.meme_score_min) - 10),
+                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
+        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
+                    txns1h_min=max(0, int(cfg.txns1h_min * 0.8)), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
+        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
+                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+                    turnover_min=max(0.0, float(cfg.turnover_min) * 0.8), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
+        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
+                    txns1h_min=int(cfg.txns1h_min), liq_min=max(0.0, float(cfg.liq_min) * 0.5), liq_max=float(cfg.liq_max) * 1.5,
+                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
+        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
+                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
+                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min) - 10, chg24_max=float(cfg.chg24_max) + 50),
     ]
     chosen = steps[0]
     for i, c in enumerate(steps):
         if _count_candidates(df, c) > 0:
             chosen = c
-            if i > 0:
-                st.info(f"Adaptive relax attivo: step {i} (soglie alleggerite).")
+            if i > 0: st.info(f"Adaptive relax attivo: step {i} (soglie alleggerite).")
             break
     return chosen
 
@@ -684,7 +810,6 @@ r_cfg = RiskConfig(
     allow_pyramiding=bool(st.session_state.get("allow_pyr", False)),
     pyramid_add_on_trigger_pct=float(st.session_state.get("add_on_pct",8))/100.0,
     time_stop_min=int(st.session_state.get("time_stop_min",60)),
-    # Break-even lock
     be_trigger_pct=float(st.session_state.get("be_trig",10))/100.0,
     be_lock_profit_pct=float(st.session_state.get("be_lock",2))/100.0,
     dd_lock_pct=float(st.session_state.get("dd_lock",6))/100.0,
@@ -703,12 +828,10 @@ s_cfg = StratConfig(
     heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
 )
 
-# Applica Adaptive Relax se necessario
 active_s_cfg = s_cfg
 if df_pairs is not None and not df_pairs.empty:
     active_s_cfg = relax_strategy_if_empty(df_pairs, s_cfg)
 
-# crea/aggiorna il motore
 if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
     st.session_state["trade_engine"] = TradeEngine(r_cfg, active_s_cfg, bm_check=None, sent_check=None)
 else:
@@ -722,20 +845,14 @@ eng = st.session_state["trade_engine"]
 
 if df_pairs is None or df_pairs.empty:
     st.info("Nessun dato per la strategia al momento.")
-    df_signals = pd.DataFrame()
-    df_open = pd.DataFrame()
-    df_closed = pd.DataFrame()
+    df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
 else:
     df_signals, df_open, df_closed = eng.step(df_pairs)
 
-# Segnali
 st.markdown("**Segnali (candidati all'ingresso)**")
-if not df_signals.empty:
-    st.dataframe(df_signals.head(12), use_container_width=True)
-else:
-    st.caption("Nessun segnale valido con i parametri attuali. Controlla la 'Diagnostica strategia' sopra.")
+if not df_signals.empty: st.dataframe(df_signals.head(12), use_container_width=True)
+else: st.caption("Nessun segnale valido con i parametri attuali.")
 
-# Posizioni aperte
 st.markdown("**Posizioni aperte (Paper)**")
 if not df_open.empty:
     cols = st.columns([3,2,2,2,2,2,2])
@@ -743,41 +860,27 @@ if not df_open.empty:
     for _, r in df_open.iterrows():
         c = st.columns([3,2,2,2,2,2,2])
         c[0].write(f"{r['symbol']} ({r['label']})")
-        c[1].write(f"{r['entry']:.8f}")
-        c[2].write(f"{r['last']:.8f}")
-        c[3].write(f"{r['pnl_usd']:.2f}")
-        c[4].write(f"{r['pnl_pct']*100:.2f}%")
-        c[5].write(r['opened_ago'])
+        c[1].write(f"{r['entry']:.8f}"); c[2].write(f"{r['last']:.8f}")
+        c[3].write(f"{r['pnl_usd']:.2f}"); c[4].write(f"{r['pnl_pct']*100:.2f}%"); c[5].write(r['opened_ago'])
         if c[6].button("Chiudi", key=f"close_{r['id']}"):
-            try:
-                px = float(r["last"]); eng.close_by_id(str(r["id"]), px)
-            except Exception:
-                pass
+            try: px = float(r["last"]); eng.close_by_id(str(r["id"]), px)
+            except Exception: pass
     st.caption(f"Posizioni aperte: {len(df_open)} / max {st.session_state['max_pos']}")
 else:
     st.caption("Nessuna posizione aperta.")
 
-# Ultime chiusure
 st.markdown("**Ultime chiusure**")
-if not df_closed.empty:
-    st.dataframe(df_closed, use_container_width=True)
-else:
-    st.caption("Nessuna chiusura registrata (ancora).")
+if not df_closed.empty: st.dataframe(df_closed, use_container_width=True)
+else: st.caption("Nessuna chiusura registrata (ancora).")
 
-# Performance rapida — PnL aperto/realizzato/totale
 st.markdown("**Performance (Paper)**")
 open_pnl = float(pd.to_numeric(df_open["pnl_usd"], errors="coerce").fillna(0).sum()) if not df_open.empty else 0.0
 realized = float(eng.risk.state.daily_pnl) if eng else 0.0
 total_today = open_pnl + realized
 m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("PnL Aperto (Unrealized)", f"{open_pnl:.2f} USD")
-with m2:
-    st.metric("PnL Giornaliero (Realizzato)", f"{realized:.2f} USD",
-              help="Si aggiorna quando chiudi una posizione.")
-with m3:
-    st.metric("Totale Oggi", f"{total_today:.2f} USD",
-              help=f"Somma di aperto + realizzato. Il daily risk limit resta su PnL realizzato (−{r_cfg.daily_loss_limit_usd:.0f} USD).")
+with m1: st.metric("PnL Aperto (Unrealized)", f"{open_pnl:.2f} USD")
+with m2: st.metric("PnL Giornaliero (Realizzato)", f"{realized:.2f} USD")
+with m3: st.metric("Totale Oggi", f"{total_today:.2f} USD")
 
 if not df_closed.empty:
     try:
@@ -790,74 +893,139 @@ if not df_closed.empty:
 else:
     st.caption("Nessuna chiusura → curva PnL in attesa.")
 
-# ---------------- ALERT TELEGRAM dalla tabella ----------------
+# ---------------- ALERT TELEGRAM ----------------
 def tg_send(text: str) -> tuple[bool, str | None]:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return False, "missing-credentials"
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
     try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
-            timeout=15
-        )
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                         params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
         return (True, None) if r.ok else (False, f"status={r.status_code}")
     except Exception as e:
         return False, str(e)
 
-if "tg_sent" not in st.session_state:
-    st.session_state["tg_sent"] = {}  # {baseAddress: ts_last_sent}
+if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
 
 tg_sent_now = 0
-if enable_alerts:
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        st.warning("Alert attivi ma credenziali Telegram mancanti: compila Bot Token e Chat ID nella sidebar.")
-    elif df_pairs is None or df_pairs.empty:
-        st.caption("Alert attivi, ma non ci sono coppie post-filtri.")
-    else:
-        try:
-            df_alert = df_pairs.copy()
-            mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & \
-                   (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
-            if int(alert_meme_min) > 0:
-                mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
-            df_alert = df_alert[mask]
-            if not df_alert.empty:
-                df_alert = df_alert.sort_values(
-                    by=["Meme Score", "Txns 1h", "Liquidity (USD)"],
-                    ascending=[False, False, False]
-                )
-                now = time.time()
-                cooldown = int(alert_cooldown_min) * 60
-                max_send = int(alert_max_per_run)
-                for _, row in df_alert.head(max_send*2).iterrows():
-                    addr = str(row.get("Base Address","")) or row.get("Pair")
-                    last_ts = st.session_state["tg_sent"].get(addr, 0)
-                    if now - last_ts < cooldown:
-                        continue
-                    pair = row.get("Pair","")
-                    dex  = row.get("DEX","")
-                    ms   = int(row.get("Meme Score", 0) or 0)
-                    tx1  = int(row.get("Txns 1h", 0) or 0)
-                    liq  = int(row.get("Liquidity (USD)", 0) or 0)
-                    vol  = int(row.get("Volume 24h (USD)", 0) or 0)
-                    px   = row.get("Price (USD)", None)
-                    chg  = row.get("Change 24h (%)", None)
-                    link = row.get("Link","")
-                    txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
-                    if isinstance(px,(int,float)) and px:
-                        txt += f"\nPrice: {px:.8f}"
-                    if chg is not None:
-                        try: txt += f"  |  24h: {float(chg):.2f}%"
-                        except Exception: pass
-                    if link: txt += f"\n{link}"
-                    ok, err = tg_send(txt)
-                    if ok:
-                        st.session_state["tg_sent"][addr] = now
-                        tg_sent_now += 1
-                        if tg_sent_now >= max_send:
-                            break
-        except Exception as e:
-            st.caption(f"Alert Telegram: errore durante la scansione — {e}")
+if enable_alerts and (df_pairs is not None) and not df_pairs.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        df_alert = df_pairs.copy()
+        mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
+        if int(alert_meme_min) > 0: mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
+        df_alert = df_alert[mask]
+        if not df_alert.empty:
+            df_alert = df_alert.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
+            now = time.time(); cooldown = int(alert_cooldown_min) * 60; max_send = int(alert_max_per_run)
+            for _, row in df_alert.head(max_send*2).iterrows():
+                addr = str(row.get("Base Address","")) or row.get("Pair")
+                last_ts = st.session_state["tg_sent"].get(addr, 0)
+                if now - last_ts < cooldown: continue
+                pair = row.get("Pair",""); dex = row.get("DEX",""); ms = int(row.get("Meme Score",0) or 0)
+                tx1 = int(row.get("Txns 1h",0) or 0); liq = int(row.get("Liquidity (USD)",0) or 0)
+                vol = int(row.get("Volume 24h (USD)",0) or 0)
+                px  = row.get("Price (USD)", None); chg = row.get("Change 24h (%)", None)
+                link= row.get("Link","")
+                txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
+                if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
+                if chg is not None:
+                    try: txt += f"  |  24h: {float(chg):.2f}%"
+                    except Exception: pass
+                if link: txt += f"\n{link}"
+                ok, err = tg_send(txt)
+                if ok:
+                    st.session_state["tg_sent"][addr] = now
+                    tg_sent_now += 1
+                    if tg_sent_now >= max_send: break
+    except Exception as e:
+        st.caption(f"Alert Telegram: errore — {e}")
+
+# ---------------- LIVE MIRROR (Jupiter) ----------------
+st.markdown("#### Live Mirror")
+if "live_positions" not in st.session_state:
+    st.session_state["live_positions"] = {}  # id_trade -> dict(mints, qty_base, last_sig/url)
+
+live_cfg = LiveConfig(mode=live_mode, slippage_bps=int(slip_bps),
+                      rpc_url=rpc_url or None, public_key=pub_key or None, private_key_b58=priv_b58 or None)
+jup = JupiterConnector(live_cfg)
+
+def find_mints_for_symbol(symbol: str) -> tuple[str | None, str | None]:
+    # symbol come "BASE/QUOTE"
+    try:
+        base_sym, quote_sym = (symbol or "").split("/", 1)
+    except Exception:
+        return (None, None)
+    hit = None
+    try:
+        dfh = df_view[(df_view["baseSymbol"]==base_sym) & (df_view["quoteSymbol"]==quote_sym)]
+        if not dfh.empty: hit = dfh.iloc[0]
+    except Exception: pass
+    base_mint = hit.get("baseAddress", None) if hit is not None else None
+    quote_mint = hit.get("quoteAddress", None) if hit is not None else None
+    if not quote_mint:
+        qs = quote_sym.upper()
+        quote_mint = MINT_USDC if qs in ("USDC","USDT") else (MINT_SOL if qs in ("SOL","WSOL") else MINT_USDC)
+    return (base_mint, quote_mint)
+
+live_log = []
+
+curr_ids = set()
+if not df_open.empty and "id" in df_open.columns:
+    curr_ids = set(str(x) for x in df_open["id"].tolist())
+prev_ids = set(st.session_state["live_positions"].keys())
+
+# APERTURE
+new_ids = curr_ids - prev_ids
+for tid in list(new_ids):
+    try:
+        r = df_open[df_open["id"].astype(str) == tid].iloc[0]
+        symbol = r.get("symbol","")
+        base_mint, quote_mint = find_mints_for_symbol(symbol)
+        if not base_mint:
+            live_log.append(f"BUY {symbol} → mint base non trovato")
+            continue
+        size_usd = float(st.session_state.get("pos_usd", 50.0))
+        px_usd   = float(r.get("entry") or r.get("last") or 0.0)
+        mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd, )
+        qty_base_est = size_usd / max(px_usd, 1e-9) if px_usd else 0.0
+        st.session_state["live_positions"][tid] = {"symbol":symbol, "base_mint": base_mint, "quote_mint": quote_mint,
+                                                   "qty_base": qty_base_est, "last_sig": None, "last_url": None}
+        if mode == "deeplink":
+            st.session_state["live_positions"][tid]["last_url"] = payload
+            live_log.append(f"BUY {symbol} → [Jupiter link]({payload})")
+        elif mode == "sent":
+            st.session_state["live_positions"][tid]["last_sig"] = payload
+            live_log.append(f"BUY {symbol} → tx: `{payload}`")
+        else:
+            live_log.append(f"BUY {symbol} → {payload}")
+    except Exception as e:
+        live_log.append(f"BUY error: {e}")
+
+# CHIUSURE
+closed_ids = prev_ids - curr_ids
+for tid in list(closed_ids):
+    info = st.session_state["live_positions"].get(tid)
+    if not info: 
+        continue
+    try:
+        symbol = info.get("symbol","?")
+        base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
+        mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
+        if mode == "deeplink":
+            live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
+        elif mode == "sent":
+            live_log.append(f"SELL {symbol} → tx: `{payload}`")
+        else:
+            live_log.append(f"SELL {symbol} → {payload}")
+    except Exception as e:
+        live_log.append(f"SELL error: {e}")
+    finally:
+        st.session_state["live_positions"].pop(tid, None)
+
+if live_cfg.mode == "off":
+    st.caption("Live: OFF")
+elif not live_log:
+    st.caption("Live: nessuna operazione da replicare in questo tick.")
+else:
+    for line in live_log: st.write("• " + line)
 
 # ---------------- Diagnostica finale ----------------
 st.subheader("Diagnostica")
@@ -870,5 +1038,4 @@ with d4:
     st.text(f"Nuove coin source: {src}")
 st.caption(f"Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
 
-# 🔚 aggiorna timestamp per countdown
 st.session_state["last_refresh_ts"] = time.time()
