@@ -1,9 +1,9 @@
-# streamlit_app.py — Meme Radar (Streamlit) v11.2 (no Pump.fun / no Moralis)
+# streamlit_app.py — Meme Radar (Streamlit) v11.3 (no GetMoni, no Bubblemaps, no Pump.fun)
 # - Auto-refresh, countdown, "Aggiorna ora"
 # - StrategyMomentumV2 (turnover, market heat, change range, break-even lock)
 # - KPI, Meme Score, grafici, watchlist
-# - Bubblemaps + GetMoni integrati
-# - NUOVO: Alert Telegram dalla tabella (soglie + cooldown + test)
+# - Alert Telegram dalla tabella (soglie + cooldown + test)
+# - RIMOSSI: Bubblemaps & Social (GetMoni)
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -13,8 +13,6 @@ import streamlit as st
 
 from market_data import MarketDataProvider
 from trading import RiskConfig, StratConfig, TradeEngine  # Strategy V2 in trading.py
-from bubblemaps_client import check_wallet_clusters
-from getmoni_client import SocialSentimentAnalyzer
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -105,7 +103,7 @@ with st.sidebar:
         _tg_send_test()
 
     st.divider()
-    st.subheader("Trading (Paper) + Bubblemaps + GetMoni")
+    st.subheader("Trading (Paper)")
     # preset strategia
     preset = st.selectbox("Preset strategia", ["Prudente","Neutra","Aggressiva"], index=1)
     if st.button("Applica preset"):
@@ -171,28 +169,6 @@ with st.sidebar:
     with colp2:
         add_on_pct = st.slider("Trigger add-on (%)", 1, 25, int(st.session_state.get("add_on_pct", 8)), key="add_on_pct",
                                help="Apre un'add-on solo se il prezzo è già salito di almeno questa % dall'ultimo ingresso")
-
-    BUBBLEMAPS_API_KEY = st.text_input("BUBBLEMAPS_API_KEY", value=os.getenv("BUBBLEMAPS_API_KEY",""), type="password", help="Filtro anti-cluster")
-
-    # ---------- GetMoni ----------
-    st.markdown("**GetMoni — Social Filter**")
-    GETMONI_API_KEY = st.text_input("GETMONI_API_KEY", value=os.getenv("GETMONI_API_KEY",""), type="password")
-    gm_header = st.selectbox("Header auth", ["X-API-Key","Authorization"], index=0, help="Se 'Authorization', usa Bearer <key>")
-    gm_enable = st.toggle("Abilita filtro Social (GetMoni)", value=False)
-    colg1, colg2, colg3 = st.columns(3)
-    with colg1:
-        gm_mentions = st.number_input("Min Mentions 24h", min_value=0, value=50, step=10)
-    with colg2:
-        gm_smarts = st.number_input("Min Smarts engagement", min_value=0, value=10, step=5, help="# di account 'smart' che interagiscono")
-    with colg3:
-        gm_sent = st.slider("Min Sentiment (Moni score)", 0, 100, 30)
-    st.caption("Serve una mappa SYMBOL→@username. Formato: una riga per voce, 'SYMBOL=@handle'")
-
-    gm_map_text = st.text_area(
-        "Mappatura simboli → Twitter (GetMoni)",
-        value=os.getenv("GETMONI_MAP", "WIF=@dogwifcoin\nBONK=@bonk_inu"),
-        height=100
-    )
 
 # 🔁 Auto-refresh
 try:
@@ -503,74 +479,117 @@ if not df_pairs.empty:
     fig3.update_layout(yaxis_range=[0, 100]); fig3.update_xaxes(tickangle=-30)
     st.plotly_chart(fig3, use_container_width=True)
 
-# ---------------- GetMoni setup ----------------
-def parse_map(text: str) -> dict:
-    mp = {}
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"): 
-            continue
-        if "=" in line:
-            sym, user = line.split("=", 1)
-        elif ":" in line:
-            sym, user = line.split(":", 1)
-        else:
-            continue
-        mp[sym.strip().upper()] = user.strip()
-    return mp
+# ---------------- Diagnostica Strategia (in-app) ----------------
+def market_heat_value(df: pd.DataFrame, topN: int) -> float:
+    if df is None or df.empty: 
+        return 0.0
+    top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(topN)))
+    return float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
 
-if "gm_analyzer" not in st.session_state:
-    st.session_state["gm_analyzer"] = None
-if "gm_calls" not in st.session_state:
-    st.session_state["gm_calls"] = 0
+def check_row_reasons(row: pd.Series, cfg) -> list[str]:
+    reasons = []
+    try:
+        liq = float(row.get("Liquidity (USD)", 0) or 0)
+        vol = float(row.get("Volume 24h (USD)", 0) or 0)
+        tx1 = int(row.get("Txns 1h", 0) or 0)
+        meme = int(row.get("Meme Score", 0) or 0)
+        chg = row.get("Change 24h (%)", None)
+        chg = float(chg) if chg is not None else 0.0
+        dex = str(row.get("DEX", "")).lower()
+    except Exception:
+        return ["parse"]
 
-if gm_enable and GETMONI_API_KEY:
-    mapping = parse_map(gm_map_text)
-    if st.session_state["gm_analyzer"] is None:
-        st.session_state["gm_analyzer"] = SocialSentimentAnalyzer(
-            GETMONI_API_KEY,
-            auth_header=gm_header,
-            symbol_to_user=mapping,
-            cache_ttl_sec=600,
-            min_mentions_24h=int(gm_mentions),
-            min_smart_engagement=int(gm_smarts),
-            min_sentiment_score=float(gm_sent),
-        )
-    else:
-        a = st.session_state["gm_analyzer"]
-        a.api_key = GETMONI_API_KEY
-        a.auth_header = gm_header
-        a.update_mapping(mapping)
-        a.th_mentions = int(gm_mentions)
-        a.th_smarts = int(gm_smarts)
-        a.th_sent = float(gm_sent)
+    if not (float(liq_min_sweet) <= liq <= float(liq_max_sweet)):
+        reasons.append("liq")
+    if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex:
+        reasons.append("dex")
+    if meme < int(st.session_state.get("strat_meme", cfg.meme_score_min)):
+        reasons.append("meme")
+    if tx1 < int(st.session_state.get("strat_txns", cfg.txns1h_min)):
+        reasons.append("tx1h")
+    turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
+    if turnover < float(st.session_state.get("strat_turnover", cfg.turnover_min)):
+        reasons.append("turnover")
+    if chg < float(st.session_state.get("chg_min", cfg.chg24_min)) or chg > float(st.session_state.get("chg_max", cfg.chg24_max)):
+        reasons.append("chg24")
+    return reasons
+
+st.markdown("### Diagnostica strategia")
+if df_pairs is None or df_pairs.empty:
+    st.caption("Nessuna coppia post-filtri provider: allarga i filtri nel pannello a sinistra (DEX, Min Liquidity, ecc.).")
 else:
-    st.session_state["gm_analyzer"] = None
+    heat_val = market_heat_value(df_pairs, int(st.session_state.get("heat_topN", 10)))
+    heat_thr = float(st.session_state.get("strat_heat_avg", 120))
+    st.caption(f"Market heat (media **Txns1h** top {int(st.session_state.get('heat_topN', 10))} per **Volume 24h**): "
+               f"**{int(heat_val)}** vs soglia **{int(heat_thr)}** → "
+               f"{'OK ✅' if heat_val >= heat_thr else 'BLOCCO ⛔️'}")
 
-def sent_check(symbol: str, base_addr: str):
-    if not gm_enable or not st.session_state["gm_analyzer"]:
-        return {"passes": True}
-    st.session_state["gm_calls"] += 1
-    return st.session_state["gm_analyzer"].analyze(symbol)
+    s = df_pairs.copy()
+    total = len(s)
+    try:
+        chg_series = pd.to_numeric(s["Change 24h (%)"], errors="coerce").fillna(0)
+    except Exception:
+        chg_series = pd.Series([0]*len(s))
 
-# ---------------- Bubblemaps cache ----------------
-if "bm_cache" not in st.session_state:
-    st.session_state["bm_cache"] = {}
+    def cnt(mask): 
+        try: return int(mask.sum())
+        except Exception: return 0
 
-def bm_check_cached(addr: str):
-    key = f"{addr}"
-    hit = st.session_state["bm_cache"].get(key)
-    now = time.time()
-    if hit and now - hit["ts"] < 3600:  # 1h TTL
-        return hit["res"]
-    if not BUBBLEMAPS_API_KEY:
-        return {"is_high_risk": False, "reason": "no-key", "top1": None, "top3": None, "score": None}
-    res = check_wallet_clusters(addr, chain="solana", api_key=BUBBLEMAPS_API_KEY)
-    st.session_state["bm_cache"][key] = {"ts": now, "res": res}
-    return res
+    c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
+    c_dex = cnt(s["DEX"].str.lower().isin(list(("raydium","orca","meteora"))))
+    c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
+    c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
+    c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
+    c_chg  = cnt((chg_series >= float(st.session_state.get("chg_min", -8))) & (chg_series <= float(st.session_state.get("chg_max", 180))))
 
-# ---------------- Trading (Paper) + Bubblemaps + GetMoni ----------------
-st.markdown("## 🧪 Trading — Paper Mode (Bubblemaps + GetMoni)")
+    cols = st.columns(7)
+    cols[0].metric("Totale", total)
+    cols[1].metric("Liq OK", c_liq)
+    cols[2].metric("DEX OK", c_dex)
+    cols[3].metric("Meme OK", c_meme)
+    cols[4].metric("Tx1h OK", c_tx)
+    cols[5].metric("Turnover OK", c_turn)
+    cols[6].metric("Change24 OK", c_chg)
+
+    try:
+        cfg_tmp = StratConfig(
+            meme_score_min=int(st.session_state.get("strat_meme",70)),
+            txns1h_min=int(st.session_state.get("strat_txns",250)),
+            liq_min=float(liq_min_sweet),
+            liq_max=float(liq_max_sweet),
+            turnover_min=float(st.session_state.get("strat_turnover",1.2)),
+            chg24_min=float(st.session_state.get("chg_min",-8)),
+            chg24_max=float(st.session_state.get("chg_max",180)),
+            allow_dex=("raydium","orca","meteora"),
+            heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
+            heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
+        )
+    except Exception:
+        cfg_tmp = None
+
+    reasons_all = [check_row_reasons(r, cfg_tmp) for _, r in s.iterrows()] if cfg_tmp else []
+    tech_pass = sum(1 for rs in reasons_all if len(rs) == 0)
+    st.caption(f"Candidati tecnici: **{tech_pass}**")
+
+    near = []
+    for (_, r), rs in zip(s.iterrows(), reasons_all):
+        if len(rs) == 1:
+            near.append({
+                "Pair": r.get("Pair",""),
+                "DEX": r.get("DEX",""),
+                "Meme": int(r.get("Meme Score",0) or 0),
+                "Tx1h": int(r.get("Txns 1h",0) or 0),
+                "Liq": int(r.get("Liquidity (USD)",0) or 0),
+                "Vol24h": int(r.get("Volume 24h (USD)",0) or 0),
+                "Fail": rs[0]
+            })
+    if near:
+        df_near = pd.DataFrame(near).sort_values(by=["Meme","Tx1h","Liq"], ascending=[False,False,False]).head(10)
+        st.markdown("**Bocciati da UN solo filtro (top 10)**")
+        st.dataframe(df_near, use_container_width=True)
+
+# ---------------- Trading (Paper) ----------------
+st.markdown("## 🧪 Trading — Paper Mode")
 
 r_cfg = RiskConfig(
     position_usd=float(st.session_state.get("pos_usd",50.0)),
@@ -603,14 +622,15 @@ s_cfg = StratConfig(
     heat_tx1h_avg_min=int(st.session_state.get("strat_heat_avg",120)),
 )
 
+# crea/aggiorna il motore (senza bm_check/sent_check)
 if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
-    st.session_state["trade_engine"] = TradeEngine(r_cfg, s_cfg, bm_check=bm_check_cached, sent_check=sent_check)
+    st.session_state["trade_engine"] = TradeEngine(r_cfg, s_cfg, bm_check=None, sent_check=None)
 else:
     eng_tmp = st.session_state["trade_engine"]
     eng_tmp.risk.cfg = r_cfg
     eng_tmp.strategy.cfg = s_cfg
-    eng_tmp.bm_check = bm_check_cached
-    eng_tmp.sent_check = sent_check
+    eng_tmp.bm_check = None
+    eng_tmp.sent_check = None
 
 eng = st.session_state["trade_engine"]
 
@@ -627,7 +647,7 @@ st.markdown("**Segnali (candidati all'ingresso)**")
 if not df_signals.empty:
     st.dataframe(df_signals.head(12), use_container_width=True)
 else:
-    st.caption("Nessun segnale valido: filtri tecnici, Bubblemaps e/o GetMoni possono aver escluso i candidati.")
+    st.caption("Nessun segnale valido con i parametri attuali. Controlla la 'Diagnostica strategia' sopra.")
 
 # Posizioni aperte
 st.markdown("**Posizioni aperte (Paper)**")
@@ -710,28 +730,24 @@ if enable_alerts:
     else:
         try:
             df_alert = df_pairs.copy()
-            # Applica soglie
             mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & \
                    (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
             if int(alert_meme_min) > 0:
                 mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
             df_alert = df_alert[mask]
-            # Ordina per priorità
             if not df_alert.empty:
                 df_alert = df_alert.sort_values(
                     by=["Meme Score", "Txns 1h", "Liquidity (USD)"],
                     ascending=[False, False, False]
                 )
-                # Cooldown anti-spam
                 now = time.time()
                 cooldown = int(alert_cooldown_min) * 60
                 max_send = int(alert_max_per_run)
-                for _, row in df_alert.head(max_send*2).iterrows():  # scansiona un po' di più del max_send
+                for _, row in df_alert.head(max_send*2).iterrows():
                     addr = str(row.get("Base Address","")) or row.get("Pair")
                     last_ts = st.session_state["tg_sent"].get(addr, 0)
                     if now - last_ts < cooldown:
                         continue
-                    # Compose message
                     pair = row.get("Pair","")
                     dex  = row.get("DEX","")
                     ms   = int(row.get("Meme Score", 0) or 0)
@@ -741,19 +757,13 @@ if enable_alerts:
                     px   = row.get("Price (USD)", None)
                     chg  = row.get("Change 24h (%)", None)
                     link = row.get("Link","")
-                    txt = (
-                        f"⚡️ Radar Hit — {pair}\n"
-                        f"DEX: {dex}  |  MemeScore: {ms}\n"
-                        f"Txns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}\n"
-                        f"Price: {px:.8f}" if isinstance(px,(int,float)) and px else ""
-                    )
+                    txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
+                    if isinstance(px,(int,float)) and px:
+                        txt += f"\nPrice: {px:.8f}"
                     if chg is not None:
-                        try:
-                            txt += f"  |  24h: {float(chg):.2f}%"
-                        except Exception:
-                            pass
-                    if link:
-                        txt += f"\n{link}"
+                        try: txt += f"  |  24h: {float(chg):.2f}%"
+                        except Exception: pass
+                    if link: txt += f"\n{link}"
                     ok, err = tg_send(txt)
                     if ok:
                         st.session_state["tg_sent"][addr] = now
@@ -763,7 +773,7 @@ if enable_alerts:
         except Exception as e:
             st.caption(f"Alert Telegram: errore durante la scansione — {e}")
 
-# ---------------- Diagnostica ----------------
+# ---------------- Diagnostica finale ----------------
 st.subheader("Diagnostica")
 d1, d2, d3, d4 = st.columns(4)
 with d1: st.text(f"Query provider: {len(SEARCH_QUERIES)}  •  HTTP: {codes if codes else '—'}")
@@ -772,7 +782,7 @@ with d3: st.text(f"Righe dopo watchlist: {post_count}")
 with d4:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
-st.caption(f"Refresh: {REFRESH_SEC}s • GetMoni calls: {st.session_state.get('gm_calls',0)} • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
+st.caption(f"Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
 
 # 🔚 aggiorna timestamp per countdown
 st.session_state["last_refresh_ts"] = time.time()
