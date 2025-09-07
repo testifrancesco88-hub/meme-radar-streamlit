@@ -1,6 +1,7 @@
-# market_data.py — Provider DexScreener v3.1 (priceChange enrichment)
+# market_data.py — Provider DexScreener v3.2 (dual enrichment: pairs + tokens)
 # - Search multipla su DexScreener
-# - Enrichment: /latest/dex/pairs/{chainId}/{pairIds} per riempire priceChange (h1/h4/h6/h24)
+# - Enrichment 1: /latest/dex/pairs/{chainId}/{pairIds...} → riempie priceChange (h1/h4/h6/h24)
+# - Enrichment 2 (fallback): /tokens/v1/{chainId}/{tokenAddresses...} → riempie di nuovo priceChange
 # - Normalizza record mantenendo priceChange nested + flat fallback
 # - Filtri: only_raydium, min_liq, exclude_quotes
 # - Thread di auto-refresh
@@ -17,7 +18,8 @@ import pandas as pd
 
 DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search"
 DEX_PAIRS  = "https://api.dexscreener.com/latest/dex/pairs/{chainId}/{pairIds}"  # comma-separated pairIds
-CHAIN_ID   = "solana"  # questa app è focalizzata su Solana
+DEX_TOKENS = "https://api.dexscreener.com/tokens/v1/{chainId}/{tokenAddresses}" # comma-separated mints (max 30)
+CHAIN_ID   = "solana"  # app focalizzata su Solana
 
 UA_HEADERS = {
     "User-Agent": "MemeRadar/1.0 (+https://github.com/) Python/Requests",
@@ -31,11 +33,13 @@ def _to_float(x, default=None):
         return default
     try:
         s = str(x).replace(",", "").strip()
-        if s.endswith("%"):
-            s = s[:-1]
+        if s.endswith("%"): s = s[:-1]
         return float(s)
     except Exception:
-        return default
+        try:
+            return float(x)
+        except Exception:
+            return default
 
 def _sum_tx1h(txns: Dict[str, Any] | None) -> int:
     """DexScreener txns: {'h1': {'buys': int, 'sells': int}, ...}"""
@@ -62,7 +66,7 @@ def _vol24_usd(vol: Dict[str, Any] | None) -> float | None:
         return None
 
 def _safe_get_price_change(obj: Dict[str, Any] | None, key: str) -> float | None:
-    """obj può essere priceChange dict; key es. 'h1', 'h4', 'h6', 'h24'"""
+    """obj può essere priceChange dict; key es. 'm5', 'h1', 'h4', 'h6', 'h24'"""
     try:
         if not isinstance(obj, dict):
             return None
@@ -96,17 +100,17 @@ def _norm_pair(p: Dict[str, Any]) -> Dict[str, Any]:
     # timestamps
     rec["pairCreatedAt"]  = p.get("pairCreatedAt") or p.get("createdAt") or None
 
-    # Manteniamo priceChange annidato (se esiste)
-    price_change = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else None
+    # Manteniamo SEMPRE un dict per priceChange
+    price_change = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else {}
     rec["priceChange"] = price_change
 
-    # Valori "flat" (se presenti) — NON indispensabili per la UI (che legge anche nested)
+    # Valori "flat" (si riempiono anche via enrichment)
     rec["priceChange1hPct"]  = (
         _to_float(p.get("priceChange1hPct"), None)
         or _safe_get_price_change(price_change, "h1")
         or _to_float(p.get("pc1h"), None)
     )
-    # Dexscreener non sempre espone h4; la UI ha fallback a h6
+    # Dexscreener non sempre espone h4; la UI farà fallback su h6
     rec["priceChange4hPct"]  = (
         _to_float(p.get("priceChange4hPct"), None)
         or _safe_get_price_change(price_change, "h4")
@@ -129,7 +133,8 @@ class MarketDataProvider:
     """
     Recupera e normalizza i pairs da DexScreener (Solana).
     - /latest/dex/search?q=...
-    - Enrichment: /latest/dex/pairs/{chainId}/{pairIds} (blocchi) per riempire priceChange
+    - Enrichment 1: /latest/dex/pairs/{chainId}/{pairIds...}
+    - Enrichment 2: /tokens/v1/{chainId}/{tokenAddresses...}
     """
     def __init__(self, refresh_sec: int = 60, preserve_on_empty: bool = True):
         self.refresh_sec = int(refresh_sec)
@@ -262,40 +267,32 @@ class MarketDataProvider:
             out.append(r)
         return out
 
-    # -------- Enrichment: pairs endpoint (riempie priceChange h1/h4/h6/h24) --------
-    def _enrich_price_change(self, recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[int | str]]:
-        """
-        Per i pair senza priceChange.h1/h4, chiama /latest/dex/pairs/solana/{comma-separated}
-        a blocchi (max 30 id per chiamata, prudenziale) e aggiorna i record in-place.
-        """
-        # Se pochi record o già completi, si esce subito
+    # -------- Enrichment 1: pairs endpoint (riempie priceChange h1/h4/h6/h24) --------
+    def _enrich_via_pairs(self, recs: List[Dict[str, Any]]) -> Tuple[int, List[int | str]]:
         if not recs:
-            return recs, []
+            return 0, []
+        # Target: record senza h1 o h4
         need_ids: List[str] = []
         for r in recs:
-            pc = r.get("priceChange")
-            has_h1 = isinstance(pc, dict) and (pc.get("h1") is not None)
-            has_h4 = isinstance(pc, dict) and (pc.get("h4") is not None)
-            # Se mancano h1 o h4, proviamo ad arricchire (NB: la UI farà fallback su h6)
+            pc = r.get("priceChange") or {}
+            has_h1 = pc.get("h1") is not None
+            has_h4 = pc.get("h4") is not None  # spesso mancante: UI farà fallback su h6
             if (not has_h1) or (not has_h4):
                 pid = r.get("pairAddress")
-                if pid:
-                    need_ids.append(pid)
+                if pid: need_ids.append(pid)
 
-        # Niente da arricchire
         if not need_ids:
-            return recs, []
+            return 0, []
 
-        # Raggruppa in blocchi (prudenziale 30 id)
         CHUNK = 30
+        updated = 0
         codes: List[int | str] = []
-        idx_map = {r.get("pairAddress"): r for r in recs if r.get("pairAddress")}
+        by_id = {r.get("pairAddress"): r for r in recs if r.get("pairAddress")}
         session = self._session
 
         for i in range(0, len(need_ids), CHUNK):
             chunk = need_ids[i:i+CHUNK]
-            pair_ids = ",".join(chunk)
-            url = DEX_PAIRS.format(chainId=CHAIN_ID, pairIds=pair_ids)
+            url = DEX_PAIRS.format(chainId=CHAIN_ID, pairIds=",".join(chunk))
             try:
                 resp = session.get(url, timeout=20)
                 codes.append(resp.status_code)
@@ -305,23 +302,85 @@ class MarketDataProvider:
                 pairs = data.get("pairs") or []
                 for p in pairs:
                     pid = p.get("pairAddress")
-                    tgt = idx_map.get(pid)
+                    tgt = by_id.get(pid)
                     if not tgt:
                         continue
-                    pc = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else None
-                    if not pc:
-                        continue
-                    # aggiorna nested + flat
-                    tgt["priceChange"] = pc
-                    # flat
-                    tgt["priceChange1hPct"] = tgt.get("priceChange1hPct") or _safe_get_price_change(pc, "h1")
-                    # h4 può mancare, ma UI farà fallback su h6
-                    tgt["priceChange4hPct"] = tgt.get("priceChange4hPct") or _safe_get_price_change(pc, "h4")
-                    tgt["priceChange6hPct"] = tgt.get("priceChange6hPct") or _safe_get_price_change(pc, "h6")
-                    tgt["priceChange24hPct"]= tgt.get("priceChange24hPct") or _safe_get_price_change(pc, "h24")
+                    pc = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else {}
+                    if pc:
+                        tgt_pc = tgt.get("priceChange") or {}
+                        tgt_pc.update(pc)
+                        tgt["priceChange"] = tgt_pc
+                        # flat
+                        if tgt.get("priceChange1hPct") is None:
+                            tgt["priceChange1hPct"] = _safe_get_price_change(pc, "h1")
+                        if tgt.get("priceChange4hPct") is None:
+                            tgt["priceChange4hPct"] = _safe_get_price_change(pc, "h4")
+                        if tgt.get("priceChange6hPct") is None:
+                            tgt["priceChange6hPct"] = _safe_get_price_change(pc, "h6")
+                        if tgt.get("priceChange24hPct") is None:
+                            tgt["priceChange24hPct"] = _safe_get_price_change(pc, "h24")
+                        updated += 1
             except Exception:
                 codes.append("ERR")
-        return recs, codes
+        return updated, codes
+
+    # -------- Enrichment 2: tokens endpoint (fallback via baseAddress) --------
+    def _enrich_via_tokens(self, recs: List[Dict[str, Any]]) -> Tuple[int, List[int | str]]:
+        if not recs:
+            return 0, []
+        # Prendiamo i baseAddress dei record con h1/h4 mancanti
+        target = []
+        for r in recs:
+            pc = r.get("priceChange") or {}
+            if pc.get("h1") is None or pc.get("h4") is None:
+                mint = r.get("baseAddress")
+                if mint:
+                    target.append(mint)
+        # Unici + chunk
+        target = list({t for t in target if t})
+        if not target:
+            return 0, []
+        CHUNK = 30
+        updated = 0
+        codes: List[int | str] = []
+        by_id = {r.get("pairAddress"): r for r in recs if r.get("pairAddress")}
+        session = self._session
+
+        for i in range(0, len(target), CHUNK):
+            mints = target[i:i+CHUNK]
+            url = DEX_TOKENS.format(chainId=CHAIN_ID, tokenAddresses=",".join(mints))
+            try:
+                resp = session.get(url, timeout=20)
+                codes.append(resp.status_code)
+                if not resp.ok:
+                    continue
+                pairs = resp.json() or []
+                # tokens/v1 ritorna una LISTA di pair (per ciascun mint)
+                for p in pairs:
+                    pid = p.get("pairAddress")
+                    if not pid:
+                        continue
+                    tgt = by_id.get(pid)
+                    if not tgt:
+                        continue
+                    pc = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else {}
+                    if not pc:
+                        continue
+                    tgt_pc = tgt.get("priceChange") or {}
+                    tgt_pc.update(pc)
+                    tgt["priceChange"] = tgt_pc
+                    if tgt.get("priceChange1hPct") is None:
+                        tgt["priceChange1hPct"] = _safe_get_price_change(pc, "h1")
+                    if tgt.get("priceChange4hPct") is None:
+                        tgt["priceChange4hPct"] = _safe_get_price_change(pc, "h4")
+                    if tgt.get("priceChange6hPct") is None:
+                        tgt["priceChange6hPct"] = _safe_get_price_change(pc, "h6")
+                    if tgt.get("priceChange24hPct") is None:
+                        tgt["priceChange24hPct"] = _safe_get_price_change(pc, "h24")
+                    updated += 1
+            except Exception:
+                codes.append("ERR")
+        return updated, codes
 
     def _collect_all(self) -> Tuple[pd.DataFrame, float]:
         all_recs: List[Dict[str, Any]] = []
@@ -345,21 +404,29 @@ class MarketDataProvider:
         # dedup
         all_recs = self._dedup_by_pair(all_recs)
 
-        # Enrichment: per contenere le chiamate, priorità ai pair con volume24h più alto
+        # Enrichment su TOP per volume (limitiamo le chiamate)
         if all_recs:
             try:
-                # ordina per volume desc e limita a 180 rec da arricchire (rate-limit safe)
-                tmp_df = pd.DataFrame(all_recs)
-                tmp_df["__v24__"] = pd.to_numeric(tmp_df.get("volume24hUsd", 0), errors="coerce").fillna(0)
-                top_ids = tmp_df.sort_values("__v24__", ascending=False)["pairAddress"].dropna().astype(str).tolist()[:180]
-                # mantieni ordine e filtra i record in base a top_ids
+                df_tmp = pd.DataFrame(all_recs)
+                df_tmp["__v24__"] = pd.to_numeric(df_tmp.get("volume24hUsd", 0), errors="coerce").fillna(0)
+                # Arricchiamo i top 180 per volume per restare entro rate limit
+                top_ids = df_tmp.sort_values("__v24__", ascending=False)["pairAddress"].dropna().astype(str).tolist()[:180]
                 id_set = set(top_ids)
-                top_recs = [r for r in all_recs if r.get("pairAddress") in id_set]
-                enr_recs, enr_codes = self._enrich_price_change(top_recs)
-                codes.extend(enr_codes)
-                # rimpiazza nei record totali quelli arricchiti
+                target_recs = [r for r in all_recs if r.get("pairAddress") in id_set]
+
+                # 1) pairs
+                upd1, codes1 = self._enrich_via_pairs(target_recs)
+                codes.extend(codes1)
+
+                # 2) tokens (solo se serve ancora)
+                need_more = [r for r in target_recs if (r.get("priceChange") or {}).get("h1") is None or (r.get("priceChange") or {}).get("h4") is None]
+                if need_more:
+                    upd2, codes2 = self._enrich_via_tokens(need_more)
+                    codes.extend(codes2)
+
+                # Aggiorna all_recs con le versioni arricchite
                 by_id = {r.get("pairAddress"): r for r in all_recs if r.get("pairAddress")}
-                for r in enr_recs:
+                for r in target_recs:
                     pid = r.get("pairAddress")
                     if pid in by_id:
                         by_id[pid].update(r)
