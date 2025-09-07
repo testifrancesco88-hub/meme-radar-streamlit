@@ -1,21 +1,24 @@
-# market_data.py — Provider DexScreener v3 (nested priceChange safe)
-# - search multipla su DexScreener
-# - normalizza record mantenendo priceChange (h1,h4,h6,h24)
-# - filtri: only_raydium, min_liq, exclude_quotes
-# - thread di auto-refresh opzionale
-# - snapshot in DataFrame con campi usati dalla UI
+# market_data.py — Provider DexScreener v3.1 (priceChange enrichment)
+# - Search multipla su DexScreener
+# - Enrichment: /latest/dex/pairs/{chainId}/{pairIds} per riempire priceChange (h1/h4/h6/h24)
+# - Normalizza record mantenendo priceChange nested + flat fallback
+# - Filtri: only_raydium, min_liq, exclude_quotes
+# - Thread di auto-refresh
+# - Snapshot in DataFrame con campi consumati dalla UI
 
 from __future__ import annotations
 import time
 import threading
 import random
-import math
 from typing import Iterable, Optional, Tuple, Dict, Any, List
 
 import requests
 import pandas as pd
 
 DEX_SEARCH = "https://api.dexscreener.com/latest/dex/search"
+DEX_PAIRS  = "https://api.dexscreener.com/latest/dex/pairs/{chainId}/{pairIds}"  # comma-separated pairIds
+CHAIN_ID   = "solana"  # questa app è focalizzata su Solana
+
 UA_HEADERS = {
     "User-Agent": "MemeRadar/1.0 (+https://github.com/) Python/Requests",
     "Accept": "application/json",
@@ -74,11 +77,12 @@ def _norm_pair(p: Dict[str, Any]) -> Dict[str, Any]:
     quote = (p.get("quoteToken") or {})
     rec: Dict[str, Any] = {}
 
+    rec["chainId"]      = p.get("chainId") or CHAIN_ID
     rec["baseSymbol"]   = base.get("symbol") or ""
     rec["quoteSymbol"]  = quote.get("symbol") or ""
     rec["baseAddress"]  = base.get("address") or ""
     rec["quoteAddress"] = quote.get("address") or ""
-    rec["pairAddress"]  = p.get("pairAddress") or p.get("pairAddress") or ""
+    rec["pairAddress"]  = p.get("pairAddress") or ""
 
     rec["dexId"]        = p.get("dexId") or ""
     rec["url"]          = p.get("url") or ""
@@ -90,7 +94,6 @@ def _norm_pair(p: Dict[str, Any]) -> Dict[str, Any]:
     rec["txns1h"]         = _sum_tx1h(p.get("txns"))
 
     # timestamps
-    # Dexscreener usa ms epoch in 'pairCreatedAt' se disponibile
     rec["pairCreatedAt"]  = p.get("pairCreatedAt") or p.get("createdAt") or None
 
     # Manteniamo priceChange annidato (se esiste)
@@ -124,10 +127,10 @@ def _norm_pair(p: Dict[str, Any]) -> Dict[str, Any]:
 
 class MarketDataProvider:
     """
-    Recupera e normalizza i pairs da DexScreener su Solana (tramite /search?q=).
-    Conserva un DataFrame unificato (dedup per pairAddress).
+    Recupera e normalizza i pairs da DexScreener (Solana).
+    - /latest/dex/search?q=...
+    - Enrichment: /latest/dex/pairs/{chainId}/{pairIds} (blocchi) per riempire priceChange
     """
-
     def __init__(self, refresh_sec: int = 60, preserve_on_empty: bool = True):
         self.refresh_sec = int(refresh_sec)
         self.preserve_on_empty = bool(preserve_on_empty)
@@ -206,7 +209,6 @@ class MarketDataProvider:
             try:
                 self.force_refresh()
             except Exception:
-                # non blocchiamo il loop su eccezioni momentanee
                 pass
             wait = max(3, int(self.refresh_sec * (1.0 + random.uniform(-jitter, jitter))))
             self._stop.wait(wait)
@@ -260,6 +262,67 @@ class MarketDataProvider:
             out.append(r)
         return out
 
+    # -------- Enrichment: pairs endpoint (riempie priceChange h1/h4/h6/h24) --------
+    def _enrich_price_change(self, recs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[int | str]]:
+        """
+        Per i pair senza priceChange.h1/h4, chiama /latest/dex/pairs/solana/{comma-separated}
+        a blocchi (max 30 id per chiamata, prudenziale) e aggiorna i record in-place.
+        """
+        # Se pochi record o già completi, si esce subito
+        if not recs:
+            return recs, []
+        need_ids: List[str] = []
+        for r in recs:
+            pc = r.get("priceChange")
+            has_h1 = isinstance(pc, dict) and (pc.get("h1") is not None)
+            has_h4 = isinstance(pc, dict) and (pc.get("h4") is not None)
+            # Se mancano h1 o h4, proviamo ad arricchire (NB: la UI farà fallback su h6)
+            if (not has_h1) or (not has_h4):
+                pid = r.get("pairAddress")
+                if pid:
+                    need_ids.append(pid)
+
+        # Niente da arricchire
+        if not need_ids:
+            return recs, []
+
+        # Raggruppa in blocchi (prudenziale 30 id)
+        CHUNK = 30
+        codes: List[int | str] = []
+        idx_map = {r.get("pairAddress"): r for r in recs if r.get("pairAddress")}
+        session = self._session
+
+        for i in range(0, len(need_ids), CHUNK):
+            chunk = need_ids[i:i+CHUNK]
+            pair_ids = ",".join(chunk)
+            url = DEX_PAIRS.format(chainId=CHAIN_ID, pairIds=pair_ids)
+            try:
+                resp = session.get(url, timeout=20)
+                codes.append(resp.status_code)
+                if not resp.ok:
+                    continue
+                data = resp.json() or {}
+                pairs = data.get("pairs") or []
+                for p in pairs:
+                    pid = p.get("pairAddress")
+                    tgt = idx_map.get(pid)
+                    if not tgt:
+                        continue
+                    pc = p.get("priceChange") if isinstance(p.get("priceChange"), dict) else None
+                    if not pc:
+                        continue
+                    # aggiorna nested + flat
+                    tgt["priceChange"] = pc
+                    # flat
+                    tgt["priceChange1hPct"] = tgt.get("priceChange1hPct") or _safe_get_price_change(pc, "h1")
+                    # h4 può mancare, ma UI farà fallback su h6
+                    tgt["priceChange4hPct"] = tgt.get("priceChange4hPct") or _safe_get_price_change(pc, "h4")
+                    tgt["priceChange6hPct"] = tgt.get("priceChange6hPct") or _safe_get_price_change(pc, "h6")
+                    tgt["priceChange24hPct"]= tgt.get("priceChange24hPct") or _safe_get_price_change(pc, "h24")
+            except Exception:
+                codes.append("ERR")
+        return recs, codes
+
     def _collect_all(self) -> Tuple[pd.DataFrame, float]:
         all_recs: List[Dict[str, Any]] = []
         codes: List[int | str] = []
@@ -282,13 +345,37 @@ class MarketDataProvider:
         # dedup
         all_recs = self._dedup_by_pair(all_recs)
 
+        # Enrichment: per contenere le chiamate, priorità ai pair con volume24h più alto
+        if all_recs:
+            try:
+                # ordina per volume desc e limita a 180 rec da arricchire (rate-limit safe)
+                tmp_df = pd.DataFrame(all_recs)
+                tmp_df["__v24__"] = pd.to_numeric(tmp_df.get("volume24hUsd", 0), errors="coerce").fillna(0)
+                top_ids = tmp_df.sort_values("__v24__", ascending=False)["pairAddress"].dropna().astype(str).tolist()[:180]
+                # mantieni ordine e filtra i record in base a top_ids
+                id_set = set(top_ids)
+                top_recs = [r for r in all_recs if r.get("pairAddress") in id_set]
+                enr_recs, enr_codes = self._enrich_price_change(top_recs)
+                codes.extend(enr_codes)
+                # rimpiazza nei record totali quelli arricchiti
+                by_id = {r.get("pairAddress"): r for r in all_recs if r.get("pairAddress")}
+                for r in enr_recs:
+                    pid = r.get("pairAddress")
+                    if pid in by_id:
+                        by_id[pid].update(r)
+                all_recs = list(by_id.values()) + [r for r in all_recs if not r.get("pairAddress")]
+            except Exception:
+                # se l'arricchimento fallisce, proseguiamo con i dati disponibili
+                pass
+
         df = pd.DataFrame(all_recs) if all_recs else pd.DataFrame(columns=[
-            "baseSymbol","quoteSymbol","baseAddress","quoteAddress","pairAddress",
+            "chainId","baseSymbol","quoteSymbol","baseAddress","quoteAddress","pairAddress",
             "dexId","url","priceUsd","liquidityUsd","volume24hUsd","txns1h",
             "pairCreatedAt","priceChange","priceChange1hPct","priceChange4hPct","priceChange6hPct","priceChange24hPct",
         ])
 
         ts = time.time()
         with self._lock:
-            self._http_codes = codes[-10:]  # mantieni ultimi 10
+            # tieni ultimi 20 codici HTTP per diagnostica
+            self._http_codes = (self._http_codes + codes)[-20:]
         return df, ts
