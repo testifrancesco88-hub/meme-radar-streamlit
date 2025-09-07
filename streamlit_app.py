@@ -1,5 +1,6 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8.4
-# + LIVE Pump.fun via WebSocket (subscribeNewToken) con filtri e alert opzionali
+# streamlit_app.py — Meme Radar (Streamlit) v8.4.1
+# Fix crash Meme Score: rimosso placeholder e resi robusti compute_meme_score_row/score_liq
+# Include: MarketDataProvider + Charts + Watchlist + CSV + Alert Telegram + LIVE Pump.fun
 
 import os, time, math, random, datetime, json, threading
 import pandas as pd
@@ -31,7 +32,7 @@ SEARCH_QUERIES = [
     "chain:solana bonk",
     "chain:solana wif",
     "chain:solana pepe",
-    # suggerimento per coprire pump.fun quando indicizzato
+    # extra copertura pump.fun quando indicizzato
     "chain:solana pump",
 ]
 
@@ -99,7 +100,7 @@ with st.sidebar:
     pump_alert_enable = st.toggle("Alert Telegram su match keyword", value=False, help="Richiede BOT_TOKEN e CHAT_ID sopra")
     st.caption("Fonte: PumpPortal WebSocket – un'unica connessione condivisa. Evita multi-connessioni. ")
 
-# 🔁 sostituisce experimental_set_query_params
+# Refresh via query param (no experimental)
 if auto_refresh:
     try:
         st.query_params.update({"_": str(int(time.time() // REFRESH_SEC))})
@@ -129,11 +130,10 @@ def fmt_int(n):
     return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
 
 def hours_since_ms(ms_or_s):
-    if not ms_or_s and ms_or_s != 0: return None
+    if ms_or_s is None: return None
     try:
         v = int(ms_or_s)
-        # autodetect ms vs s
-        if v > 10_000_000_000:  # > ~2001 in s → quindi probabilmente ms
+        if v > 10_000_000_000:  # ms vs s
             v = v/1000.0
         return max(0.0, (time.time() - v) / 3600.0)
     except Exception:
@@ -193,27 +193,58 @@ def score_symbol(s):
 def score_age(hours):
     if hours is None: return 0.5
     return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
-def score_liq(liq, mn, mx):
-    if liq is None or liq <= 0: return 0.0
-    if mn <= liq <= mx: return 1.0
-    if liq < mn: return max(0.0, liq / mn)
-    return max(0.0, mx / liq)
-def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
-def compute_meme_score_row(r, weights, sweet_min, sweet_max):
+def score_liq(liq, mn, mx):
+    """
+    Gestione robusta di mn/mx None: se non passati, assumo banda [0, +inf).
+    """
+    if liq is None or liq <= 0:
+        return 0.0
+    try:
+        mn = float(mn) if mn is not None else 0.0
+    except Exception:
+        mn = 0.0
+    try:
+        mx = float(mx) if mx not in (None, 0) else float("inf")
+    except Exception:
+        mx = float("inf")
+    if mn <= liq <= mx:
+        return 1.0
+    if liq < mn:
+        return max(0.0, liq / (mn if mn > 0 else 1.0))
+    # liq > mx (mx può essere inf → questo ramo non scatta)
+    return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
+
+def score_dex(d): 
+    return DEX_WEIGHTS.get((d or "").lower(), 0.6)
+
+def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
+    """
+    Calcola Meme Score (0–100).
+    - weights: tuple/list (w_symbol, w_age, w_txns, w_liq, w_dex). Se None → usa cursori sidebar.
+    - sweet_min/max: banda ideale liquidity. Se None → trattata come [0, +inf) (nessuna penalità per eccesso).
+    """
+    # supporta dict/Series
     base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
     dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
     liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
     tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
+
+    # fallback ai cursori della sidebar se weights è None
+    if weights is None:
+        local_weights = (w_symbol, w_age, w_txns, w_liq, w_dex)
+    else:
+        local_weights = tuple(weights)
+
     f = (
-        w_symbol*score_symbol(base) +
-        w_age*score_age(ageh) +
-        w_txns*s_sigmoid(tx1) +
-        w_liq*score_liq(liq, sweet_min, sweet_max) +
-        w_dex*score_dex(dex)
+        local_weights[0]*score_symbol(base) +
+        local_weights[1]*score_age(ageh) +
+        local_weights[2]*s_sigmoid(tx1) +
+        local_weights[3]*score_liq(liq, sweet_min, sweet_max) +
+        local_weights[4]*score_dex(dex)
     )
-    total = max(1e-6, sum([w_symbol, w_age, w_txns, w_liq, w_dex]))
+    total = max(1e-6, sum(local_weights))
     return round(100.0 * f / total)
 
 # ---------------- Provider init (una sola volta) ----------------
@@ -355,11 +386,15 @@ with right:
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
-        mscore = compute_meme_score_row(r, None, None, None)  # pesi già letti sopra
+        mscore = compute_meme_score_row(
+            r,
+            weights=(w_symbol, w_age, w_txns, w_liq, w_dex),
+            sweet_min=liq_min_sweet,
+            sweet_max=liq_max_sweet
+        )
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
         rows.append({
-            "Meme Score": compute_meme_score_row(r, None, None, None) if False else  # placeholder disattivato
-                         compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet),
+            "Meme Score": mscore,
             "Pair": f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
             "DEX": r.get("dexId",""),
             "Liquidity (USD)": int(round(r.get("liquidityUsd") or 0)),
@@ -398,7 +433,7 @@ if not df_pairs.empty:
             "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
         }
     )
-    csv_bytes = df_pairs[[c for c in display_cols]].to_csv(index=False).encode("utf-8")
+    csv_bytes = df_pairs[display_cols].to_csv(index=False).encode("utf-8")
     st.download_button("📥 Scarica CSV filtrato", data=csv_bytes, file_name="solana-meme-radar.csv", mime="text/csv")
 else:
     st.info("Nessuna pair da mostrare (post-filtri).")
@@ -408,7 +443,9 @@ st.markdown("### Top 10 per Meme Score")
 if not df_pairs.empty:
     top10_meme = df_pairs.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]).head(10)
     fig3 = px.bar(
-        top10_meme, x="Pair", y="Meme Score",
+        top10_meme,
+        x="Pair",
+        y="Meme Score",
         hover_data=["DEX","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Price (USD)","Change 24h (%)","Created (UTC)","Pair Age"],
         title="Top 10 per Meme Score"
     )
@@ -419,10 +456,7 @@ else:
 
 # ---------------- LIVE Pump.fun — classe + integrazione ----------------
 class PumpFunLive:
-    """
-    WebSocket single-connection a PumpPortal per subscribeNewToken.
-    Dedup per mint, buffer limitato, snapshot in DataFrame.
-    """
+    """WebSocket single-connection a PumpPortal per subscribeNewToken (dedup mint, buffer, snapshot DF)."""
     def __init__(self, max_rows=200, api_key: str | None = None):
         self.max_rows = int(max_rows)
         self.api_key = api_key
@@ -446,10 +480,8 @@ class PumpFunLive:
     def stop(self):
         self._stop.set()
         try:
-            if self._ws:
-                self._ws.close()
-        except Exception:
-            pass
+            if self._ws: self._ws.close()
+        except Exception: pass
 
     def _on_open(self, ws):
         self._connected = True
@@ -461,12 +493,10 @@ class PumpFunLive:
     def _on_message(self, ws, message: str):
         try:
             data = json.loads(message) if isinstance(message, (str, bytes, bytearray)) else message
-            # Estrarre in modo resiliente
             mint   = data.get("mint") or data.get("token") or data.get("mintAddress") or data.get("address")
             name   = data.get("name") or data.get("tokenName") or data.get("symbol") or ""
             symbol = data.get("symbol") or ""
             creator= data.get("creator") or data.get("user") or data.get("owner") or ""
-            # timestamp (ms o s)
             ts = (data.get("createdTimestamp") or data.get("createdOn") or data.get("createdAt") or int(time.time()))
             row = {
                 "Mint": mint or "",
@@ -478,11 +508,9 @@ class PumpFunLive:
                 "Pump.fun": f"https://pump.fun/coin/{mint}" if mint else "",
                 "Solscan": f"https://solscan.io/token/{mint}" if mint else "",
             }
-            if not mint:
-                return
+            if not mint: return
             with self._lock:
-                if any(r["Mint"] == mint for r in self._rows):
-                    return
+                if any(r["Mint"] == mint for r in self._rows): return
                 self._rows.insert(0, row)
                 if len(self._rows) > self.max_rows:
                     self._rows = self._rows[:self.max_rows]
@@ -508,7 +536,6 @@ class PumpFunLive:
                 self._ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 self._last_err = f"run_forever err: {e}"
-            # se non stop, backoff e retry
             if not self._stop.is_set():
                 time.sleep(1.5 + random.uniform(0, 1.5))
 
@@ -523,16 +550,14 @@ class PumpFunLive:
 if "pump_live" not in st.session_state:
     st.session_state["pump_live"] = None
 if pump_enable and websocket is None:
-    st.warning("Installare `websocket-client` in requirements.txt per attivare il feed live.")
+    st.warning("Installa `websocket-client` in requirements.txt per attivare il feed live.")
 elif pump_enable and websocket is not None:
     if st.session_state["pump_live"] is None:
         st.session_state["pump_live"] = PumpFunLive(max_rows=pump_buffer, api_key=os.getenv("PUMP_API_KEY",""))
         st.session_state["pump_live"].start()
     else:
-        # aggiorna max_rows dinamicamente
         st.session_state["pump_live"].max_rows = int(pump_buffer)
 else:
-    # disabilitato: stop e pulizia
     if st.session_state["pump_live"] is not None:
         st.session_state["pump_live"].stop()
         st.session_state["pump_live"] = None
@@ -566,7 +591,7 @@ if pump_enable and st.session_state["pump_live"] and websocket is not None:
         if pump_alert_enable and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and keys:
             if "sent_live" not in st.session_state: st.session_state["sent_live"] = set()
             to_send = []
-            for _, r in df_live.head(10).iterrows():  # limitiamo per sicurezza
+            for _, r in df_live.head(10).iterrows():  # limite invii
                 mint = r["Mint"]
                 if mint and mint not in st.session_state["sent_live"]:
                     to_send.append(r)
