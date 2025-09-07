@@ -198,10 +198,12 @@ class TradeEngine:
     """
     Collega strategia + broker + risk. Gestisce open/close su DataFrame di segnali.
     """
-    def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig):
+class TradeEngine:
+    def __init__(self, risk_cfg: RiskConfig, strat_cfg: StratConfig, bm_check=None):
         self.risk = RiskManager(risk_cfg)
         self.broker = PaperBroker(self.risk)
         self.strategy = StrategyMomentumV1(strat_cfg)
+        self.bm_check = bm_check  # funzione(token_address) -> dict
 
     def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """
@@ -231,16 +233,44 @@ class TradeEngine:
             by=["Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False]
         ).reset_index(drop=True) if candidates else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link"])
 
-        # 2) apri max 1 posizione per step (prudenza)
-        if not df_signals.empty and self.risk.can_open(len(self.broker.positions)):
-            top = df_signals.iloc[0].to_dict()
-            sym = top["Pair"]; px = float(top["Price (USD)"] or 0.0)
-            if px > 0:
-                self.broker.open_long(sym, label=f"{top['DEX']} | S{top['Score']}", price=px, usd_amount=self.risk.cfg.position_usd)
+        # 1) scan segnali
+        for r in df_pairs.to_dict(orient="records"):
+            sym = r.get("Pair","")
+            last = float(r.get("Price (USD)") or 0.0)
+            prices[sym] = last
+            if self.strategy.signal_long(r):
+                candidates.append({
+                    "Pair": sym,
+                    "DEX": r.get("DEX",""),
+                    "Score": int(r.get("Meme Score", 0) or 0),
+                    "Txns 1h": int(r.get("Txns 1h", 0) or 0),
+                    "Liquidity (USD)": int(r.get("Liquidity (USD)", 0) or 0),
+                    "Price (USD)": last,
+                    "Link": r.get("Link",""),
+                    "Base Address": r.get("Base Address","") or r.get("baseAddress",""),
+                })
 
-        # 3) mark-to-market & regole di uscita
-        df_open, df_closed = self.broker.mark_to_market(prices)
-        return df_signals, df_open, df_closed
+        # --- Bubblemaps anti-cluster (filtra i candidati ad alto rischio) ---
+        filtered = []
+        for c in candidates:
+            addr = c.get("Base Address") or ""
+            bm_ok = "N/A"
+            if self.bm_check and addr:
+                try:
+                    bm = self.bm_check(addr)
+                    if bm.get("is_high_risk"):
+                        # scarta (non tradabile)
+                        bm_ok = "HIGH"
+                        # NON aggiungere a filtered
+                        continue
+                    else:
+                        bm_ok = "OK"
+                except Exception:
+                    bm_ok = "ERR"
+            c["BM Risk"] = bm_ok  # visibile in UI
+            filtered.append(c)
 
-    def close_by_id(self, pid: str, last_price: float):
-        self.broker.close(pid, last_price, "MANUAL")
+        df_signals = (pd.DataFrame(filtered)
+                        .sort_values(by=["Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
+                        .reset_index(drop=True)
+                      ) if filtered else pd.DataFrame(columns=["Pair","DEX","Score","Txns 1h","Liquidity (USD)","Price (USD)","Link","Base Address","BM Risk"])
