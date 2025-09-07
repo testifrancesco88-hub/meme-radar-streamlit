@@ -1,13 +1,13 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8
+# streamlit_app.py — Meme Radar (Streamlit) v8.1
 # Integra MarketDataProvider per dati live (prezzo, liq, vol24h, change24h, txns1h)
-# Mantiene: Meme Score, watchlist, alert Telegram, grafici, export CSV
+# Safe sort / fallback robusti + Meme Score + Watchlist + Alert Telegram + Export CSV + Pair Age + Grafico Top Meme
 
 import os, time, math, random, datetime
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from market_data import MarketDataProvider  # <-- provider
+from market_data import MarketDataProvider  # <-- assicurati di avere market_data.py nella repo
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -143,6 +143,21 @@ def norm_list(s):
         out.append(part.upper() if len(part) <= 8 else part)
     return out
 
+def safe_series_mean(s):
+    vals = []
+    for x in s:
+        try:
+            if pd.notna(x):
+                vals.append(float(x))
+        except Exception:
+            pass
+    return (sum(vals)/len(vals)) if vals else None
+
+def safe_sort(df, col, ascending=False):
+    if df is None or df.empty or col not in df.columns:
+        return df
+    return df.sort_values(by=[col], ascending=ascending)
+
 # Meme Score helpers
 STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
 WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
@@ -165,11 +180,12 @@ def score_liq(liq, mn, mx):
 def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
 def compute_meme_score_row(r, weights, sweet_min, sweet_max):
-    base = r.get("baseSymbol","")
-    dex  = r.get("dexId","")
-    liq  = r.get("liquidityUsd", None)
-    tx1  = r.get("txns1h", 0)
-    ageh = hours_since_ms(r.get("pairCreatedAt", 0))
+    # r può essere dict/Series: usa .get
+    base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
+    dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
+    liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
+    tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
+    ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     f = (
         weights[0]*score_symbol(base) +
         weights[1]*score_age(ageh) +
@@ -207,9 +223,9 @@ st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts 
 # Watchlist
 watchlist = norm_list(watchlist_input)
 def is_watch_hit_row(r):
-    base = (r.get("baseSymbol") or "").upper()
-    quote= (r.get("quoteSymbol") or "").upper()
-    addr = r.get("pairAddress") or ""
+    base = str(r.get("baseSymbol","")).upper() if hasattr(r,"get") else str(r["baseSymbol"]).upper()
+    quote= str(r.get("quoteSymbol","")).upper() if hasattr(r,"get") else str(r["quoteSymbol"]).upper()
+    addr = r.get("pairAddress","") if hasattr(r,"get") else r["pairAddress"]
     return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
 
 df_view = df_provider.copy()
@@ -222,10 +238,6 @@ if watchlist_only and not df_view.empty:
 post_count = len(df_view)
 
 # ---------------- KPI base (dal df_view) ----------------
-def safe_series_mean(s):
-    vals = [float(x) for x in s if pd.notna(x)]
-    return avg(vals)
-
 if df_view.empty:
     vol24_avg = None
     tx1h_avg = None
@@ -237,10 +249,11 @@ else:
 if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
-# Nuove coin – Birdeye (opzionale) con fallback “pairs più recenti” dal provider
+# ---------------- Nuove coin – Birdeye + Fallback sicuro ----------------
 be_headers = {"accept": "application/json"}
 be_key = os.getenv("BE_API_KEY","")
 if be_key: be_headers["x-api-key"] = be_key
+
 bird_data, bird_code = fetch_with_retry(BIRDEYE_URL, headers={**UA_HEADERS, **be_headers})
 bird_tokens, bird_ok = [], False
 if bird_data and "data" in bird_data:
@@ -266,10 +279,12 @@ if bird_ok and bird_tokens:
     new_source = "Birdeye"
 else:
     new_source = "DexScreener (fallback)"
-    recents = df_provider.sort_values(by=["pairCreatedAt"], ascending=False).head(20)
-    new_liq_values = [x for x in recents["liquidityUsd"].tolist() if x is not None]
+    recents = safe_sort(df_provider, "pairCreatedAt", ascending=False)
+    recents = recents.head(20) if recents is not None and not recents.empty else pd.DataFrame(columns=["liquidityUsd","baseSymbol"])
+    liq_series = recents.get("liquidityUsd", pd.Series(dtype=float))
+    new_liq_values = [float(x) for x in liq_series.tolist() if pd.notna(x)]
 
-new_liq_avg = avg(new_liq_values) if new_liq_values else None
+new_liq_avg = (sum(new_liq_values)/len(new_liq_values)) if new_liq_values else None
 
 # Score mercato
 score = "N/D"
@@ -308,9 +323,9 @@ with right:
         fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
         st.plotly_chart(fig2, use_container_width=True)
     else:
-        recents = df_provider.sort_values(by=["pairCreatedAt"], ascending=False).head(20)
-        if not recents.empty:
-            df_liq = pd.DataFrame({"Token": recents["baseSymbol"], "Liquidity": recents["liquidityUsd"].fillna(0)})
+        recents = safe_sort(df_provider, "pairCreatedAt", ascending=False)
+        if recents is not None and not recents.empty:
+            df_liq = pd.DataFrame({"Token": recents.head(20)["baseSymbol"], "Liquidity": recents.head(20)["liquidityUsd"].fillna(0)})
             fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Pairs – Liquidity (Dex fallback)")
             st.plotly_chart(fig2, use_container_width=True)
         else:
