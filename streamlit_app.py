@@ -1,12 +1,12 @@
-# streamlit_app.py — Meme Radar (Streamlit) v8.2
-# Fix: st.query_params al posto di experimental_set_query_params + filtri provider robusti
+# streamlit_app.py — Meme Radar (Streamlit) v8.3
+# Fix: usa st.query_params e passa exclude_quotes sanitizzato + fallback try/except
 
 import os, time, math, random, datetime
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from market_data import MarketDataProvider  # v8.2
+from market_data import MarketDataProvider  # v8.3
 
 # ---------------- Config ----------------
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
@@ -210,11 +210,23 @@ if "provider" not in st.session_state:
 provider: MarketDataProvider = st.session_state["provider"]
 
 # Applica/azzera filtri del provider in base al toggle
-if disable_all_filters:
-    provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
-else:
-    # passa una LIST, non set — il provider gestisce uppercase/flatten
-    provider.set_filters(only_raydium=only_raydium, min_liq=min_liq, exclude_quotes=list(exclude_quotes))
+try:
+    if disable_all_filters:
+        provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
+    else:
+        # passa SOLO stringhe (sanitizza), lascia che il provider faccia uppercase/flatten
+        exclude_quotes_safe = [str(x) for x in (exclude_quotes or [])]
+        provider.set_filters(
+            only_raydium=only_raydium,
+            min_liq=min_liq,
+            exclude_quotes=exclude_quotes_safe
+        )
+except Exception as e:
+    # Fallback gentile: rimuovi exclude_quotes e continua
+    st.warning(f"Filtro quote non applicato (fallback). Dettagli: {type(e).__name__}")
+    provider.set_filters(only_raydium=only_raydium if not disable_all_filters else False,
+                         min_liq=min_liq if not disable_all_filters else 0,
+                         exclude_quotes=[])
 
 # Snapshot dal provider
 df_provider, ts = provider.get_snapshot()
