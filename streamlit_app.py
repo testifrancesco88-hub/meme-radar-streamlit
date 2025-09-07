@@ -1,5 +1,5 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12.3
-# - Scanner Solana (DexScreener + Birdeye per nuove coin)
+# streamlit_app.py — Meme Radar (Streamlit) v12.4
+# - Scanner Solana via MarketDataProvider (DexScreener)
 # - KPI, Meme Score, grafici, watchlist
 # - Filtro Volume 24h (MIN/MAX)
 # - DEX consentiti (multiselect)
@@ -7,7 +7,7 @@
 # - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
 # - Alert Telegram dalla tabella
 # - LIVE Trading (Jupiter): deeplink o autosign (locale)
-# - Tabella: Top10 toggle + Change 1h + Change 4h con fallback H6 (nested-aware)
+# - Tabella: Top 10 per Volume 24h + Change 1h + Change 4h con fallback H6 (nested-aware)
 # - Start / Stop: pausa globale (strategia, alert, live mirror)
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
@@ -453,6 +453,29 @@ def safe_sort(df, col, ascending=False):
     if df is None or df.empty or col not in df.columns: return df
     return df.sort_values(by=[col], ascending=ascending)
 
+# ---- Cast sicuri per evitare ValueError su NaN / stringhe
+def to_float0(x, default=0.0):
+    """Cast robusto a float con fallback su default. Gestisce None, stringhe e NaN."""
+    if x is None:
+        return default
+    try:
+        v = float(x)
+        if not math.isfinite(v):  # NaN / inf
+            return default
+        return v
+    except (TypeError, ValueError):
+        try:
+            s = str(x).replace(",", "").strip().replace("%", "")
+            v = float(s) if s else default
+            return v if math.isfinite(v) else default
+        except Exception:
+            return default
+
+def to_int0(x, default=0):
+    """Cast robusto a int con arrotondamento e gestione NaN."""
+    v = to_float0(x, float(default))
+    return int(round(v))
+
 # Meme Score helpers
 STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
 WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
@@ -486,7 +509,7 @@ def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     local_weights = tuple(weights or (w_symbol, w_age, w_txns, w_liq, w_dex))
     f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq(liq, liq_min_sweet, liq_max_sweet) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq( (liq or 0.0), liq_min_sweet, liq_max_sweet) +
          local_weights[4]*score_dex(dex))
     return round(100.0 * f / max(1e-6, sum(local_weights)))
 
@@ -627,7 +650,7 @@ with right:
         fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
         st.plotly_chart(fig2, use_container_width=True)
 
-# ---------------- Tabella pairs con Meme Score (nested-aware) ----------------
+# ---------------- Tabella pairs con Meme Score (nested-aware + cast sicuri) ----------------
 def _first_or_none(d, keys):
     # Cerca al livello piatto
     for k in keys:
@@ -711,10 +734,10 @@ def build_table(df):
             "Meme Score": mscore,
             "Pair": f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
             "DEX": r.get("dexId",""),
-            "Liquidity (USD)": int(round(r.get("liquidityUsd") or 0)),
-            "Txns 1h": int(r.get("txns1h") or 0),
-            "Volume 24h (USD)": int(round(r.get("volume24hUsd") or 0)),
-            "Price (USD)": r.get("priceUsd"),
+            "Liquidity (USD)": to_int0(r.get("liquidityUsd"), 0),
+            "Txns 1h": to_int0(r.get("txns1h"), 0),
+            "Volume 24h (USD)": to_int0(r.get("volume24hUsd"), 0),
+            "Price (USD)": (None if r.get("priceUsd") in (None, "") else to_float0(r.get("priceUsd"), None)),
             "Change 1h (%)": chg_1h,
             "Change 4h/6h (%)": chg_4h,
             "Change 24h (%)": chg_24h,
