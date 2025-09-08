@@ -1,17 +1,9 @@
-# streamlit_app.py — Meme Radar (Streamlit) v13.0
-# - Fix Start/Stop: stato mostrato dopo i bottoni + st.rerun() immediato
-# - Scanner Solana via MarketDataProvider (DexScreener)
-# - KPI, Meme Score, grafici, watchlist
-# - Filtro Volume 24h (MIN/MAX)
-# - DEX consentiti (multiselect)
-# - StrategyMomentumV2 + Diagnostica + Adaptive Relax
-# - Trading Paper: LONG/SHORT (short = paper), BE lock, trailing, pyramiding
-# - Partial TP multipli: 50% a 2R + (opzione) 3R runner o 3R+5R (25%/25%)
-# - Alert Telegram dalla tabella
-# - LIVE Trading (Jupiter): deeplink o autosign (locale) — ignora SHORT
-# - Tabella: Top 10 per Volume 24h + Change 1h + Change 4h con fallback H6 (nested-aware)
-# - Auto-refresh condizionato a "Running"
-# - Compatibile con Streamlit >= 1.33 (usa st.query_params)
+# streamlit_app.py — Meme Radar (Streamlit) v15.0
+# - PAIRS filters (solo tabella) + OPZIONE per applicarli anche alla strategia (per-filtro)
+# - Top 10 per Volume usa la tabella filtrata
+# - Start/Stop, Auto-refresh condizionale, H4→H6 fallback, Telegram alerts, Live Jupiter (ignora short)
+# - Partial TP multipli (richiede trading.py con partial_scales)
+# - Compatibile con Streamlit >= 1.33: usa st.query_params
 
 import os, time, math, random, datetime, json, threading, base64
 import pandas as pd
@@ -20,7 +12,7 @@ import requests
 import streamlit as st
 
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine  # Engine con partial multipli
+from trading import RiskConfig, StratConfig, TradeEngine
 
 # =========================== Jupiter LIVE Connector (inline) ===========================
 JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
@@ -194,10 +186,9 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Stato esecuzione: inizializza chiave (non stampare ancora lo stato)
+# Stato esecuzione
 if "app_running" not in st.session_state:
     st.session_state["app_running"] = True
-
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
 
@@ -205,7 +196,7 @@ if "last_refresh_ts" not in st.session_state:
 with st.sidebar:
     st.header("Impostazioni")
 
-    # --- Controllo esecuzione (Start / Stop) ---
+    # --- Start/Stop ---
     st.subheader("Esecuzione")
     col_run1, col_run2 = st.columns(2)
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
@@ -238,7 +229,7 @@ with st.sidebar:
     watchlist_only = st.toggle("Mostra solo watchlist", value=False, key="watchlist_only")
 
     st.divider()
-    st.subheader("Filtro Volume 24h (USD)")
+    st.subheader("Filtro Volume 24h (USD) — strategia")
     vol24_min = st.number_input("Volume 24h MIN", min_value=0, value=st.session_state.get("vol24_min", 0), step=10000, key="vol24_min")
     vol24_max = st.number_input("Volume 24h MAX (0 = illimitato)", min_value=0, value=st.session_state.get("vol24_max", 0), step=100000, key="vol24_max")
 
@@ -265,9 +256,76 @@ with st.sidebar:
     # --- Tabella ---
     st.divider()
     st.subheader("Tabella")
-    show_pair_age = st.toggle("Mostra colonna 'Pair Age' (min/ore)", value=True)
+    show_pair_age = st.toggle("Mostra 'Pair Age' (min/ore)", value=True)
     show_top10_table = st.toggle("Tabella: mostra solo Top 10 per Volume 24h", value=True)
     show_h6_fallback = st.toggle("Fallback: mostra Change H6 se H4 mancante", value=True)
+
+    # --- Filtri PAIRS (tabella) ---
+    st.subheader("Filtri PAIRS (tabella)")
+    pairs_meme_min = st.slider(
+        "Meme Score min (PAIRS)", 0, 100, 0,
+        help="Applica un minimo di Meme Score alla tabella, senza influenzare la strategia (a meno che tu non scelga di farlo)."
+    )
+    # Range slider Pair Age
+    pairs_age_min_h, pairs_age_max_h = st.slider(
+        "Pair Age (ore) — range",
+        min_value=0.0, max_value=10000.0, value=(0.0, 10000.0), step=0.5,
+        help="Filtra per età della pair (in ore) solo nella tabella. Puoi opzionalmente applicarlo anche alla strategia."
+    )
+    # Liquidity log-range
+    st.markdown("**Liquidity (USD) — range (log)**")
+    pairs_liq_enable = st.toggle(
+        "Abilita filtro Liquidity (tabella, log scale)",
+        value=False,
+        help="Filtra SOLO la tabella PAIRS in scala log. Puoi opzionalmente applicarlo anche alla strategia."
+    )
+    pairs_liq_exp_min, pairs_liq_exp_max = st.slider(
+        "10^x (min, max) [Liquidity]",
+        min_value=0.0, max_value=12.0, value=(0.0, 12.0), step=0.25,
+        disabled=not pairs_liq_enable
+    )
+    pairs_liq_min = 10 ** pairs_liq_exp_min
+    pairs_liq_max = 10 ** pairs_liq_exp_max
+    if pairs_liq_enable:
+        st.caption(f"Range Liquidity tabella: ${int(pairs_liq_min):,} → ${int(pairs_liq_max):,}".replace(",", "."))
+    else:
+        st.caption("Filtro liquidity disattivato (tabella mostra tutte le liquidità).")
+
+    # Volume log-range
+    st.markdown("**Volume 24h (USD) — range (log)**")
+    pairs_vol_enable = st.toggle(
+        "Abilita filtro Volume 24h (tabella, log scale)",
+        value=False,
+        help="Filtra SOLO la tabella PAIRS in scala log. Puoi opzionalmente applicarlo anche alla strategia."
+    )
+    pairs_vol_exp_min, pairs_vol_exp_max = st.slider(
+        "10^x (min, max) [Volume 24h]",
+        min_value=0.0, max_value=12.0, value=(0.0, 12.0), step=0.25,
+        disabled=not pairs_vol_enable
+    )
+    pairs_vol_min = 10 ** pairs_vol_exp_min
+    pairs_vol_max = 10 ** pairs_vol_exp_max
+    if pairs_vol_enable:
+        st.caption(f"Range Volume 24h tabella: ${int(pairs_vol_min):,} → ${int(pairs_vol_max):,}".replace(",", "."))
+    else:
+        st.caption("Filtro volume disattivato (tabella mostra tutti i volumi).")
+
+    # ---- NOVITÀ: Applicazione facoltativa dei filtri PAIRS alla strategia ----
+    st.divider()
+    st.subheader("Applicazione filtri PAIRS → Strategia")
+    pairs_filters_to_strategy = st.toggle(
+        "Applica i filtri PAIRS anche alla strategia",
+        value=False,
+        help="Se attivo, puoi selezionare quali filtri PAIRS impattano anche l'universo della strategia."
+    )
+    col_apply1, col_apply2 = st.columns(2)
+    with col_apply1:
+        apply_meme_to_strat = st.checkbox("Meme Score min → strategia", value=True, disabled=not pairs_filters_to_strategy)
+        apply_age_to_strat  = st.checkbox("Pair Age range → strategia", value=True, disabled=not pairs_filters_to_strategy)
+    with col_apply2:
+        apply_liq_to_strat  = st.checkbox("Liquidity (log) → strategia", value=False, disabled=not pairs_filters_to_strategy)
+        apply_vol_to_strat  = st.checkbox("Volume 24h (log) → strategia", value=False, disabled=not pairs_filters_to_strategy)
+    st.caption("Suggerimento: lascia OFF il volume log sulla strategia se stai già usando il filtro Volume 24h (MIN/MAX) in alto.")
 
     st.divider()
     st.subheader("Alert Telegram (tabella)")
@@ -315,7 +373,7 @@ with st.sidebar:
         trail_pct= st.slider("Trailing %", 5, 60, st.session_state.get("trail_pct", 15), key="trail_pct")
         day_loss = st.number_input("Daily loss limit (USD)", min_value=50.0, value=st.session_state.get("day_loss", 200.0), step=50.0, key="day_loss")
 
-    # Direzione strategia + R-multipli
+    # Direzione + multipli
     direction = st.selectbox(
         "Direzione",
         ["Long only", "Short only (paper)", "Long & Short (paper)"],
@@ -327,7 +385,7 @@ with st.sidebar:
 
     st.markdown("**Partial Take Profit (2R)**")
     ptp_enable = st.toggle("Chiudi 50% a 2R e lascia correre", value=True,
-                           help="A 2×R (calcolato da Stop Loss %) chiude la frazione e alza lo stop a BE+lock.")
+                           help="A 2×R chiude la frazione e alza lo stop a BE+lock.")
     ptp_frac = st.slider("Frazione a 2R", 0.1, 0.9, 0.5, 0.05)
 
     st.markdown("**Scale extra**")
@@ -394,7 +452,7 @@ with st.sidebar:
 running = bool(st.session_state.get("app_running", True))
 st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
 
-# 🔁 Auto-refresh (condizionato a Running)
+# 🔁 Auto-refresh
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -569,7 +627,7 @@ df_provider, ts = provider.get_snapshot()
 codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
-# Watchlist & Volume filter pipeline
+# Watchlist & Volume (strategia base) pipeline
 df_view = df_provider.copy()
 pre_count = len(df_view)
 
@@ -589,13 +647,12 @@ def is_watch_hit_row(r):
     addr = r.get("pairAddress","") if hasattr(r,"get") else r["pairAddress"]
     return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
 
-# Applica watchlist_only
 if st.session_state.get("watchlist_only", False) and not df_view.empty:
     mask = df_view.apply(is_watch_hit_row, axis=1)
     df_view = df_view[mask].reset_index(drop=True)
 post_watch_count = len(df_view)
 
-# Applica filtro Volume 24h
+# Filtro Volume 24h (strategia, MIN/MAX)
 vmin = int(st.session_state.get("vol24_min", 0))
 vmax = int(st.session_state.get("vol24_max", 0))
 if not df_view.empty:
@@ -604,13 +661,13 @@ if not df_view.empty:
     df_view = df_view[mask_vol].reset_index(drop=True)
 post_vol_count = len(df_view)
 
-# ---------------- KPI base (calcolati prima del filtro volume per stabilità) ----------------
+# ---------------- KPI base ----------------
 if df_provider.empty:
     vol24_avg = None; tx1h_avg = None
 else:
-    top10 = df_provider.sort_values(by=["volume24hUsd"], ascending=False).head(10)
-    vol24_avg = safe_series_mean(top10["volume24hUsd"])
-    tx1h_avg  = safe_series_mean(top10["txns1h"])
+    top10_raw = df_provider.sort_values(by=["volume24hUsd"], ascending=False).head(10)
+    vol24_avg = safe_series_mean(top10_raw["volume24hUsd"])
+    tx1h_avg  = safe_series_mean(top10_raw["txns1h"])
 if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
@@ -641,8 +698,7 @@ if bird_ok and bird_tokens:
     new_liq_values = [liquidity_from_birdeye_token(t) for t in bird_tokens[:20]]
     new_liq_values = [v for v in new_liq_values if v is not None]
 else:
-    recents = safe_sort(df_provider, "pairCreatedAt", ascending=False)
-    recents = recents.head(20) if recents is not None and not recents.empty else pd.DataFrame(columns=["liquidityUsd","baseSymbol"])
+    recents = df_provider.sort_values(by=["pairCreatedAt"], ascending=False).head(20) if (df_provider is not None and not df_provider.empty and "pairCreatedAt" in df_provider.columns) else pd.DataFrame(columns=["liquidityUsd"])
     liq_series = recents.get("liquidityUsd", pd.Series(dtype=float))
     new_liq_values = [float(x) for x in liq_series.tolist() if pd.notna(x)]
 new_liq_avg = (sum(new_liq_values)/len(new_liq_values)) if new_liq_values else None
@@ -663,27 +719,7 @@ with c2: st.metric("Volume 24h medio Top 10", fmt_int(vol24_avg))
 with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
-# ---------------- Charts (post volume filter) ----------------
-left, right = st.columns(2)
-with left:
-    if not df_view.empty:
-        df_top = df_view.sort_values(by=["volume24hUsd"], ascending=False).head(10)
-        df_chart = pd.DataFrame({"Token": df_top["baseSymbol"], "Volume 24h": df_top["volume24hUsd"].fillna(0)})
-        fig = px.bar(df_chart, x="Token", y="Volume 24h", title="Top 10 Volume 24h (post-filtri)")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Nessuna coppia disponibile con i filtri attuali.")
-with right:
-    if bird_ok and bird_tokens:
-        names, liqs = [], []
-        for t in bird_tokens[:20]:
-            names.append(t.get("name") or t.get("symbol") or (t.get("mint") or "")[:6])
-            liqs.append(liquidity_from_birdeye_token(t) or 0)
-        df_liq = pd.DataFrame({"Token": names, "Liquidity": liqs})
-        fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
-        st.plotly_chart(fig2, use_container_width=True)
-
-# ---------------- Tabella pairs con Meme Score (nested-aware + cast sicuri) ----------------
+# ---------------- Tabella pairs & Meme Score ----------------
 def _first_or_none(d, keys):
     for k in keys:
         try:
@@ -770,6 +806,7 @@ def build_table(df):
             "Change 24h (%)": chg_24h,
             "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
             "Pair Age": fmt_age(ageh),
+            "PairAgeHours": (float(ageh) if ageh is not None else None),  # per filtri tabella/strategia opzionali
             "Link": r.get("url",""),
             "Base Address": r.get("baseAddress",""),
             "baseSymbol": r.get("baseSymbol",""),
@@ -782,10 +819,79 @@ def build_table(df):
 
 df_pairs = build_table(df_view)
 
+# === Filtri SOLO tabella (non influiscono sulla strategia a meno che scelto) ===
+df_pairs_table = df_pairs.copy()
+
+# Meme Score min (tabella)
+if not df_pairs_table.empty and pairs_meme_min > 0:
+    df_pairs_table = df_pairs_table[
+        pd.to_numeric(df_pairs_table["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)
+    ]
+
+# PairAgeHours range (ore)
+if not df_pairs_table.empty and "PairAgeHours" in df_pairs_table.columns:
+    age_series_tbl = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce")
+    lo, hi = float(pairs_age_min_h), float(pairs_age_max_h)
+    df_pairs_table = df_pairs_table[age_series_tbl.between(lo, hi, inclusive="both")]
+
+# Liquidity (USD) — log filter tabella
+if pairs_liq_enable and not df_pairs_table.empty and "Liquidity (USD)" in df_pairs_table.columns:
+    liq_series_tbl = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
+    df_pairs_table = df_pairs_table[(liq_series_tbl >= pairs_liq_min) & (liq_series_tbl <= pairs_liq_max)]
+
+# Volume 24h — log filter tabella
+if pairs_vol_enable and not df_pairs_table.empty and "Volume 24h (USD)" in df_pairs_table.columns:
+    vol_series_tbl = pd.to_numeric(df_pairs_table["Volume 24h (USD)"], errors="coerce").fillna(0)
+    df_pairs_table = df_pairs_table[(vol_series_tbl >= pairs_vol_min) & (vol_series_tbl <= pairs_vol_max)]
+
+# === Filtri opzionali anche sulla strategia ===
+df_pairs_strategy = df_pairs.copy()
+if pairs_filters_to_strategy and not df_pairs_strategy.empty:
+    # Meme Score → strategia
+    if apply_meme_to_strat and pairs_meme_min > 0:
+        df_pairs_strategy = df_pairs_strategy[
+            pd.to_numeric(df_pairs_strategy["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)
+        ]
+    # Pair Age → strategia
+    if apply_age_to_strat and "PairAgeHours" in df_pairs_strategy.columns:
+        age_series_str = pd.to_numeric(df_pairs_strategy["PairAgeHours"], errors="coerce")
+        df_pairs_strategy = df_pairs_strategy[age_series_str.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
+    # Liquidity (log) → strategia
+    if apply_liq_to_strat and pairs_liq_enable and "Liquidity (USD)" in df_pairs_strategy.columns:
+        liq_series_str = pd.to_numeric(df_pairs_strategy["Liquidity (USD)"], errors="coerce").fillna(0)
+        df_pairs_strategy = df_pairs_strategy[(liq_series_str >= pairs_liq_min) & (liq_series_str <= pairs_liq_max)]
+    # Volume 24h (log) → strategia
+    if apply_vol_to_strat and pairs_vol_enable and "Volume 24h (USD)" in df_pairs_strategy.columns:
+        vol_series_str = pd.to_numeric(df_pairs_strategy["Volume 24h (USD)"], errors="coerce").fillna(0)
+        df_pairs_strategy = df_pairs_strategy[(vol_series_str >= pairs_vol_min) & (vol_series_str <= pairs_vol_max)]
+
+# ---------------- Charts (usano la tabella filtrata) ----------------
+left, right = st.columns(2)
+with left:
+    if not df_pairs_table.empty:
+        df_top = df_pairs_table.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10)
+        df_chart = pd.DataFrame({"Token": df_top["Pair"], "Volume 24h": df_top["Volume 24h (USD)"].fillna(0)})
+        fig = px.bar(df_chart, x="Token", y="Volume 24h", title="Top 10 Volume 24h (tabella filtrata)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Nessuna coppia disponibile con i filtri tabella attuali.")
+with right:
+    if bird_ok and bird_tokens:
+        names, liqs = [], []
+        for t in bird_tokens[:20]:
+            names.append(t.get("name") or t.get("symbol") or (t.get("mint") or "")[:6])
+            liqs.append(liquidity_from_birdeye_token(t) or 0)
+        df_liq = pd.DataFrame({"Token": names, "Liquidity": liqs})
+        fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+# ---------------- Tabella PAIRS ----------------
 st.markdown("### Pairs (post-filtri)")
-if not df_pairs.empty:
-    df_pairs_for_view = df_pairs.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else df_pairs
-    display_cols = [c for c in df_pairs_for_view.columns if c not in ("baseSymbol","quoteSymbol")]
+if not df_pairs_table.empty:
+    base_for_view = df_pairs_table
+    df_pairs_for_view = base_for_view.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else base_for_view
+
+    display_cols = [c for c in df_pairs_for_view.columns if c not in ("baseSymbol","quoteSymbol","PairAgeHours")]
     if not show_pair_age and "Pair Age" in display_cols:
         display_cols.remove("Pair Age")
 
@@ -809,7 +915,7 @@ if not df_pairs.empty:
         st.caption(f"Diagnostica Change: 1h valorizzati {n1}/{len(df_pairs_for_view)} • 4h/6h valorizzati {n4}/{len(df_pairs_for_view)}")
     except Exception:
         pass
-    cap = "Top 10 per Volume 24h." if show_top10_table else "Tutte le coppie post-filtri."
+    cap = "Top 10 per Volume 24h (tabella filtrata)." if show_top10_table else "Tutte le coppie (tabella filtrata)."
     cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
     st.caption(cap)
 else:
@@ -817,29 +923,35 @@ else:
 
 # ---------------- Diagnostica Strategia ----------------
 def market_heat_value(df: pd.DataFrame, topN: int) -> float:
-    if df is None or df.empty: 
+    if df is None or df.empty:
+        return 0.0
+    if "Volume 24h (USD)" not in df.columns or "Txns 1h" not in df.columns:
         return 0.0
     top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(topN)))
     return float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
 
 st.markdown("### Diagnostica strategia")
-if df_pairs is None or df_pairs.empty:
-    st.caption("Nessuna coppia post-filtri provider/watchlist/volume.")
+df_pairs_used = df_pairs_strategy if (pairs_filters_to_strategy) else df_pairs
+if df_pairs_used is None or df_pairs_used.empty:
+    if pairs_filters_to_strategy:
+        st.warning("Universo strategia vuoto dopo l'applicazione dei filtri PAIRS alla strategia. Allarga i range o disattiva l'opzione.")
+    else:
+        st.caption("Nessuna coppia post-filtri provider/watchlist/volume.")
 else:
-    heat_val = market_heat_value(df_pairs, int(st.session_state.get("heat_topN", 10)))
+    heat_val = market_heat_value(df_pairs_used, int(st.session_state.get("heat_topN", 10)))
     heat_thr = float(st.session_state.get("strat_heat_avg", 120))
     st.caption(f"Market heat (media **Txns1h** top {int(st.session_state.get('heat_topN', 10))} per **Volume 24h**): "
                f"**{int(heat_val)}** vs soglia **{int(heat_thr)}** → "
                f"{'OK ✅' if heat_val >= heat_thr else 'BLOCCO ⛔️'}")
 
-    s = df_pairs.copy()
+    s = df_pairs_used.copy()
     total = len(s)
     try:
         chg_series = pd.to_numeric(s["Change 24h (%)"], errors="coerce").fillna(0)
     except Exception:
         chg_series = pd.Series([0]*len(s))
 
-    def cnt(mask): 
+    def cnt(mask):
         try: return int(mask.sum())
         except Exception: return 0
 
@@ -867,7 +979,7 @@ else:
 
 # === Adaptive Relax ============================================================
 def _count_candidates(df: pd.DataFrame, cfg) -> int:
-    if df is None or df.empty: 
+    if df is None or df.empty:
         return 0
     def _reasons(row):
         reasons = []
@@ -971,10 +1083,13 @@ s_cfg = StratConfig(
     heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
 )
 
+# Applica relax sul dataset che userà la strategia (df_pairs_used)
+df_pairs_used = df_pairs_strategy if (pairs_filters_to_strategy) else df_pairs
 active_s_cfg = s_cfg
-if df_pairs is not None and not df_pairs.empty:
-    active_s_cfg = relax_strategy_if_empty(df_pairs, s_cfg)
+if df_pairs_used is not None and not df_pairs_used.empty:
+    active_s_cfg = relax_strategy_if_empty(df_pairs_used, s_cfg)
 
+# Init/aggiorna engine
 if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
     st.session_state["trade_engine"] = TradeEngine(r_cfg, active_s_cfg, bm_check=None, sent_check=None)
 else:
@@ -986,13 +1101,16 @@ else:
 
 eng = st.session_state["trade_engine"]
 
-# In pausa: non eseguire step
-if df_pairs is None or df_pairs.empty:
-    st.info("Nessun dato per la strategia al momento.")
+# Esecuzione step strategia
+if df_pairs_used is None or df_pairs_used.empty:
+    if pairs_filters_to_strategy:
+        st.info("Strategia in attesa: i filtri PAIRS (applicati alla strategia) non hanno prodotto candidati.")
+    else:
+        st.info("Nessun dato per la strategia al momento.")
     df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
 else:
     if running:
-        df_signals, df_open, df_closed = eng.step(df_pairs)
+        df_signals, df_open, df_closed = eng.step(df_pairs_used)
     else:
         df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
         st.info("Strategia in pausa — premi ▶️ Start per riattivare.")
@@ -1004,7 +1122,7 @@ else: st.caption("Nessun segnale valido con i parametri attuali.")
 st.markdown("**Posizioni aperte (Paper)**")
 if not df_open.empty:
     cols = st.columns([3,2,2,2,2,2,2])
-    cols[0].write("Pair"); cols[1].write("Entry"); cols[2].write("Last"); cols[3].write("PnL $ (aperto)"); cols[4].write("PnL % (aperto)"); cols[5].write("Aperta da"); cols[6].write("Azioni")
+    cols[0].write("Pair"); cols[1].write("Entry"); cols[2].write("Last"); cols[3].write("PnL $"); cols[4].write("PnL %"); cols[5].write("Aperta da"); cols[6].write("Azioni")
     for _, r in df_open.iterrows():
         c = st.columns([3,2,2,2,2,2,2])
         c[0].write(f"{r['symbol']} ({r['label']})")
@@ -1041,7 +1159,7 @@ if not df_closed.empty:
 else:
     st.caption("Nessuna chiusura → curva PnL in attesa.")
 
-# ---------------- ALERT TELEGRAM ----------------
+# ---------------- ALERT TELEGRAM (dalla tabella) ----------------
 def tg_send(text: str) -> tuple[bool, str | None]:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
     try:
@@ -1054,9 +1172,9 @@ def tg_send(text: str) -> tuple[bool, str | None]:
 if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
 
 tg_sent_now = 0
-if running and enable_alerts and (df_pairs is not None) and not df_pairs.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+if running and enable_alerts and (df_pairs_table is not None) and not df_pairs_table.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
     try:
-        df_alert = df_pairs.copy()
+        df_alert = df_pairs_table.copy()
         mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
         if int(alert_meme_min) > 0: mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
         df_alert = df_alert[mask]
@@ -1159,10 +1277,9 @@ else:
     closed_ids = prev_ids - curr_ids
     for tid in list(closed_ids):
         info = st.session_state["live_positions"].get(tid)
-        if not info: 
+        if not info:
             continue
         try:
-            # se era short, non c'era operazione live da replicare
             if info.get("skip") == "short":
                 live_log.append("SELL (skip short live)")
             else:
@@ -1197,6 +1314,10 @@ with d4: st.text(f"Righe dopo filtro volume: {post_vol_count}")
 with d5:
     src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
     st.text(f"Nuove coin source: {src}")
-st.caption(f"Stato esecuzione: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f}")
+st.caption(
+    f"Stato esecuzione: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • "
+    f"TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f} • "
+    f"Filtri PAIRS→Strategia: {'ON' if pairs_filters_to_strategy else 'OFF'}"
+)
 
 st.session_state["last_refresh_ts"] = time.time()
