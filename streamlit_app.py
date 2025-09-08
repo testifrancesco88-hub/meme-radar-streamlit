@@ -1,4 +1,5 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12.4
+# streamlit_app.py — Meme Radar (Streamlit) v12.5
+# - Fix Start/Stop: stato mostrato dopo i bottoni + st.rerun() immediato
 # - Scanner Solana via MarketDataProvider (DexScreener)
 # - KPI, Meme Score, grafici, watchlist
 # - Filtro Volume 24h (MIN/MAX)
@@ -8,7 +9,7 @@
 # - Alert Telegram dalla tabella
 # - LIVE Trading (Jupiter): deeplink o autosign (locale)
 # - Tabella: Top 10 per Volume 24h + Change 1h + Change 4h con fallback H6 (nested-aware)
-# - Start / Stop: pausa globale (strategia, alert, live mirror)
+# - Auto-refresh condizionato a "Running"
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
 
 import os, time, math, random, datetime, json, threading, base64
@@ -173,6 +174,9 @@ class JupiterConnector:
             return ("error", f"Invio fallito: {e}")
 
 # =============================== App Config/UI =================================
+st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
+st.title("Solana Meme Coin Radar")
+
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
 PROXY_TICKET  = float(os.getenv("PROXY_TICKET_USD", "150"))
 BIRDEYE_URL   = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
@@ -189,14 +193,9 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
-st.title("Solana Meme Coin Radar")
-
-# Stato esecuzione
+# Stato esecuzione: inizializziamo solo la chiave (non stampiamo ancora lo stato)
 if "app_running" not in st.session_state:
     st.session_state["app_running"] = True  # default ON
-running = bool(st.session_state.get("app_running", True))
-st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
 
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
@@ -211,11 +210,12 @@ with st.sidebar:
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
         st.session_state["app_running"] = True
         st.toast("Esecuzione avviata", icon="✅")
+        st.rerun()  # aggiorna subito lo stato in pagina
     if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
         st.session_state["app_running"] = False
         st.session_state["live_positions"] = {}  # prudente
         st.toast("Esecuzione in pausa", icon="⏸️")
-    running = bool(st.session_state["app_running"])
+        st.rerun()  # aggiorna subito lo stato in pagina
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh", value=True)
@@ -362,6 +362,10 @@ with st.sidebar:
     pub_key   = st.text_input("WALLET Public Key (solo autosign)", value=os.getenv("WALLET_PUB",""))
     priv_b58  = st.text_input("WALLET Private Key (base58) • NON su cloud", value=os.getenv("WALLET_PRIV",""), type="password")
 
+# ---------- Stato: mostra DOPO i bottoni ----------
+running = bool(st.session_state.get("app_running", True))
+st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
+
 # 🔁 Auto-refresh (condizionato a Running)
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -374,6 +378,8 @@ def _tick_query_param():
     except Exception:
         pass
 
+if "last_refresh_ts" not in st.session_state:
+    st.session_state["last_refresh_ts"] = time.time()
 _prev_ts = float(st.session_state.get("last_refresh_ts", time.time()))
 _next_ts = _prev_ts + max(1, REFRESH_SEC)
 secs_left = max(0, int(round(_next_ts - time.time())))
@@ -583,6 +589,7 @@ if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
 # ---------------- Nuove coin — Birdeye + Fallback ----------------
+BIRDEYE_URL = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
 be_headers = {"accept": "application/json"}
 be_key = os.getenv("BE_API_KEY","")
 if be_key: be_headers["x-api-key"] = be_key
@@ -599,7 +606,7 @@ def liquidity_from_birdeye_token(t):
         try:
             v = t.get(k)
             if v is None: continue
-            x = float(v); 
+            x = float(v)
             if not math.isnan(x): return x
         except Exception:
             pass
@@ -652,7 +659,6 @@ with right:
 
 # ---------------- Tabella pairs con Meme Score (nested-aware + cast sicuri) ----------------
 def _first_or_none(d, keys):
-    # Cerca al livello piatto
     for k in keys:
         try:
             v = d.get(k) if hasattr(d, "get") else d[k]
@@ -663,7 +669,6 @@ def _first_or_none(d, keys):
     return None
 
 def _to_float_pct(x):
-    # '12.34' o '12.34%' -> 12.34; altrimenti None
     if x is None:
         return None
     try:
@@ -673,7 +678,6 @@ def _to_float_pct(x):
         return None
 
 def _get_change_pct_from_nested(r, nested_key, candidates):
-    # Cerca dentro un oggetto annidato (es. r['priceChange'])
     try:
         obj = r.get(nested_key) if hasattr(r, "get") else r[nested_key]
     except Exception:
@@ -687,7 +691,6 @@ def _get_change_pct_from_nested(r, nested_key, candidates):
     return None
 
 def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
-    # 1) flat; 2) nested priceChange[h1/h4/h6/…]
     v = _first_or_none(r, flat_keys)
     v = _to_float_pct(v)
     if v is not None:
@@ -700,7 +703,6 @@ def build_table(df):
         mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
 
-        # Change 1h: flat -> nested priceChange['h1'/'1h'/'m60'/...]
         chg_1h = _get_change_pct(
             r,
             flat_keys=["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"],
@@ -708,7 +710,6 @@ def build_table(df):
             nested_candidates=("h1","1h","m60","60m")
         )
 
-        # Change 4h con fallback a H6 se mancante
         chg_4h = _get_change_pct(
             r,
             flat_keys=["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"],
@@ -757,9 +758,7 @@ df_pairs = build_table(df_view)
 
 st.markdown("### Pairs (post-filtri)")
 if not df_pairs.empty:
-    # Vista "Top 10 per Volume 24h" SOLO per la resa tabellare se richiesto
     df_pairs_for_view = df_pairs.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else df_pairs
-
     display_cols = [c for c in df_pairs_for_view.columns if c not in ("baseSymbol","quoteSymbol")]
     if not show_pair_age and "Pair Age" in display_cols:
         display_cols.remove("Pair Age")
@@ -782,7 +781,6 @@ if not df_pairs.empty:
     cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
     st.caption(cap)
 
-    # Diagnostica popolamento Change
     try:
         n1 = pd.to_numeric(df_pairs_for_view["Change 1h (%)"], errors="coerce").notna().sum()
         n4 = pd.to_numeric(df_pairs_for_view["Change 4h/6h (%)"], errors="coerce").notna().sum()
