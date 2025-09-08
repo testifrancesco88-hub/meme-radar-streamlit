@@ -1,455 +1,482 @@
-# trading.py — Strategy V2 con SHORT + TP a R-multiple + Multi-Partial (2R/3R/5R)
-# - RiskConfig:
-#     direction ('long'|'short'|'both'), use_r_multiple, tp_r_multiple
-#     partial_tp_enable, partial_tp_fraction (es. 0.5 a 2R)
-#     partial_scales: lista di (multiple, fraction) es. [(3.0, 0.25), (5.0, 0.25)]
-# - TradeEngine:
-#     • Segnali long/short (short = solo paper)
-#     • Partial TP multipli: quando raggiunge il target, realizza la frazione, riduce size e imposta stop a BE+lock
-#     • Trailing, BE lock, time-stop
-#     • Registra chiusure parziali (note: "partial 25% @ 3.0R")
-
+# trading.py — Engine semplice, robusto e compatibile con streamlit_app.py v15+
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, List, Dict, Any
-import time, math
-import pandas as pd
 
-# ========================= Config =========================
+import time
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional
+import pandas as pd
+import math
+import uuid
+
+
+# ============================== Config dataclasses ==============================
 
 @dataclass
 class RiskConfig:
+    # dimensionamento & limiti
     position_usd: float = 50.0
     max_positions: int = 3
-    stop_loss_pct: float = 0.20            # 20% -> 0.20
-    take_profit_pct: float = 0.40          # legacy se use_r_multiple=False
-    trailing_pct: float = 0.15
-    daily_loss_limit_usd: float = 200.0
     max_positions_per_symbol: int = 1
+    daily_loss_limit_usd: float = 200.0
+
+    # gestione rischio/uscite
+    stop_loss_pct: float = 0.20          # 20%
+    take_profit_pct: float = 0.40        # 40% (se non usi R-multiple)
+    trailing_pct: float = 0.15           # 15%
+    time_stop_min: int = 60
+
+    # break-even lock
+    be_trigger_pct: float = 0.10         # +10% attiva lock
+    be_lock_profit_pct: float = 0.02     # lock a +2%
+    dd_lock_pct: float = 0.06            # se ritraccia più di 6% da HWM → chiudi
+
+    # anti-duplicato
     symbol_cooldown_min: int = 20
     allow_pyramiding: bool = False
     pyramid_add_on_trigger_pct: float = 0.08
-    time_stop_min: int = 60
-    be_trigger_pct: float = 0.10           # legacy trigger BE (non centrale qui)
-    be_lock_profit_pct: float = 0.02       # lock minimo su BE (dopo partial)
-    dd_lock_pct: float = 0.06              # (non usato esplicitamente qui)
 
-    # Direzione e R-multipli
-    direction: str = "long"                # 'long' | 'short' | 'both'
+    # direzione e TP a multipli di R
+    direction: str = "long"              # "long" | "short" | "both" (short solo paper)
     use_r_multiple: bool = True
-    tp_r_multiple: float = 2.0             # prima scala (es. 2R)
-    partial_tp_enable: bool = True
-    partial_tp_fraction: float = 0.5       # frazione alla prima scala (es. 50%)
+    tp_r_multiple: float = 2.0
 
-    # Scalini addizionali: [(3.0, 0.25), (5.0, 0.25)]
+    # partial take profit
+    partial_tp_enable: bool = True
+    partial_tp_fraction: float = 0.5
+    # scalini extra: [(3.0, 0.25), (5.0, 0.25)] = chiudi 25% a 3R e 25% a 5R
     partial_scales: List[Tuple[float, float]] = field(default_factory=list)
+
 
 @dataclass
 class StratConfig:
     meme_score_min: int = 70
-    txns1h_min: int = 250
+    txns1h_min: int = 200
     liq_min: float = 10_000.0
     liq_max: float = 200_000.0
     turnover_min: float = 1.2
     chg24_min: float = -8.0
     chg24_max: float = 180.0
-    allow_dex: tuple[str, ...] = ("raydium","orca","meteora","lifinity")
+    allow_dex: Tuple[str, ...] = ("raydium", "orca", "meteora", "lifinity")
+
+    # market heat gate
     heat_tx1h_topN: int = 10
     heat_tx1h_avg_min: float = 120.0
 
-# ========================= Utils =========================
 
-def _now() -> float: return time.time()
+# ================================ State models =================================
 
-def _fmt_ago(ts: float) -> str:
-    d = max(0, _now() - ts)
-    m = int(d // 60); s = int(d % 60)
-    if m >= 60:
-        h = m // 60; m = m % 60
-        return f"{h}h {m}m"
-    return f"{m}m {s}s"
+@dataclass
+class _RiskState:
+    daily_pnl: float = 0.0
+    last_action_ts: Dict[str, float] = field(default_factory=dict)   # per symbol cooldown
 
-def _to_float(x, default=None):
-    if x is None: return default
-    try:
-        v = float(x)
-        if not math.isfinite(v): return default
-        return v
-    except Exception:
-        try:
-            s = str(x).replace(",", "").replace("%","").strip()
-            v = float(s) if s else default
-            return v if (v is not None and math.isfinite(v)) else default
-        except Exception:
-            return default
 
-def _row_price(row: pd.Series) -> Optional[float]:
-    return _to_float(row.get("Price (USD)"), None)
+@dataclass
+class _Position:
+    id: str
+    symbol: str           # "BASE/QUOTE"
+    direction: str        # "long" | "short"
+    entry: float
+    qty: float            # quantità base (semplice proxy paper)
+    opened_ts: float
+    last: float
+    hwm: float            # high-water-mark sul prezzo (per trailing/lock)
+    label: str            # es. "raydium | LONG"
+    partial_done_2r: bool = False
+    closed: bool = False
+    pnl_usd: float = 0.0
+    pnl_pct: float = 0.0
+    # per scalini extra: set di multipli già eseguiti
+    scales_hit: set = field(default_factory=set)
 
-# ========================= Engine =========================
+
+# ================================ TradeEngine ==================================
 
 class TradeEngine:
-
-    class _RiskState:
-        def __init__(self):
-            self.daily_pnl: float = 0.0
-            self.symbol_last_open: Dict[str, float] = {}
-            self.per_symbol_open_count: Dict[str, int] = {}
-
-    def __init__(self, risk: RiskConfig, strategy: StratConfig, bm_check=None, sent_check=None):
-        self.risk = type("Risk", (), {})()
-        self.risk.cfg = risk
-        self.risk.state = TradeEngine._RiskState()
-
-        self.strategy = type("Strategy", (), {})()
-        self.strategy.cfg = strategy
-
-        self.bm_check = bm_check
+    def __init__(self, risk: RiskConfig, strategy: StratConfig,
+                 bm_check=None, sent_check=None):
+        self.risk = type("RiskWrap", (), {"cfg": risk, "state": _RiskState()})
+        self.strategy = type("StratWrap", (), {"cfg": strategy})
+        self.bm_check = bm_check      # hook opzionali (non usati in questa build)
         self.sent_check = sent_check
 
-        self._positions: Dict[str, Dict[str, Any]] = {}
-        self._closed: List[Dict[str, Any]] = []
-        self._last_id = 0
+        self.positions: Dict[str, _Position] = {}
+        self.closed_trades: List[Dict] = []
 
-    # ---------- API ----------
+    # ----------------------------- API pubblica -----------------------------
 
-    def close_by_id(self, pos_id: str, last_price: float | None = None):
-        pos = self._positions.pop(str(pos_id), None)
-        if not pos:
+    def step(self, df_pairs: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        - genera segnali dal df filtrato
+        - apre/gestisce/chiude posizioni paper
+        - ritorna (signals_df, open_df, closed_df)
+        """
+        now = time.time()
+
+        # 0) market heat gate
+        if not self._market_heat_ok(df_pairs):
+            # aggiorna mark-to-market delle posizioni e applica time-stop/lock
+            self._mtm_and_manage(df_pairs, now)
+            return self._signals_df([]), self._open_df(), self._closed_df()
+
+        # 1) genera candidati strategia
+        candidates = self._candidates(df_pairs)
+
+        # 2) apri posizioni se c'è capienza
+        to_open = self._select_to_open(candidates)
+        for row in to_open:
+            self._try_open(row, now)
+
+        # 3) mark-to-market & regole di uscita
+        self._mtm_and_manage(df_pairs, now)
+
+        return self._signals_df(candidates), self._open_df(), self._closed_df()
+
+    def close_by_id(self, pid: str, price: Optional[float] = None):
+        """Chiusura manuale da UI."""
+        pos = self.positions.get(str(pid))
+        if not pos or pos.closed:
             return
-        if last_price is not None:
-            pos["last"] = float(last_price)
-        pnl = self._compute_pnl_usd(pos, pos.get("last"))
-        pos["pnl_usd"] = pnl
-        pos["pnl_pct"] = self._compute_pnl_pct(pos, pos.get("last"))
-        pos["closed_at"] = _now()
-        self._closed.append({
-            "symbol": pos["symbol"],
-            "label": pos["label"],
-            "side": pos["side"],
-            "pnl_usd": pos["pnl_usd"],
-            "pnl_pct": pos["pnl_pct"],
-            "duration": _fmt_ago(pos["opened_at"]),
-            "note": "full close",
-        })
-        self.risk.state.daily_pnl += pnl
-        sym = pos["symbol"]
-        self.risk.state.per_symbol_open_count[sym] = max(0, self.risk.state.per_symbol_open_count.get(sym, 1) - 1)
+        px = float(price) if price and price > 0 else pos.last
+        self._close_position(pos, px, reason="manual")
 
-    def step(self, df_pairs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        self._update_positions(df_pairs.copy() if df_pairs is not None else pd.DataFrame())
+    # ---------------------------- Costruttori DF ----------------------------
 
-        if self.risk.state.daily_pnl <= -abs(self.risk.cfg.daily_loss_limit_usd):
-            return (pd.DataFrame(), self._df_open(), self._flush_closed())
+    def _signals_df(self, rows: List[dict]) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame()
+        cols = ["Pair", "DEX", "Price (USD)", "Meme Score", "Txns 1h",
+                "Liquidity (USD)", "Volume 24h (USD)", "Change 24h (%)", "label"]
+        out = []
+        for r in rows:
+            out.append({
+                "Pair": r.get("Pair"),
+                "DEX": r.get("DEX"),
+                "Price (USD)": _to_float(r.get("Price (USD)")),
+                "Meme Score": int(_to_float(r.get("Meme Score"), 0)),
+                "Txns 1h": int(_to_float(r.get("Txns 1h"), 0)),
+                "Liquidity (USD)": int(_to_float(r.get("Liquidity (USD)"), 0)),
+                "Volume 24h (USD)": int(_to_float(r.get("Volume 24h (USD)"), 0)),
+                "Change 24h (%)": _to_float(r.get("Change 24h (%)")),
+                "label": f"{str(r.get('DEX','')).lower()} | {self._dir_label()}",
+            })
+        return pd.DataFrame(out, columns=cols)
 
-        signals = self._generate_signals(df_pairs)
-        self._open_from_signals(signals)
+    def _open_df(self) -> pd.DataFrame:
+        if not self.positions:
+            return pd.DataFrame()
+        rows = []
+        for p in self.positions.values():
+            if p.closed:
+                continue
+            opened_ago = _fmt_ago(time.time() - p.opened_ts)
+            rows.append({
+                "id": p.id,
+                "symbol": p.symbol,
+                "label": p.label,
+                "entry": p.entry,
+                "last": p.last,
+                "pnl_usd": p.pnl_usd,
+                "pnl_pct": p.pnl_pct,
+                "opened_ago": opened_ago,
+            })
+        return pd.DataFrame(rows)
 
-        return (self._df_signals(signals), self._df_open(), self._flush_closed())
+    def _closed_df(self) -> pd.DataFrame:
+        if not self.closed_trades:
+            return pd.DataFrame()
+        return pd.DataFrame(self.closed_trades)
 
-    # ---------- Segnali ----------
+    # ------------------------------- Logica --------------------------------
 
-    def _generate_signals(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
-        s = self.strategy.cfg
-        rk = self.risk.cfg
+    def _market_heat_ok(self, df: pd.DataFrame) -> bool:
+        """Controlla la media Txns1h sui top-N per Volume 24h."""
+        c = self.strategy.cfg
+        if df is None or df.empty:
+            return False
+        if "Volume 24h (USD)" not in df.columns or "Txns 1h" not in df.columns:
+            return False
+        top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(c.heat_tx1h_topN)))
+        avg_tx = float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
+        return (avg_tx >= float(c.heat_tx1h_avg_min))
+
+    def _candidates(self, df: pd.DataFrame) -> List[dict]:
+        """Filtra il df secondo StratConfig e ritorna una lista di righe (dict)."""
+        c = self.strategy.cfg
         if df is None or df.empty:
             return []
 
-        d = df.copy()
-        try:
-            d = d[d["DEX"].str.lower().isin(s.allow_dex)]
-        except Exception:
-            pass
-        d = d[pd.to_numeric(d["Meme Score"], errors="coerce").fillna(0) >= s.meme_score_min]
-        d = d[pd.to_numeric(d["Txns 1h"], errors="coerce").fillna(0) >= s.txns1h_min]
+        s = df.copy()
 
-        liq = pd.to_numeric(d["Liquidity (USD)"], errors="coerce").fillna(0)
-        d = d[(liq >= s.liq_min) & (liq <= s.liq_max)]
+        def _num(series_name, default=0.0):
+            return pd.to_numeric(s[series_name], errors="coerce").fillna(default)
 
-        vol = pd.to_numeric(d["Volume 24h (USD)"], errors="coerce").fillna(0)
-        turnover = (vol / liq.replace(0, 1)).fillna(0)
-        d = d[turnover >= s.turnover_min]
+        # filtri
+        s = s[s["DEX"].str.lower().isin([d.lower() for d in c.allow_dex])]
+        s = s[_num("Meme Score") >= int(c.meme_score_min)]
+        s = s[_num("Txns 1h") >= int(c.txns1h_min)]
+        s = s[(_num("Liquidity (USD)") >= float(c.liq_min)) & (_num("Liquidity (USD)") <= float(c.liq_max))]
+        vol = _num("Volume 24h (USD)")
+        liq = _num("Liquidity (USD)").replace(0, 1)
+        s = s[(vol / liq) >= float(c.turnover_min)]
+        chg24 = _num("Change 24h (%)", 0.0)
+        s = s[(chg24 >= float(c.chg24_min)) & (chg24 <= float(c.chg24_max))]
 
-        chg24 = pd.to_numeric(d["Change 24h (%)"], errors="coerce")
-        d = d[(chg24 >= s.chg24_min) & (chg24 <= s.chg24_max)]
-
-        if rk.direction == "long":
-            d = d[pd.to_numeric(d["Change 1h (%)"], errors="coerce").fillna(0) >= 0]
-        elif rk.direction == "short":
-            c1 = pd.to_numeric(d["Change 1h (%)"], errors="coerce").fillna(0) <= -3.0
-            c4 = pd.to_numeric(d["Change 4h/6h (%)"], errors="coerce").fillna(0) <= 0.0
-            d = d[c1 & c4]
-        else:
-            pass  # both
-
-        if d.empty:
+        if s.empty:
             return []
 
-        d = d.sort_values(by=["Meme Score", "Txns 1h", "Liquidity (USD)"], ascending=[False, False, False])
+        # ranking semplice: Meme Score desc, poi Txns1h desc, poi Vol24 desc
+        s = s.sort_values(by=["Meme Score", "Txns 1h", "Volume 24h (USD)"], ascending=[False, False, False])
+        return s.to_dict(orient="records")
 
-        signals: List[Dict[str, Any]] = []
-        for _, r in d.iterrows():
-            price = _row_price(r)
-            if price is None or price <= 0:
-                continue
-            pair = r.get("Pair", "")
-            dex = r.get("DEX", "")
-            label = dex
-            ch1 = _to_float(r.get("Change 1h (%)"), None)
-            ch4 = _to_float(r.get("Change 4h/6h (%)"), None)
+    def _select_to_open(self, candidates: List[dict]) -> List[dict]:
+        """Sceglie quali candidati aprire rispettando capienza/duplicati/cooldown."""
+        if not candidates:
+            return []
+        cfg = self.risk.cfg
 
-            # side
-            side = "long"
-            if rk.direction == "short":
-                side = "short"
-            elif rk.direction == "both":
-                side = "short" if ((ch1 is not None and ch1 <= -3.0) and (ch4 is None or ch4 <= 0.0)) else "long"
+        # capienza globale
+        free_slots = max(0, int(cfg.max_positions) - sum(1 for p in self.positions.values() if not p.closed))
+        if free_slots <= 0:
+            return []
 
-            if not self._can_open_symbol(pair):
-                continue
+        # anti-duplicato e cooldown
+        chosen = []
+        per_symbol_count: Dict[str, int] = {}
+        now = time.time()
 
-            signals.append({
-                "symbol": pair,
-                "label": label,
-                "side": side,
-                "entry": float(price),
-                "mscore": int(_to_float(r.get("Meme Score"), 0) or 0),
-                "tx1h": int(_to_float(r.get("Txns 1h"), 0) or 0),
-                "liq": float(_to_float(r.get("Liquidity (USD)"), 0) or 0),
-                "vol24": float(_to_float(r.get("Volume 24h (USD)"), 0) or 0),
-                "url": r.get("Link", ""),
-            })
-            if len(signals) >= 20:
+        for r in candidates:
+            if len(chosen) >= free_slots:
                 break
-
-        return signals
-
-    def _can_open_symbol(self, symbol: str) -> bool:
-        if self.risk.state.per_symbol_open_count.get(symbol, 0) >= max(1, self.risk.cfg.max_positions_per_symbol):
-            return False
-        last_ts = self.risk.state.symbol_last_open.get(symbol, 0)
-        if (_now() - last_ts) < (self.risk.cfg.symbol_cooldown_min * 60):
-            return False
-        return True
-
-    # ---------- Apertura / Update ----------
-
-    def _open_from_signals(self, signals: List[Dict[str, Any]]):
-        if not signals:
-            return
-        space = max(0, self.risk.cfg.max_positions - len(self._positions))
-        if space <= 0:
-            return
-        for sig in signals:
-            if space <= 0:
-                break
-            if not self._can_open_symbol(sig["symbol"]):
+            pair = str(r.get("Pair", ""))
+            if not pair or "/" not in pair:
                 continue
-            self._open_position(sig)
-            space -= 1
+            base = pair.split("/", 1)[0]
 
-    def _open_position(self, sig: Dict[str, Any]):
-        self._last_id += 1
-        pos_id = str(self._last_id)
+            # limiti per simbolo
+            per_symbol_count.setdefault(base, 0)
+            active_same = sum(1 for p in self.positions.values()
+                              if (not p.closed) and p.symbol.startswith(base + "/"))
+            if active_same >= int(cfg.max_positions_per_symbol):
+                continue
 
-        side = sig["side"]
-        entry = float(sig["entry"])
-        size_usd = float(self.risk.cfg.position_usd)
-        qty_base = size_usd / max(1e-9, entry)
+            # cooldown
+            last_ts = self.risk.state.last_action_ts.get(base, 0.0)
+            if now - last_ts < cfg.symbol_cooldown_min * 60:
+                continue
 
-        sl_pct = float(self.risk.cfg.stop_loss_pct)
-        tp_pct = float(self.risk.cfg.take_profit_pct)
+            chosen.append(r)
+            per_symbol_count[base] += 1
 
-        # Stop simmetrico
-        if side == "long":
-            stop_price = entry * (1 - sl_pct)
-            tp_price_legacy = entry * (1 + tp_pct)
-        else:
-            stop_price = entry * (1 + sl_pct)
-            tp_price_legacy = entry * (1 - tp_pct)
+        return chosen
 
-        # Costruisci lista scalini (prima 2R, poi eventuali extra)
-        partials: List[Dict[str, Any]] = []
-        if self.risk.cfg.use_r_multiple and self.risk.cfg.partial_tp_enable:
-            base_mult = float(self.risk.cfg.tp_r_multiple)
-            base_frac = max(0.05, min(0.95, float(self.risk.cfg.partial_tp_fraction)))
-            price_base = entry * (1 + base_mult * sl_pct) if side == "long" else entry * (1 - base_mult * sl_pct)
-            partials.append({"multiple": base_mult, "price": price_base, "fraction": base_frac, "hit": False})
-            # extra scalini
-            for mult, frac in (self.risk.cfg.partial_scales or []):
-                m = float(mult); f = max(0.05, min(0.95, float(frac)))
-                price_m = entry * (1 + m * sl_pct) if side == "long" else entry * (1 - m * sl_pct)
-                partials.append({"multiple": m, "price": price_m, "fraction": f, "hit": False})
+    def _try_open(self, row: dict, now: float):
+        """Apre una posizione paper."""
+        cfg = self.risk.cfg
+        side = self._decide_side()  # "long" | "short"
+        price = _to_float(row.get("Price (USD)"), None)
+        if price is None or price <= 0:
+            return  # prezzo non valido
 
-            # ordina per multiple crescente per sicurezza
-            partials.sort(key=lambda x: x["multiple"])
-
-        pos = {
-            "id": pos_id,
-            "symbol": sig["symbol"],
-            "label": sig["label"],
-            "side": side,
-            "entry": entry,
-            "last": entry,
-            "size_usd": size_usd,
-            "qty": qty_base,
-            "opened_at": _now(),
-            "stop_price": stop_price,
-            "tp_price_legacy": tp_price_legacy if not (self.risk.cfg.use_r_multiple and self.risk.cfg.partial_tp_enable) else None,
-            "partials": partials,      # lista target R multipli
-            "best": entry,
-        }
-        self._positions[pos_id] = pos
-
-        self.risk.state.symbol_last_open[sig["symbol"]] = _now()
-        self.risk.state.per_symbol_open_count[sig["symbol"]] = self.risk.state.per_symbol_open_count.get(sig["symbol"], 0) + 1
-
-    def _update_positions(self, df: pd.DataFrame):
-        if not self._positions:
+        pair = str(row.get("Pair", ""))
+        if not pair:
             return
+        base, quote = pair.split("/", 1)
+        label = f"{str(row.get('DEX','')).lower()} | {side.upper()}"
 
-        by_pair = {}
-        try:
-            for _, r in df.iterrows():
-                by_pair[r.get("Pair","")] = _row_price(r)
-        except Exception:
-            pass
+        # sizing paper
+        qty = cfg.position_usd / max(1e-9, price)
 
-        to_close: List[Tuple[str, Dict[str, Any]]] = []
-        for pid, pos in list(self._positions.items()):
-            price = by_pair.get(pos["symbol"], pos["last"])
-            if price is None: price = pos["last"]
-            pos["last"] = float(price)
+        pid = uuid.uuid4().hex[:8].upper()
+        pos = _Position(
+            id=pid,
+            symbol=pair,
+            direction=side,
+            entry=price,
+            qty=qty,
+            opened_ts=now,
+            last=price,
+            hwm=price,
+            label=label,
+        )
+        self.positions[pid] = pos
+        # aggiorna cooldown per il base
+        self.risk.state.last_action_ts[base] = now
 
-            # best per trailing
-            if pos["side"] == "long":
-                pos["best"] = max(pos["best"], price)
+    def _mtm_and_manage(self, df: pd.DataFrame, now: float):
+        """Aggiorna P&L delle posizioni e applica stop/TP/trailing/time-stop/lock."""
+        if not self.positions:
+            return
+        cfg = self.risk.cfg
+
+        # mappa Pair -> prezzo corrente (se disponibile)
+        px_map: Dict[str, float] = {}
+        if df is not None and not df.empty and "Pair" in df.columns and "Price (USD)" in df.columns:
+            for r in df.to_dict(orient="records"):
+                pair = str(r.get("Pair", ""))
+                px = _to_float(r.get("Price (USD)"))
+                if pair and px and px > 0:
+                    px_map[pair] = px
+
+        to_close: List[Tuple[_Position, float, str]] = []
+
+        for p in list(self.positions.values()):
+            if p.closed:
+                continue
+
+            price = px_map.get(p.symbol, p.last)
+            p.last = price
+            if price <= 0:
+                continue
+
+            # direzione: per "short" invertiamo la percentuale
+            raw_ret = (price / p.entry - 1.0)
+            ret_pct = raw_ret if p.direction == "long" else (-raw_ret)
+            p.pnl_pct = ret_pct
+            p.pnl_usd = ret_pct * cfg.position_usd
+
+            # HWM aggiornato (per trailing su LONG; su SHORT usiamo LWM equivalente)
+            if p.direction == "long":
+                p.hwm = max(p.hwm, price)
             else:
-                pos["best"] = min(pos["best"], price)
+                # per short, hwm è il "low-water-mark": prezzo più basso
+                p.hwm = min(p.hwm, price)
 
-            # ===== Partial multipli (2R / 3R / 5R / ...) =====
-            if pos.get("partials"):
-                for tgt in pos["partials"]:
-                    if tgt["hit"]:
-                        continue
-                    reached = (price >= tgt["price"]) if pos["side"] == "long" else (price <= tgt["price"])
-                    if reached:
-                        f = max(0.05, min(0.95, float(tgt["fraction"])))
-                        pnl_pct_total = self._compute_pnl_pct(pos, price)
-                        # realizza sul notional corrente (size_usd rimasto)
-                        realized_usd = float(pos["size_usd"]) * pnl_pct_total * f
-                        self.risk.state.daily_pnl += realized_usd
-                        self._closed.append({
-                            "symbol": pos["symbol"],
-                            "label": pos["label"],
-                            "side": pos["side"],
-                            "pnl_usd": realized_usd,
-                            "pnl_pct": pnl_pct_total * f,
-                            "duration": _fmt_ago(pos["opened_at"]),
-                            "note": f"partial {int(f*100)}% @ {tgt['multiple']:.1f}R",
-                        })
-                        # riduci posizione (runner rimane)
-                        pos["qty"] = float(pos["qty"]) * (1.0 - f)
-                        pos["size_usd"] = float(pos["size_usd"]) * (1.0 - f)
-                        tgt["hit"] = True
-
-                        # BE+lock dopo OGNI partial
-                        be_lock = float(self.risk.cfg.be_lock_profit_pct)
-                        sl_pct = float(self.risk.cfg.stop_loss_pct)
-                        lock = max(be_lock, sl_pct)
-                        if pos["side"] == "long":
-                            pos["stop_price"] = max(pos["stop_price"], pos["entry"] * (1 + lock))
-                        else:
-                            pos["stop_price"] = min(pos["stop_price"], pos["entry"] * (1 - lock))
-
-                        # se size residua è troppo piccola, chiudi
-                        if pos["size_usd"] <= 1e-6 or pos["qty"] <= 1e-18:
-                            to_close.append((pid, pos))
-                        # continua a valutare altri scalini nello stesso tick
-
-            # trailing dinamico
-            trail = float(self.risk.cfg.trailing_pct)
-            if trail > 0:
-                if pos["side"] == "long":
-                    trail_price = pos["best"] * (1 - trail)
-                    pos["stop_price"] = max(pos["stop_price"], trail_price)
-                else:
-                    trail_price = pos["best"] * (1 + trail)
-                    pos["stop_price"] = min(pos["stop_price"], trail_price)
-
-            # time-stop
-            if self.risk.cfg.time_stop_min > 0:
-                age_min = (_now() - pos["opened_at"]) / 60.0
-                if age_min >= self.risk.cfg.time_stop_min:
-                    r = float(self.risk.cfg.stop_loss_pct)
-                    pnl_pct = self._compute_pnl_pct(pos, price)
-                    if pnl_pct < 0.5 * r:
-                        to_close.append((pid, pos))
-
-            # SL / BE / Trail
-            if (pos["side"] == "long" and price <= pos["stop_price"]) or (pos["side"] == "short" and price >= pos["stop_price"]):
-                to_close.append((pid, pos))
+            # regole di uscita
+            # 1) Stop loss
+            if ret_pct <= -cfg.stop_loss_pct:
+                to_close.append((p, price, "stop"))
                 continue
 
-            # Legacy TP% (se niente R-multipli)
-            if (not self.risk.cfg.use_r_multiple) and pos.get("tp_price_legacy") is not None:
-                if (pos["side"] == "long" and price >= pos["tp_price_legacy"]) or (pos["side"] == "short" and price <= pos["tp_price_legacy"]):
-                    to_close.append((pid, pos))
+            # 2) TP classico (se non uso multipli di R)
+            if not cfg.use_r_multiple and ret_pct >= cfg.take_profit_pct:
+                to_close.append((p, price, "tp"))
+                continue
 
-        for pid, pos in to_close:
-            self.close_by_id(pid, pos.get("last"))
+            # 3) Partial TP a 2R (se abilitato)
+            if cfg.use_r_multiple and cfg.partial_tp_enable and not p.partial_done_2r:
+                r_mult = (ret_pct / max(1e-9, cfg.stop_loss_pct))
+                if r_mult >= cfg.tp_r_multiple:  # es. 2R
+                    # chiudiamo frazione e spostiamo entry in avanti come se fossimo lockati
+                    cash_out = cfg.partial_tp_fraction * p.qty * (price - p.entry)
+                    self.risk.state.daily_pnl += cash_out
+                    # riduci qty (runner rimasto)
+                    p.qty *= (1.0 - cfg.partial_tp_fraction)
+                    p.partial_done_2r = True
+                    # break-even lock: aggiorna entry simulando BE+lock
+                    be_price = p.entry * (1.0 + cfg.be_lock_profit_pct if p.direction == "long"
+                                          else 1.0 - cfg.be_lock_profit_pct)
+                    p.entry = min(be_price, price) if p.direction == "long" else max(be_price, price)
 
-    # ---------- PnL ----------
+            # 4) Scalini extra a R multipli (runner)
+            if cfg.use_r_multiple and cfg.partial_scales and p.qty > 0:
+                r_now = ret_pct / max(1e-9, cfg.stop_loss_pct)
+                for r_mult, frac in cfg.partial_scales:
+                    if r_now >= r_mult and (r_mult not in p.scales_hit) and 0.0 < frac < 1.0:
+                        cash_out = frac * p.qty * (price - p.entry)
+                        self.risk.state.daily_pnl += cash_out
+                        p.qty *= (1.0 - frac)
+                        p.scales_hit.add(r_mult)
 
-    def _compute_pnl_pct(self, pos: Dict[str, Any], last: float | None) -> float:
-        if last is None: return 0.0
-        e = float(pos["entry"])
-        if e <= 0: return 0.0
-        move = (last - e) / e
-        return move if pos["side"] == "long" else (-move)
+            # 5) Trailing / Drawdown lock
+            if cfg.trailing_pct > 0:
+                if p.direction == "long":
+                    trail_stop = p.hwm * (1.0 - cfg.trailing_pct)
+                    if price <= trail_stop:
+                        to_close.append((p, price, "trailing"))
+                        continue
+                else:
+                    trail_stop = p.hwm * (1.0 + cfg.trailing_pct)  # per short p.hwm è LWM
+                    if price >= trail_stop:
+                        to_close.append((p, price, "trailing"))
+                        continue
 
-    def _compute_pnl_usd(self, pos: Dict[str, Any], last: float | None) -> float:
-        if last is None: return 0.0
-        pct = self._compute_pnl_pct(pos, last)
-        return float(pos["size_usd"]) * pct
+            # 6) Break-even trigger + drawdown lock da HWM
+            if ret_pct >= cfg.be_trigger_pct:
+                # drawdown dal massimo rendimento
+                if p.direction == "long":
+                    peak_ret = (p.hwm / p.entry - 1.0)
+                else:
+                    peak_ret = (p.entry / p.hwm - 1.0)  # per short
+                if peak_ret - ret_pct >= cfg.dd_lock_pct:
+                    to_close.append((p, price, "dd-lock"))
+                    continue
 
-    # ---------- Output DF ----------
+            # 7) Time stop
+            if cfg.time_stop_min > 0 and (now - p.opened_ts) >= cfg.time_stop_min * 60:
+                to_close.append((p, price, "time-stop"))
+                continue
 
-    def _df_open(self) -> pd.DataFrame:
-        rows = []
-        for pid, p in self._positions.items():
-            rows.append({
-                "id": pid,
-                "symbol": p["symbol"],
-                "label": f"{p['label']} • {p['side']}",
-                "entry": float(p["entry"]),
-                "last": float(p["last"]),
-                "pnl_usd": self._compute_pnl_usd(p, p["last"]),
-                "pnl_pct": self._compute_pnl_pct(p, p["last"]),
-                "opened_ago": _fmt_ago(p["opened_at"]),
-            })
-        return pd.DataFrame(rows)
+            # 8) Daily loss limit (sommatoria realized + unrealized)
+            if (self.risk.state.daily_pnl + self._unrealized_sum()) <= -abs(cfg.daily_loss_limit_usd):
+                to_close.append((p, price, "day-loss-limit"))
+                continue
 
-    def _df_signals(self, signals: List[Dict[str, Any]]) -> pd.DataFrame:
-        if not signals:
-            return pd.DataFrame()
-        rows = []
-        for s in signals:
-            rows.append({
-                "symbol": s["symbol"],
-                "side": s["side"],
-                "entry": s["entry"],
-                "mscore": s["mscore"],
-                "tx1h": s["tx1h"],
-                "liq": s["liq"],
-                "vol24": s["vol24"],
-                "url": s["url"],
-            })
-        return pd.DataFrame(rows)
+        for p, px, reason in to_close:
+            self._close_position(p, px, reason)
 
-    def _flush_closed(self) -> pd.DataFrame:
-        if not self._closed:
-            return pd.DataFrame()
-        df = pd.DataFrame(self._closed)
-        self._closed = []
-        return df
+    def _close_position(self, p: _Position, price: float, reason: str):
+        if p.closed:
+            return
+        cfg = self.risk.cfg
+        # realized pnl: su tutto il residuo
+        ret_pct = (price / p.entry - 1.0) if p.direction == "long" else (p.entry / price - 1.0)
+        realized = ret_pct * cfg.position_usd * (p.qty)  # qty in “quote” semplificato
+        self.risk.state.daily_pnl += realized
+        p.closed = True
+        p.last = price
+        p.pnl_usd = realized
+        p.pnl_pct = ret_pct
+        self.closed_trades.append({
+            "closed_ts": time.strftime("%H:%M:%S"),
+            "symbol": p.symbol,
+            "label": p.label,
+            "reason": reason,
+            "pnl_usd": round(realized, 4),
+            "pnl_pct": round(ret_pct * 100.0, 2),
+        })
+
+    # ------------------------------ Utilità --------------------------------
+
+    def _dir_label(self) -> str:
+        d = self.risk.cfg.direction
+        if d == "long":
+            return "LONG"
+        if d == "short":
+            return "SHORT"
+        return "LONG/SHORT"
+
+    def _decide_side(self) -> str:
+        d = self.risk.cfg.direction
+        if d in ("long", "short"):
+            return d
+        # "both": per ora preferiamo LONG su spot; SHORT rimane paper/manuale
+        return "long"
+
+    def _unrealized_sum(self) -> float:
+        return sum(p.pnl_usd for p in self.positions.values() if not p.closed)
+
+
+# ================================ Helpers =====================================
+
+def _to_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace(",", "").strip().replace("%", "")
+        return float(s) if s else default
+    except Exception:
+        return default
+
+
+def _fmt_ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
