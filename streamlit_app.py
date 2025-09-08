@@ -1,13 +1,14 @@
-# streamlit_app.py — Meme Radar (Streamlit) v12.5
+# streamlit_app.py — Meme Radar (Streamlit) v13.0
 # - Fix Start/Stop: stato mostrato dopo i bottoni + st.rerun() immediato
 # - Scanner Solana via MarketDataProvider (DexScreener)
 # - KPI, Meme Score, grafici, watchlist
 # - Filtro Volume 24h (MIN/MAX)
 # - DEX consentiti (multiselect)
 # - StrategyMomentumV2 + Diagnostica + Adaptive Relax
-# - Trading Paper (risk mgmt, BE lock, trailing, pyramiding)
+# - Trading Paper: LONG/SHORT (short = paper), BE lock, trailing, pyramiding
+# - Partial TP multipli: 50% a 2R + (opzione) 3R runner o 3R+5R (25%/25%)
 # - Alert Telegram dalla tabella
-# - LIVE Trading (Jupiter): deeplink o autosign (locale)
+# - LIVE Trading (Jupiter): deeplink o autosign (locale) — ignora SHORT
 # - Tabella: Top 10 per Volume 24h + Change 1h + Change 4h con fallback H6 (nested-aware)
 # - Auto-refresh condizionato a "Running"
 # - Compatibile con Streamlit >= 1.33 (usa st.query_params)
@@ -19,7 +20,7 @@ import requests
 import streamlit as st
 
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine  # Strategy V2
+from trading import RiskConfig, StratConfig, TradeEngine  # Engine con partial multipli
 
 # =========================== Jupiter LIVE Connector (inline) ===========================
 JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
@@ -193,9 +194,9 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Stato esecuzione: inizializziamo solo la chiave (non stampiamo ancora lo stato)
+# Stato esecuzione: inizializza chiave (non stampare ancora lo stato)
 if "app_running" not in st.session_state:
-    st.session_state["app_running"] = True  # default ON
+    st.session_state["app_running"] = True
 
 if "last_refresh_ts" not in st.session_state:
     st.session_state["last_refresh_ts"] = time.time()
@@ -210,12 +211,12 @@ with st.sidebar:
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
         st.session_state["app_running"] = True
         st.toast("Esecuzione avviata", icon="✅")
-        st.rerun()  # aggiorna subito lo stato in pagina
+        st.rerun()
     if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
         st.session_state["app_running"] = False
-        st.session_state["live_positions"] = {}  # prudente
+        st.session_state["live_positions"] = {}
         st.toast("Esecuzione in pausa", icon="⏸️")
-        st.rerun()  # aggiorna subito lo stato in pagina
+        st.rerun()
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh", value=True)
@@ -313,6 +314,33 @@ with st.sidebar:
         tp_pct   = st.slider("Take Profit %", 10, 200, st.session_state.get("tp_pct", 40), key="tp_pct")
         trail_pct= st.slider("Trailing %", 5, 60, st.session_state.get("trail_pct", 15), key="trail_pct")
         day_loss = st.number_input("Daily loss limit (USD)", min_value=50.0, value=st.session_state.get("day_loss", 200.0), step=50.0, key="day_loss")
+
+    # Direzione strategia + R-multipli
+    direction = st.selectbox(
+        "Direzione",
+        ["Long only", "Short only (paper)", "Long & Short (paper)"],
+        index=0,
+        help="Short e Both sono solo in modalità paper. Per short live servono perps (Drift/Mango)."
+    )
+    use_r_mult = st.toggle("TP a R-multiple", value=True, help="Abilita TP basati su multipli di R (dove R = Stop Loss %).")
+    tp_r_mult  = st.number_input("R-multiple base (es. 2R)", min_value=1.0, value=2.0, step=0.5)
+
+    st.markdown("**Partial Take Profit (2R)**")
+    ptp_enable = st.toggle("Chiudi 50% a 2R e lascia correre", value=True,
+                           help="A 2×R (calcolato da Stop Loss %) chiude la frazione e alza lo stop a BE+lock.")
+    ptp_frac = st.slider("Frazione a 2R", 0.1, 0.9, 0.5, 0.05)
+
+    st.markdown("**Scale extra**")
+    ptp_extra_mode = st.selectbox(
+        "Modalità scala",
+        ["Nessuna", "Runner 3R", "3R + 5R (25% / 25%)"],
+        index=0,
+        help="Aggiunge scalini extra oltre al 2R."
+    )
+    runner_3r_frac = 0.25
+    if ptp_extra_mode == "Runner 3R":
+        runner_3r_frac = st.slider("Frazione a 3R (runner)", 0.1, 0.9, 0.25, 0.05)
+
     st.markdown("**Strategia V2 — parametri chiave**")
     strat_meme     = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 70), key="strat_meme")
     strat_txns     = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 250), step=25, key="strat_txns")
@@ -459,14 +487,13 @@ def safe_sort(df, col, ascending=False):
     if df is None or df.empty or col not in df.columns: return df
     return df.sort_values(by=[col], ascending=ascending)
 
-# ---- Cast sicuri per evitare ValueError su NaN / stringhe
+# ---- Cast sicuri
 def to_float0(x, default=0.0):
-    """Cast robusto a float con fallback su default. Gestisce None, stringhe e NaN."""
     if x is None:
         return default
     try:
         v = float(x)
-        if not math.isfinite(v):  # NaN / inf
+        if not math.isfinite(v):
             return default
         return v
     except (TypeError, ValueError):
@@ -478,7 +505,6 @@ def to_float0(x, default=0.0):
             return default
 
 def to_int0(x, default=0):
-    """Cast robusto a int con arrotondamento e gestione NaN."""
     v = to_float0(x, float(default))
     return int(round(v))
 
@@ -777,16 +803,15 @@ if not df_pairs.empty:
             "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
         }
     )
-    cap = "Top 10 per Volume 24h." if show_top10_table else "Tutte le coppie post-filtri."
-    cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
-    st.caption(cap)
-
     try:
         n1 = pd.to_numeric(df_pairs_for_view["Change 1h (%)"], errors="coerce").notna().sum()
         n4 = pd.to_numeric(df_pairs_for_view["Change 4h/6h (%)"], errors="coerce").notna().sum()
         st.caption(f"Diagnostica Change: 1h valorizzati {n1}/{len(df_pairs_for_view)} • 4h/6h valorizzati {n4}/{len(df_pairs_for_view)}")
     except Exception:
         pass
+    cap = "Top 10 per Volume 24h." if show_top10_table else "Tutte le coppie post-filtri."
+    cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
+    st.caption(cap)
 else:
     st.caption("Nessuna coppia disponibile con i filtri attuali.")
 
@@ -901,6 +926,13 @@ def relax_strategy_if_empty(df: pd.DataFrame, cfg):
 # ---------------- Trading (Paper) ----------------
 st.markdown("## 🧪 Trading — Paper Mode")
 
+# Costruisci scale extra per partial TP
+extra_scales = []
+if ptp_extra_mode == "Runner 3R":
+    extra_scales = [(3.0, float(runner_3r_frac))]
+elif ptp_extra_mode == "3R + 5R (25% / 25%)":
+    extra_scales = [(3.0, 0.25), (5.0, 0.25)]
+
 r_cfg = RiskConfig(
     position_usd=float(st.session_state.get("pos_usd",50.0)),
     max_positions=int(st.session_state.get("max_pos",3)),
@@ -916,6 +948,14 @@ r_cfg = RiskConfig(
     be_trigger_pct=float(st.session_state.get("be_trig",10))/100.0,
     be_lock_profit_pct=float(st.session_state.get("be_lock",2))/100.0,
     dd_lock_pct=float(st.session_state.get("dd_lock",6))/100.0,
+
+    direction=("long" if direction.startswith("Long only") else ("short" if direction.startswith("Short") else "both")),
+    use_r_multiple=bool(use_r_mult),
+    tp_r_multiple=float(tp_r_mult),
+
+    partial_tp_enable=bool(ptp_enable),
+    partial_tp_fraction=float(ptp_frac),
+    partial_scales=extra_scales,
 )
 
 s_cfg = StratConfig(
@@ -1088,6 +1128,12 @@ else:
         try:
             r = df_open[df_open["id"].astype(str) == tid].iloc[0]
             symbol = r.get("symbol","")
+            label  = str(r.get("label","")).lower()
+            # ignora SHORT in live (spot)
+            if "short" in label:
+                live_log.append(f"SKIP LIVE (short) — {symbol}")
+                st.session_state["live_positions"][tid] = {"symbol":symbol, "skip":"short"}
+                continue
             base_mint, quote_mint = find_mints_for_symbol(symbol)
             if not base_mint:
                 live_log.append(f"BUY {symbol} → mint base non trovato")
@@ -1116,15 +1162,19 @@ else:
         if not info: 
             continue
         try:
-            symbol = info.get("symbol","?")
-            base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
-            mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
-            if mode == "deeplink":
-                live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
-            elif mode == "sent":
-                live_log.append(f"SELL {symbol} → tx: `{payload}`")
+            # se era short, non c'era operazione live da replicare
+            if info.get("skip") == "short":
+                live_log.append("SELL (skip short live)")
             else:
-                live_log.append(f"SELL {symbol} → {payload}")
+                symbol = info.get("symbol","?")
+                base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
+                mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
+                if mode == "deeplink":
+                    live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
+                elif mode == "sent":
+                    live_log.append(f"SELL {symbol} → tx: `{payload}`")
+                else:
+                    live_log.append(f"SELL {symbol} → {payload}")
         except Exception as e:
             live_log.append(f"SELL error: {e}")
         finally:
