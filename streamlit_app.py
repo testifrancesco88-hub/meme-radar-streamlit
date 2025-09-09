@@ -1,7 +1,8 @@
-# streamlit_app.py — Meme Radar (no-trading) v16.0
-# - NIENTE trading: rimossi engine/segnali/posizioni/performance/Jupiter live
-# - Restano: KPI mercato, filtri provider, watchlist, PAIRS (tabella) con filtri (Meme/PairAge/Liq log/Vol log),
-#   applicazione opzionale dei filtri PAIRS anche alla "diagnostica", Top10 per Volume, alert Telegram, diagnostica mercato
+# streamlit_app.py — Meme Radar (no-trading) + Drill-down Social v17.0
+# - No trading: solo radar, KPI, filtri, Top10, watchlist, alert Telegram, diagnostica
+# - Tabella con selezione riga → pannello "Token drill-down" (logo, quick links, mini-grafici)
+# - Social & Sito dal payload DexScreener (info.websites / info.socials)
+# - Badge affidabilità social (🛡️ strong / 🟡 weak / 🔴 suspicious) + warning se solo "other"
 # - Compatibile con Streamlit >= 1.33: usa st.query_params
 
 import os, time, math, random, datetime, json, threading
@@ -9,6 +10,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from urllib.parse import urlparse  # <— per valutazione domini social
 
 from market_data import MarketDataProvider
 
@@ -74,13 +76,13 @@ with st.sidebar:
                                     help="Es: WIF,BONK,So111...,<pairAddress>", key="watchlist_input")
     watchlist_only = st.toggle("Mostra solo watchlist", value=False, key="watchlist_only")
 
-    # Volume 24h filtro “strategico” (solo dataset generale, NO trading)
+    # Volume 24h filtro (dataset)
     st.divider()
     st.subheader("Filtro Volume 24h (USD) — dataset")
     vol24_min = st.number_input("Volume 24h MIN", min_value=0, value=st.session_state.get("vol24_min", 0), step=10000, key="vol24_min")
     vol24_max = st.number_input("Volume 24h MAX (0 = illimitato)", min_value=0, value=st.session_state.get("vol24_max", 0), step=100000, key="vol24_max")
 
-    # Meme Score (per ranking tabella)
+    # Meme Score (ranking tabella)
     st.divider()
     st.subheader("Meme Score")
     sort_by_meme = st.toggle("Ordina per Meme Score (desc)", value=True)
@@ -478,7 +480,7 @@ with c2: st.metric("Volume 24h medio Top 10", fmt_int(vol24_avg))
 with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
-# ---------------- Tabella PAIRS ----------------
+# ---------------- Tabella PAIRS: build + drill-down ----------------
 def _first_or_none(d, keys):
     for k in keys:
         try:
@@ -563,9 +565,10 @@ def build_table(df):
             "Change 24h (%)": chg_24h,
             "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
             "Pair Age": fmt_age(ageh),
-            "PairAgeHours": (float(ageh) if ageh is not None else None),  # per filtri tabella/diagnostica opzionali
+            "PairAgeHours": (float(ageh) if ageh is not None else None),
             "Link": r.get("url",""),
             "Base Address": r.get("baseAddress",""),
+            "Pair Address": r.get("pairAddress",""),   # per drill-down
             "baseSymbol": r.get("baseSymbol",""),
             "quoteSymbol": r.get("quoteSymbol",""),
         })
@@ -672,20 +675,31 @@ with right:
         fig2 = px.bar(df_liq, x="Token", y="Liquidity", title="Ultime 20 Nuove Coin – Liquidity (Birdeye)")
         st.plotly_chart(fig2, use_container_width=True)
 
-# ---------------- Tabella PAIRS ----------------
+# ---------------- Tabella PAIRS + Drill-down ----------------
 st.markdown("### Pairs (post-filtri)")
 if not df_pairs_table.empty:
     base_for_view = df_pairs_table
     df_pairs_for_view = base_for_view.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else base_for_view
 
-    display_cols = [c for c in df_pairs_for_view.columns if c not in ("baseSymbol","quoteSymbol","PairAgeHours")]
+    # Aggiungo colonna di selezione per il "click"
+    df_pairs_for_view = df_pairs_for_view.copy()
+    if "Select" not in df_pairs_for_view.columns:
+        df_pairs_for_view.insert(0, "Select", False)
+
+    # Colonne da mostrare (nascondo metadati tecnici non utili)
+    display_cols = ["Select","Pair","DEX","Meme Score","Price (USD)","Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
+                    "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]
     if not show_pair_age and "Pair Age" in display_cols:
         display_cols.remove("Pair Age")
 
-    st.dataframe(
+    edited = st.data_editor(
         df_pairs_for_view[display_cols],
+        key="pairs_editor",
+        hide_index=True,
         use_container_width=True,
+        disabled=False,
         column_config={
+            "Select": st.column_config.CheckboxColumn(help="Spunta per aprire il pannello drill-down"),
             "Link": st.column_config.LinkColumn("Link", help="Apri su DexScreener"),
             "Liquidity (USD)": st.column_config.NumberColumn(format="%,d"),
             "Volume 24h (USD)": st.column_config.NumberColumn(format="%,d"),
@@ -696,15 +710,350 @@ if not df_pairs_table.empty:
             "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
         }
     )
+
+    # Trovo l’ultima riga selezionata
     try:
-        n1 = pd.to_numeric(df_pairs_for_view["Change 1h (%)"], errors="coerce").notna().sum()
-        n4 = pd.to_numeric(df_pairs_for_view["Change 4h/6h (%)"], errors="coerce").notna().sum()
-        st.caption(f"Diagnostica Change: 1h valorizzati {n1}/{len(df_pairs_for_view)} • 4h/6h valorizzati {n4}/{len(df_pairs_for_view)}")
+        sel_idx = edited.index[edited["Select"] == True].tolist()
+    except Exception:
+        sel_idx = []
+    selected_row = df_pairs_for_view.loc[sel_idx[-1]] if sel_idx else None
+
+    # Caption di stato tabella
+    try:
+        n1 = pd.to_numeric(df_pairs_for_view.loc[edited.index, "Change 1h (%)"], errors="coerce").notna().sum()
+        n4 = pd.to_numeric(df_pairs_for_view.loc[edited.index, "Change 4h/6h (%)"], errors="coerce").notna().sum()
+        st.caption(f"Diagnostica Change: 1h valorizzati {n1}/{len(edited)} • 4h/6h valorizzati {n4}/{len(edited)}")
     except Exception:
         pass
     cap = "Top 10 per Volume 24h (tabella filtrata)." if show_top10_table else "Tutte le coppie (tabella filtrata)."
     cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
     st.caption(cap)
+
+    # ---------------- Drill-down Helpers ----------------
+    def _fetch_pair_details_safely(pair_addr: str):
+        if not pair_addr:
+            return None, None
+        url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_addr}"
+        data, code = fetch_with_retry(url, tries=3, base_backoff=0.6, headers=UA_HEADERS)
+        if data and isinstance(data, dict) and data.get("pairs"):
+            return data["pairs"][0], code
+        return None, code
+
+    def _get_path(obj, path, default=None):
+        try:
+            cur = obj
+            for p in path:
+                cur = cur[p]
+            return cur
+        except Exception:
+            return default
+
+    def _tx_val(pair, tf, side):
+        return _get_path(pair, ["txns", tf, side], 0) or 0
+
+    def _pc_val(pair, tf):
+        v = _get_path(pair, ["priceChange", tf], None)
+        try:
+            if v is None: return None
+            return float(str(v).replace("%",""))
+        except Exception:
+            return None
+
+    def _vol_val(pair, tf):
+        try:
+            v = _get_path(pair, ["volume", tf], None)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+
+    # --- Social helpers ---
+    def _collect_socials(info: dict) -> dict:
+        """Raccoglie i link utili da info.websites / info.socials di DexScreener."""
+        if not isinstance(info, dict):
+            return {}
+        links = {}
+
+        webs = info.get("websites")
+        if isinstance(webs, list):
+            for w in webs:
+                if isinstance(w, dict):
+                    url = w.get("url") or w.get("link")
+                elif isinstance(w, str):
+                    url = w
+                else:
+                    url = None
+                if url and "http" in url:
+                    links.setdefault("website", url)
+
+        socs = info.get("socials")
+        if isinstance(socs, list):
+            for s in socs:
+                if isinstance(s, dict):
+                    typ = (s.get("type") or s.get("name") or "").lower()
+                    url = s.get("url") or s.get("link")
+                elif isinstance(s, str):
+                    typ = ""
+                    url = s
+                else:
+                    continue
+
+                if not (url and "http" in url):
+                    continue
+
+                if "twitter" in typ or typ == "x" or "x.com" in url:
+                    links.setdefault("twitter", url)
+                elif "telegram" in typ or "t.me" in url:
+                    links.setdefault("telegram", url)
+                elif "discord" in typ:
+                    links.setdefault("discord", url)
+                elif "github" in typ:
+                    links.setdefault("github", url)
+                elif "medium" in typ:
+                    links.setdefault("medium", url)
+                elif "coingecko" in typ:
+                    links.setdefault("coingecko", url)
+                elif "coinmarketcap" in typ or "cmc" in typ:
+                    links.setdefault("cmc", url)
+                else:
+                    links.setdefault("other", url)
+
+        return links
+
+    def _hostname(url: str) -> str:
+        try:
+            return urlparse(url).hostname or ""
+        except Exception:
+            return ""
+
+    def _slugify_sym(s: str) -> str:
+        return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+    _APPROVED_SOCIAL_DOMAINS = {
+        "twitter.com", "x.com",
+        "t.me", "telegram.me",
+        "discord.com", "discord.gg",
+        "github.com", "github.io",
+        "medium.com",
+        "coingecko.com", "coinmarketcap.com",
+    }
+    _HUB_DOMAINS = {"linktr.ee", "links.linktr.ee", "beacons.ai", "linkin.bio"}
+    _SUSPICIOUS_DOMAINS = {
+        "forms.gle", "docs.google.com", "site.google.com",
+        "notion.so", "notion.site", "pastebin.com", "pastelink.net"
+    }
+
+    def _evaluate_socials(links: dict, base_symbol: str | None, quote_symbol: str | None) -> dict:
+        keys = set(links.keys())
+        only_other = (keys == {"other"})
+        reasons = []
+        suspicious_hits = 0
+        hub_hits = 0
+
+        def _domain_in(set_domains, url):
+            host = _hostname(url).lower()
+            return any(host == d or host.endswith("." + d) for d in set_domains)
+
+        for k, url in links.items():
+            if _domain_in(_SUSPICIOUS_DOMAINS, url):
+                suspicious_hits += 1
+            if _domain_in(_HUB_DOMAINS, url):
+                hub_hits += 1
+
+        has_site = "website" in links
+        has_twt  = "twitter" in links
+        has_tg   = "telegram" in links
+        good_socials = sum(1 for k in ("twitter","telegram","discord","github","medium") if k in links)
+
+        sym = _slugify_sym(base_symbol or "")
+        sym_hit = False
+        if sym:
+            for _, url in links.items():
+                u = (url or "").lower()
+                if sym and sym in u:
+                    sym_hit = True
+                    break
+
+        if only_other:
+            reasons.append("Solo link di tipo 'other'.")
+            status = "suspicious"
+        elif suspicious_hits >= 1 and good_socials == 0:
+            reasons.append("Presenti domini sospetti e mancano social affidabili.")
+            status = "suspicious"
+        elif has_site and (has_twt or has_tg):
+            if "website" in links and _domain_in(_HUB_DOMAINS, links["website"]):
+                reasons.append("Website è un link-hub (es. linktr.ee).")
+                status = "weak"
+            elif suspicious_hits >= 1:
+                reasons.append("Trovati domini sospetti tra i link.")
+                status = "weak"
+            else:
+                if sym_hit:
+                    reasons.append("Il simbolo compare nei link (match positivo).")
+                status = "strong"
+        else:
+            reasons.append("Set social incompleto (manca website o manca Twitter/Telegram).")
+            if has_site and _domain_in(_HUB_DOMAINS, links["website"]):
+                reasons.append("Website è un link-hub (es. linktr.ee).")
+            if suspicious_hits >= 1:
+                reasons.append("Trovati domini sospetti tra i link.")
+            status = "weak"
+
+        return {"status": status, "reasons": reasons, "only_other": only_other}
+
+    # ---------------- Drill-down panel ----------------
+    if selected_row is not None:
+        # Identifico l’indirizzo della pair
+        pair_addr = None
+        if "Pair Address" in df_pairs.columns and pd.notna(selected_row.get("Pair Address","")):
+            pair_addr = str(selected_row.get("Pair Address"))
+        if (not pair_addr) and isinstance(selected_row.get("Link",""), str) and "/solana/" in selected_row.get("Link",""):
+            try:
+                pair_addr = selected_row["Link"].split("/solana/")[1].split("?")[0]
+            except Exception:
+                pass
+
+        st.markdown("#### 🔎 Token drill-down")
+        if not pair_addr:
+            st.info("Impossibile determinare il Pair Address (manca nel dataset).")
+        else:
+            pair, http_code = _fetch_pair_details_safely(pair_addr)
+            if not pair:
+                st.warning(f"Nessun dettaglio disponibile (DexScreener {http_code}).")
+            else:
+                # Header con logo e coppia
+                cA, cB = st.columns([1,3])
+                img_url = _get_path(pair, ["info","imageUrl"], None)
+                if img_url: cA.image(img_url, width=72)
+                base = _get_path(pair, ["baseToken","symbol"], "")
+                quote = _get_path(pair, ["quoteToken","symbol"], "")
+                st_pair = f"**{base}/{quote}**  •  `{pair_addr}`"
+                url_dex = pair.get("url","")
+                if url_dex: st_pair += f"  •  [DexScreener]({url_dex})"
+                cB.markdown(st_pair)
+
+                # Quick links (Jupiter, Raydium, Birdeye, DexScreener)
+                bA, bB, bC, bD = st.columns(4)
+                baddr = _get_path(pair, ["baseToken","address"], "")
+                qaddr = _get_path(pair, ["quoteToken","address"], "")
+                if baddr and qaddr:
+                    jup = f"https://jup.ag/swap/{baddr}-{qaddr}"
+                    ray = f"https://raydium.io/swap/?inputMint={baddr}&outputMint={qaddr}"
+                    bA.link_button("Jupiter", jup, use_container_width=True)
+                    bB.link_button("Raydium", ray, use_container_width=True)
+                if baddr:
+                    be = f"https://birdeye.so/token/{baddr}?chain=solana"
+                    bC.link_button("Birdeye", be, use_container_width=True)
+                if url_dex:
+                    bD.link_button("DexScreener", url_dex, use_container_width=True)
+
+                # --- Social & Sito ------------------------------------------------
+                info_obj = pair.get("info", {}) or {}
+                social_links = _collect_socials(info_obj)
+
+                if social_links:
+                    st.markdown("##### Social & Sito")
+                    ordered = [
+                        ("website",   "Website"),
+                        ("twitter",   "X / Twitter"),
+                        ("telegram",  "Telegram"),
+                        ("discord",   "Discord"),
+                        ("github",    "GitHub"),
+                        ("medium",    "Medium"),
+                        ("coingecko", "CoinGecko"),
+                        ("cmc",       "CoinMarketCap"),
+                        ("other",     "Altro"),
+                    ]
+                    buttons = [(label, social_links[k]) for k, label in ordered if k in social_links]
+                    ncols = min(4, max(1, len(buttons)))
+                    cols = st.columns(ncols)
+                    for i, (label, url) in enumerate(buttons):
+                        cols[i % ncols].link_button(label, url, use_container_width=True)
+                else:
+                    st.caption("Social non disponibili.")
+
+                # Badge & warning
+                base_sym = base
+                quote_sym = quote
+                eval_res = _evaluate_socials(social_links, base_sym, quote_sym)
+                if eval_res["status"] == "strong":
+                    st.success("🛡️ Linkset solido (website + social principali, domini OK).", icon="🛡️")
+                elif eval_res["status"] == "weak":
+                    st.warning("🟡 Linkset limitato o parzialmente affidabile.", icon="🟡")
+                else:
+                    st.error("🔴 Linkset sospetto / generico.", icon="🚩")
+                if eval_res["only_other"]:
+                    st.warning("Solo link 'other' trovati: attenzione, potrebbero non essere canali ufficiali.", icon="⚠️")
+                if eval_res["reasons"]:
+                    with st.expander("Dettagli valutazione"):
+                        for r in eval_res["reasons"]:
+                            st.markdown(f"- {r}")
+
+                st.divider()
+
+                # Metriche principali
+                m1, m2, m3, m4 = st.columns(4)
+                try:
+                    m1.metric("Prezzo (USD)", f"{float(pair.get('priceUsd',0) or 0):.8f}")
+                except Exception:
+                    m1.metric("Prezzo (USD)", "N/D")
+                try:
+                    m2.metric("Liq (USD)", fmt_int(_get_path(pair, ["liquidity","usd"], 0)))
+                except Exception:
+                    m2.metric("Liq (USD)", "N/D")
+                try:
+                    m3.metric("Vol 24h (USD)", fmt_int(_vol_val(pair, "h24") or 0))
+                except Exception:
+                    m3.metric("Vol 24h (USD)", "N/D")
+                try:
+                    ch24 = _pc_val(pair, "h24")
+                    m4.metric("Change 24h", f"{ch24:.2f}%" if ch24 is not None else "N/D")
+                except Exception:
+                    m4.metric("Change 24h", "N/D")
+
+                # --- Mini-grafici ---
+                g1, g2, g3 = st.columns(3)
+
+                # (a) Change % per timeframe
+                try:
+                    tfs = []
+                    vals = []
+                    for tf in ("m5","h1","h6","h24"):
+                        v = _pc_val(pair, tf)
+                        if v is not None:
+                            tfs.append(tf.upper()); vals.append(v)
+                    if tfs:
+                        figc = px.bar(pd.DataFrame({"TF": tfs, "Change %": vals}), x="TF", y="Change %", title="Change % by TF")
+                        g1.plotly_chart(figc, use_container_width=True)
+                    else:
+                        g1.info("Change% non disponibile.")
+                except Exception:
+                    g1.info("Change% non disponibile.")
+
+                # (b) Buys vs Sells (m5 / h1)
+                try:
+                    rows_tx = []
+                    for tf in ("m5","h1"):
+                        rows_tx.append({"TF": tf.upper(), "Side": "Buys", "Tx": _tx_val(pair, tf, "buys")})
+                        rows_tx.append({"TF": tf.upper(), "Side": "Sells","Tx": _tx_val(pair, tf, "sells")})
+                    dftx = pd.DataFrame(rows_tx)
+                    if len(dftx):
+                        figt = px.bar(dftx, x="TF", y="Tx", color="Side", barmode="group", title="Buys/Sells")
+                        g2.plotly_chart(figt, use_container_width=True)
+                    else:
+                        g2.info("Tx breakdown non disponibile.")
+                except Exception:
+                    g2.info("Tx breakdown non disponibile.")
+
+                # (c) Volume vs Liquidity
+                try:
+                    v24 = _vol_val(pair, "h24") or 0
+                    liq = _get_path(pair, ["liquidity","usd"], 0) or 0
+                    dflq = pd.DataFrame({"Metric": ["Vol 24h","Liquidity"], "USD": [v24, liq]})
+                    figv = px.bar(dflq, x="Metric", y="USD", title="Vol 24h vs Liquidity")
+                    g3.plotly_chart(figv, use_container_width=True)
+                except Exception:
+                    g3.info("Vol vs Liq non disponibile.")
+
 else:
     st.caption("Nessuna coppia disponibile con i filtri attuali.")
 
