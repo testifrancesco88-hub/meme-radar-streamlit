@@ -1,170 +1,16 @@
-# streamlit_app.py — Meme Radar (Streamlit) v15.0
-# - PAIRS filters (solo tabella) + OPZIONE per applicarli anche alla strategia (per-filtro)
-# - Top 10 per Volume usa la tabella filtrata
-# - Start/Stop, Auto-refresh condizionale, H4→H6 fallback, Telegram alerts, Live Jupiter (ignora short)
-# - Partial TP multipli (richiede trading.py con partial_scales)
+# streamlit_app.py — Meme Radar (no-trading) v16.0
+# - NIENTE trading: rimossi engine/segnali/posizioni/performance/Jupiter live
+# - Restano: KPI mercato, filtri provider, watchlist, PAIRS (tabella) con filtri (Meme/PairAge/Liq log/Vol log),
+#   applicazione opzionale dei filtri PAIRS anche alla "diagnostica", Top10 per Volume, alert Telegram, diagnostica mercato
 # - Compatibile con Streamlit >= 1.33: usa st.query_params
 
-import os, time, math, random, datetime, json, threading, base64
+import os, time, math, random, datetime, json, threading
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
 
 from market_data import MarketDataProvider
-from trading import RiskConfig, StratConfig, TradeEngine
-
-# =========================== Jupiter LIVE Connector (inline) ===========================
-JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
-JUP_SWAP  = "https://quote-api.jup.ag/v6/swap"
-JUP_TOKENS= "https://token.jup.ag/all"
-JUP_PRICE = "https://price.jup.ag/v6/price?ids=SOL"
-
-MINT_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-MINT_SOL  = "So11111111111111111111111111111111111111112"  # wSOL
-
-def _jget(url, params=None, timeout=20):
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-def _jpost(url, data, timeout=20):
-    r = requests.post(url, headers={"Content-Type":"application/json"}, data=json.dumps(data), timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-class _TokenRegistry:
-    _cache = None
-    _by_mint = {}
-    _ts = 0
-
-    @classmethod
-    def _ensure(cls):
-        if cls._cache and time.time()-cls._ts < 3600:
-            return
-        data = _jget(JUP_TOKENS)
-        cls._cache = data
-        cls._by_mint = {t["address"]: t for t in data}
-        cls._ts = time.time()
-
-    @classmethod
-    def decimals(cls, mint: str, default: int = 9) -> int:
-        cls._ensure()
-        t = cls._by_mint.get(mint)
-        return int(t.get("decimals", default)) if t else default
-
-    @classmethod
-    def symbol(cls, mint: str, default: str = "?") -> str:
-        cls._ensure()
-        t = cls._by_mint.get(mint)
-        return t.get("symbol", default) if t else default
-
-def get_sol_usd(default=150.0) -> float:
-    try:
-        j = _jget(JUP_PRICE)
-        return float(j["data"]["SOL"]["price"])
-    except Exception:
-        return float(default)
-
-class LiveConfig:
-    def __init__(self, mode: str, slippage_bps: int = 100, rpc_url: str | None = None, public_key: str | None = None, private_key_b58: str | None = None):
-        self.mode = mode              # "off" | "deeplink" | "autosign"
-        self.slippage_bps = int(slippage_bps)
-        self.rpc_url = rpc_url
-        self.public_key = public_key
-        self.private_key_b58 = private_key_b58
-
-class JupiterConnector:
-    def __init__(self, cfg: LiveConfig):
-        self.cfg = cfg
-
-    def build_buy(self, quote_mint: str, base_mint: str, amount_quote_usd: float, price_usd_base: float | None):
-        if self.cfg.mode == "off":
-            return ("off", "Live trading OFF")
-
-        if quote_mint == MINT_USDC:
-            dec = _TokenRegistry.decimals(MINT_USDC, 6)
-            amount_in = int(round(amount_quote_usd * (10 ** dec)))
-            input_mint = MINT_USDC
-        elif quote_mint == MINT_SOL:
-            sol_usd = get_sol_usd()
-            sol_amount = amount_quote_usd / max(0.01, sol_usd)
-            dec = 9
-            amount_in = int(round(sol_amount * (10 ** dec)))
-            input_mint = MINT_SOL
-        else:
-            dec = _TokenRegistry.decimals(MINT_USDC, 6)
-            amount_in = int(round(amount_quote_usd * (10 ** dec)))
-            input_mint = MINT_USDC
-
-        if self.cfg.mode == "deeplink":
-            human = amount_in / (10 ** dec)
-            url = f"https://jup.ag/swap/{_TokenRegistry.symbol(input_mint) or 'USDC'}-{_TokenRegistry.symbol(base_mint)}?amount={human}&slippageBps={self.cfg.slippage_bps}"
-            return ("deeplink", url)
-
-        if self.cfg.mode == "autosign":
-            return self._autosign_swap(input_mint, base_mint, amount_in, "ExactIn")
-
-        return ("off", "Unsupported mode")
-
-    def build_sell(self, base_mint: str, quote_mint: str, base_amount_tokens: float):
-        if self.cfg.mode == "off":
-            return ("off", "Live trading OFF")
-        dec = _TokenRegistry.decimals(base_mint, 9)
-        amount_in = int(round(base_amount_tokens * (10 ** dec)))
-        if self.cfg.mode == "deeplink":
-            url = f"https://jup.ag/swap/{_TokenRegistry.symbol(base_mint)}-{_TokenRegistry.symbol(quote_mint)}?amount={base_amount_tokens}&slippageBps={self.cfg.slippage_bps}"
-            return ("deeplink", url)
-        if self.cfg.mode == "autosign":
-            return self._autosign_swap(base_mint, quote_mint, amount_in, "ExactIn")
-        return ("off", "Unsupported mode")
-
-    def _autosign_swap(self, input_mint: str, output_mint: str, amount_in: int, swap_mode: str):
-        if not (self.cfg.rpc_url and self.cfg.public_key and self.cfg.private_key_b58):
-            return ("error", "Autosign richiede RPC_URL, PUBLIC_KEY e PRIVATE_KEY")
-        q = _jget(JUP_QUOTE, params={
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": amount_in,
-            "slippageBps": self.cfg.slippage_bps,
-            "swapMode": swap_mode,
-            "onlyDirectRoutes": "false",
-        })
-        s = _jpost(JUP_SWAP, {
-            "userPublicKey": self.cfg.public_key,
-            "wrapAndUnwrapSol": True,
-            "quoteResponse": q,
-            "asLegacyTransaction": True,
-            "dynamicComputeUnitLimit": True,
-            "useSharedAccounts": True,
-        })
-        tx_b64 = s.get("swapTransaction")
-        if not tx_b64:
-            return ("error", f"swapTransaction mancante: {s}")
-
-        try:
-            from solana.rpc.api import Client
-            from solana.keypair import Keypair
-            from solders.keypair import Keypair as SKeypair
-            from solana.transaction import Transaction
-        except Exception as e:
-            return ("error", f"Librerie non presenti (solana, solders). Aggiungi a requirements.txt. Dettagli: {e}")
-
-        try:
-            client = Client(self.cfg.rpc_url)
-            raw = base64.b64decode(tx_b64)
-            tx  = Transaction.deserialize(raw)
-            try:
-                kp = SKeypair.from_base58_string(self.cfg.private_key_b58)
-                secret = bytes(kp)
-                keypair = Keypair.from_secret_key(secret)
-            except Exception:
-                keypair = Keypair.from_secret_key(base64.b64decode(self.cfg.private_key_b58))
-            tx.sign(keypair)
-            sig = client.send_raw_transaction(tx.serialize(), skip_preflight=False).value
-            return ("sent", str(sig))
-        except Exception as e:
-            return ("error", f"Invio fallito: {e}")
 
 # =============================== App Config/UI =================================
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
@@ -196,7 +42,7 @@ if "last_refresh_ts" not in st.session_state:
 with st.sidebar:
     st.header("Impostazioni")
 
-    # --- Start/Stop ---
+    # --- Start/Stop fetch/refresh ---
     st.subheader("Esecuzione")
     col_run1, col_run2 = st.columns(2)
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
@@ -205,7 +51,6 @@ with st.sidebar:
         st.rerun()
     if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
         st.session_state["app_running"] = False
-        st.session_state["live_positions"] = {}
         st.toast("Esecuzione in pausa", icon="⏸️")
         st.rerun()
 
@@ -221,6 +66,7 @@ with st.sidebar:
     )
     st.caption(f"Proxy ticket (USD): {PROXY_TICKET:.0f} • Refresh: {REFRESH_SEC}s")
 
+    # Watchlist
     st.divider()
     st.subheader("Watchlist")
     wl_default = os.getenv("WATCHLIST", "")
@@ -228,11 +74,13 @@ with st.sidebar:
                                     help="Es: WIF,BONK,So111...,<pairAddress>", key="watchlist_input")
     watchlist_only = st.toggle("Mostra solo watchlist", value=False, key="watchlist_only")
 
+    # Volume 24h filtro “strategico” (solo dataset generale, NO trading)
     st.divider()
-    st.subheader("Filtro Volume 24h (USD) — strategia")
+    st.subheader("Filtro Volume 24h (USD) — dataset")
     vol24_min = st.number_input("Volume 24h MIN", min_value=0, value=st.session_state.get("vol24_min", 0), step=10000, key="vol24_min")
     vol24_max = st.number_input("Volume 24h MAX (0 = illimitato)", min_value=0, value=st.session_state.get("vol24_max", 0), step=100000, key="vol24_max")
 
+    # Meme Score (per ranking tabella)
     st.divider()
     st.subheader("Meme Score")
     sort_by_meme = st.toggle("Ordina per Meme Score (desc)", value=True)
@@ -245,7 +93,7 @@ with st.sidebar:
         w_liq    = st.slider("Peso: Sweet spot di Liquidity", 0, 100, 20)
         w_dex    = st.slider("Peso: DEX (Raydium > altri)", 0, 100, 15)
 
-    # --- DEX consentiti ---
+    # DEX consentiti (per diagnostica)
     allowed_dex = st.multiselect(
         "DEX consentiti",
         ["raydium", "orca", "meteora", "lifinity"],
@@ -253,31 +101,29 @@ with st.sidebar:
     )
     st.session_state["allowed_dex"] = allowed_dex
 
-    # --- Tabella ---
+    # Tabella
     st.divider()
     st.subheader("Tabella")
     show_pair_age = st.toggle("Mostra 'Pair Age' (min/ore)", value=True)
     show_top10_table = st.toggle("Tabella: mostra solo Top 10 per Volume 24h", value=True)
     show_h6_fallback = st.toggle("Fallback: mostra Change H6 se H4 mancante", value=True)
 
-    # --- Filtri PAIRS (tabella) ---
+    # Filtri PAIRS (tabella)
     st.subheader("Filtri PAIRS (tabella)")
     pairs_meme_min = st.slider(
         "Meme Score min (PAIRS)", 0, 100, 0,
-        help="Applica un minimo di Meme Score alla tabella, senza influenzare la strategia (a meno che tu non scelga di farlo)."
+        help="Applica un minimo di Meme Score alla tabella."
     )
-    # Range slider Pair Age
     pairs_age_min_h, pairs_age_max_h = st.slider(
         "Pair Age (ore) — range",
         min_value=0.0, max_value=10000.0, value=(0.0, 10000.0), step=0.5,
-        help="Filtra per età della pair (in ore) solo nella tabella. Puoi opzionalmente applicarlo anche alla strategia."
+        help="Filtra per età della pair (in ore) solo nella tabella."
     )
-    # Liquidity log-range
     st.markdown("**Liquidity (USD) — range (log)**")
     pairs_liq_enable = st.toggle(
         "Abilita filtro Liquidity (tabella, log scale)",
         value=False,
-        help="Filtra SOLO la tabella PAIRS in scala log. Puoi opzionalmente applicarlo anche alla strategia."
+        help="Filtra SOLO la tabella PAIRS in scala log."
     )
     pairs_liq_exp_min, pairs_liq_exp_max = st.slider(
         "10^x (min, max) [Liquidity]",
@@ -291,12 +137,11 @@ with st.sidebar:
     else:
         st.caption("Filtro liquidity disattivato (tabella mostra tutte le liquidità).")
 
-    # Volume log-range
     st.markdown("**Volume 24h (USD) — range (log)**")
     pairs_vol_enable = st.toggle(
         "Abilita filtro Volume 24h (tabella, log scale)",
         value=False,
-        help="Filtra SOLO la tabella PAIRS in scala log. Puoi opzionalmente applicarlo anche alla strategia."
+        help="Filtra SOLO la tabella PAIRS in scala log."
     )
     pairs_vol_exp_min, pairs_vol_exp_max = st.slider(
         "10^x (min, max) [Volume 24h]",
@@ -310,23 +155,40 @@ with st.sidebar:
     else:
         st.caption("Filtro volume disattivato (tabella mostra tutti i volumi).")
 
-    # ---- NOVITÀ: Applicazione facoltativa dei filtri PAIRS alla strategia ----
+    # Applicazione facoltativa filtri PAIRS anche alla diagnostica
     st.divider()
-    st.subheader("Applicazione filtri PAIRS → Strategia")
+    st.subheader("Applica filtri PAIRS → Diagnostica")
     pairs_filters_to_strategy = st.toggle(
-        "Applica i filtri PAIRS anche alla strategia",
+        "Applica i filtri PAIRS anche alla diagnostica",
         value=False,
-        help="Se attivo, puoi selezionare quali filtri PAIRS impattano anche l'universo della strategia."
+        help="Se attivo, scegli quali filtri PAIRS impattano anche la diagnostica (NO trading)."
     )
     col_apply1, col_apply2 = st.columns(2)
     with col_apply1:
-        apply_meme_to_strat = st.checkbox("Meme Score min → strategia", value=True, disabled=not pairs_filters_to_strategy)
-        apply_age_to_strat  = st.checkbox("Pair Age range → strategia", value=True, disabled=not pairs_filters_to_strategy)
+        apply_meme_to_strat = st.checkbox("Meme Score min → diagnostica", value=True, disabled=not pairs_filters_to_strategy)
+        apply_age_to_strat  = st.checkbox("Pair Age range → diagnostica", value=True, disabled=not pairs_filters_to_strategy)
     with col_apply2:
-        apply_liq_to_strat  = st.checkbox("Liquidity (log) → strategia", value=False, disabled=not pairs_filters_to_strategy)
-        apply_vol_to_strat  = st.checkbox("Volume 24h (log) → strategia", value=False, disabled=not pairs_filters_to_strategy)
-    st.caption("Suggerimento: lascia OFF il volume log sulla strategia se stai già usando il filtro Volume 24h (MIN/MAX) in alto.")
+        apply_liq_to_strat  = st.checkbox("Liquidity (log) → diagnostica", value=False, disabled=not pairs_filters_to_strategy)
+        apply_vol_to_strat  = st.checkbox("Volume 24h (log) → diagnostica", value=False, disabled=not pairs_filters_to_strategy)
 
+    # Parametri diagnostici (ex strategia) — NO trading
+    st.divider()
+    st.subheader("Parametri diagnostici (NO trading)")
+    strat_meme     = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 70), key="strat_meme")
+    strat_txns     = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 250), step=25, key="strat_txns")
+    strat_turnover = st.number_input("Turnover minimo (Vol24h / Liq)", min_value=0.0, value=float(st.session_state.get("strat_turnover", 1.2)), step=0.1, key="strat_turnover")
+    colh1, colh2 = st.columns(2)
+    with colh1:
+        heat_topN = st.number_input("Heat TopN (per volume)", min_value=3, max_value=20, value=int(st.session_state.get("heat_topN", 10)), step=1, key="heat_topN")
+    with colh2:
+        heat_avg  = st.number_input("Heat: media Txns1h minima", min_value=0, value=int(st.session_state.get("strat_heat_avg", 120)), step=10, key="strat_heat_avg")
+    colchg1, colchg2 = st.columns(2)
+    with colchg1:
+        chg_min = st.number_input("Change 24h minimo (%)", value=-8, step=1, key="chg_min")
+    with colchg2:
+        chg_max = st.number_input("Change 24h massimo (%)", value=180, step=10, key="chg_max")
+
+    # Alert Telegram (su tabella)
     st.divider()
     st.subheader("Alert Telegram (tabella)")
     TELEGRAM_BOT_TOKEN = st.text_input("Bot Token", value=os.getenv("TELEGRAM_BOT_TOKEN",""), type="password")
@@ -347,106 +209,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Errore Telegram: {e}")
     if st.button("Test Telegram"): _tg_send_test()
-
-    st.divider()
-    st.subheader("Trading (Paper)")
-    preset = st.selectbox("Preset strategia", ["Prudente","Neutra","Aggressiva"], index=1)
-    if st.button("Applica preset"):
-        if preset == "Prudente":
-            st.session_state.update({"pos_usd":30.0,"max_pos":2,"stop_pct":25,"tp_pct":60,"trail_pct":15,"day_loss":150.0,
-                                     "strat_meme":75,"strat_txns":250,"strat_turnover":1.4,"strat_heat_avg":140})
-        elif preset == "Neutra":
-            st.session_state.update({"pos_usd":50.0,"max_pos":3,"stop_pct":20,"tp_pct":40,"trail_pct":15,"day_loss":200.0,
-                                     "strat_meme":65,"strat_txns":200,"strat_turnover":1.2,"strat_heat_avg":120})
-        else:
-            st.session_state.update({"pos_usd":60.0,"max_pos":4,"stop_pct":18,"tp_pct":35,"trail_pct":12,"day_loss":250.0,
-                                     "strat_meme":55,"strat_txns":150,"strat_turnover":1.0,"strat_heat_avg":100})
-        st.rerun()
-
-    colA, colB = st.columns(2)
-    with colA:
-        pos_usd = st.number_input("Posizione fissa (USD)", min_value=10.0, value=st.session_state.get("pos_usd", 50.0), step=10.0, key="pos_usd")
-        max_pos = st.number_input("Max posizioni aperte", min_value=1, value=st.session_state.get("max_pos", 3), step=1, key="max_pos")
-        stop_pct = st.slider("Stop Loss %", 5, 60, st.session_state.get("stop_pct", 20), key="stop_pct")
-    with colB:
-        tp_pct   = st.slider("Take Profit %", 10, 200, st.session_state.get("tp_pct", 40), key="tp_pct")
-        trail_pct= st.slider("Trailing %", 5, 60, st.session_state.get("trail_pct", 15), key="trail_pct")
-        day_loss = st.number_input("Daily loss limit (USD)", min_value=50.0, value=st.session_state.get("day_loss", 200.0), step=50.0, key="day_loss")
-
-    # Direzione + multipli
-    direction = st.selectbox(
-        "Direzione",
-        ["Long only", "Short only (paper)", "Long & Short (paper)"],
-        index=0,
-        help="Short e Both sono solo in modalità paper. Per short live servono perps (Drift/Mango)."
-    )
-    use_r_mult = st.toggle("TP a R-multiple", value=True, help="Abilita TP basati su multipli di R (dove R = Stop Loss %).")
-    tp_r_mult  = st.number_input("R-multiple base (es. 2R)", min_value=1.0, value=2.0, step=0.5)
-
-    st.markdown("**Partial Take Profit (2R)**")
-    ptp_enable = st.toggle("Chiudi 50% a 2R e lascia correre", value=True,
-                           help="A 2×R chiude la frazione e alza lo stop a BE+lock.")
-    ptp_frac = st.slider("Frazione a 2R", 0.1, 0.9, 0.5, 0.05)
-
-    st.markdown("**Scale extra**")
-    ptp_extra_mode = st.selectbox(
-        "Modalità scala",
-        ["Nessuna", "Runner 3R", "3R + 5R (25% / 25%)"],
-        index=0,
-        help="Aggiunge scalini extra oltre al 2R."
-    )
-    runner_3r_frac = 0.25
-    if ptp_extra_mode == "Runner 3R":
-        runner_3r_frac = st.slider("Frazione a 3R (runner)", 0.1, 0.9, 0.25, 0.05)
-
-    st.markdown("**Strategia V2 — parametri chiave**")
-    strat_meme     = st.slider("Soglia Meme Score", 0, 100, st.session_state.get("strat_meme", 70), key="strat_meme")
-    strat_txns     = st.number_input("Soglia Txns 1h", min_value=0, value=st.session_state.get("strat_txns", 250), step=25, key="strat_txns")
-    strat_turnover = st.number_input("Turnover minimo (Vol24h / Liq)", min_value=0.0, value=float(st.session_state.get("strat_turnover", 1.2)), step=0.1, key="strat_turnover")
-    colh1, colh2 = st.columns(2)
-    with colh1:
-        heat_topN = st.number_input("Heat TopN (per volume)", min_value=3, max_value=20, value=int(st.session_state.get("heat_topN", 10)), step=1, key="heat_topN")
-    with colh2:
-        heat_avg  = st.number_input("Heat: media Txns1h minima", min_value=0, value=int(st.session_state.get("strat_heat_avg", 120)), step=10, key="strat_heat_avg")
-    colchg1, colchg2 = st.columns(2)
-    with colchg1:
-        chg_min = st.number_input("Change 24h minimo (%)", value=-8, step=1, key="chg_min")
-    with colchg2:
-        chg_max = st.number_input("Change 24h massimo (%)", value=180, step=10, key="chg_max")
-
-    st.markdown("**Regole anti-duplicato & timing**")
-    colx1, colx2, colx3 = st.columns(3)
-    with colx1:
-        max_per_symbol = st.number_input("Max per simbolo", min_value=1, value=int(st.session_state.get("max_per_symbol", 1)), step=1, key="max_per_symbol")
-    with colx2:
-        cooldown_min = st.number_input("Cooldown (min)", min_value=0, value=int(st.session_state.get("cooldown_min", 20)), step=5, key="cooldown_min")
-    with colx3:
-        time_stop_min = st.number_input("Time-stop (min, 0=off)", min_value=0, value=int(st.session_state.get("time_stop_min", 60)), step=5, key="time_stop_min")
-
-    st.markdown("**Break-even lock (difesa profitto)**")
-    colbe1, colbe2, colbe3 = st.columns(3)
-    with colbe1:
-        be_trig = st.slider("Trigger BE (%)", 5, 40, 10, key="be_trig")
-    with colbe2:
-        be_lock = st.slider("Lock minimo (%)", 0, 20, 2, key="be_lock")
-    with colbe3:
-        dd_lock = st.slider("Drawdown lock (%)", 2, 30, 6, key="dd_lock")
-
-    colp1, colp2 = st.columns(2)
-    with colp1:
-        allow_pyr = st.toggle("Abilita pyramiding", value=bool(st.session_state.get("allow_pyr", False)), key="allow_pyr")
-    with colp2:
-        add_on_pct = st.slider("Trigger add-on (%)", 1, 25, int(st.session_state.get("add_on_pct", 8)), key="add_on_pct",
-                               help="Apre un'add-on solo se il prezzo è a favore di almeno questa %")
-
-    st.divider()
-    st.subheader("Live Trading (Jupiter)")
-    live_mode = st.selectbox("Modalità", ["off","deeplink","autosign"], index=0,
-                             help="Deeplink: confermi dal wallet. Autosign: firma e invia (solo su macchina tua, non cloud).")
-    slip_bps  = st.number_input("Slippage (bps)", min_value=10, value=100, step=10)
-    rpc_url   = st.text_input("RPC URL (solo autosign)", value=os.getenv("SOL_RPC_URL",""))
-    pub_key   = st.text_input("WALLET Public Key (solo autosign)", value=os.getenv("WALLET_PUB",""))
-    priv_b58  = st.text_input("WALLET Private Key (base58) • NON su cloud", value=os.getenv("WALLET_PRIV",""), type="password")
 
 # ---------- Stato: mostra DOPO i bottoni ----------
 running = bool(st.session_state.get("app_running", True))
@@ -545,15 +307,12 @@ def safe_sort(df, col, ascending=False):
     if df is None or df.empty or col not in df.columns: return df
     return df.sort_values(by=[col], ascending=ascending)
 
-# ---- Cast sicuri
 def to_float0(x, default=0.0):
     if x is None:
         return default
     try:
         v = float(x)
-        if not math.isfinite(v):
-            return default
-        return v
+        return v if math.isfinite(v) else default
     except (TypeError, ValueError):
         try:
             s = str(x).replace(",", "").strip().replace("%", "")
@@ -599,7 +358,7 @@ def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     local_weights = tuple(weights or (w_symbol, w_age, w_txns, w_liq, w_dex))
     f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq( (liq or 0.0), liq_min_sweet, liq_max_sweet) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
          local_weights[4]*score_dex(dex))
     return round(100.0 * f / max(1e-6, sum(local_weights)))
 
@@ -627,7 +386,7 @@ df_provider, ts = provider.get_snapshot()
 codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
-# Watchlist & Volume (strategia base) pipeline
+# Watchlist & Volume filtro dataset
 df_view = df_provider.copy()
 pre_count = len(df_view)
 
@@ -652,12 +411,12 @@ if st.session_state.get("watchlist_only", False) and not df_view.empty:
     df_view = df_view[mask].reset_index(drop=True)
 post_watch_count = len(df_view)
 
-# Filtro Volume 24h (strategia, MIN/MAX)
+# Filtro Volume 24h (dataset, non tabella)
 vmin = int(st.session_state.get("vol24_min", 0))
 vmax = int(st.session_state.get("vol24_max", 0))
 if not df_view.empty:
     vol_series = pd.to_numeric(df_view["volume24hUsd"], errors="coerce").fillna(0)
-    mask_vol = (vol_series >= vmin) & ((vol_series <= vmax) if vmax > 0 else True)
+    mask_vol = (vol_series >= vmin) & ((vmax == 0) | (vol_series <= vmax))
     df_view = df_view[mask_vol].reset_index(drop=True)
 post_vol_count = len(df_view)
 
@@ -672,7 +431,6 @@ if (not vol24_avg or vol24_avg == 0) and (tx1h_avg and tx1h_avg > 0):
     vol24_avg = tx1h_avg * 24 * PROXY_TICKET
 
 # ---------------- Nuove coin — Birdeye + Fallback ----------------
-BIRDEYE_URL = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
 be_headers = {"accept": "application/json"}
 be_key = os.getenv("BE_API_KEY","")
 if be_key: be_headers["x-api-key"] = be_key
@@ -698,7 +456,8 @@ if bird_ok and bird_tokens:
     new_liq_values = [liquidity_from_birdeye_token(t) for t in bird_tokens[:20]]
     new_liq_values = [v for v in new_liq_values if v is not None]
 else:
-    recents = df_provider.sort_values(by=["pairCreatedAt"], ascending=False).head(20) if (df_provider is not None and not df_provider.empty and "pairCreatedAt" in df_provider.columns) else pd.DataFrame(columns=["liquidityUsd"])
+    recents = safe_sort(df_provider, "pairCreatedAt", ascending=False)
+    recents = recents.head(20) if recents is not None and not recents.empty else pd.DataFrame(columns=["liquidityUsd","baseSymbol"])
     liq_series = recents.get("liquidityUsd", pd.Series(dtype=float))
     new_liq_values = [float(x) for x in liq_series.tolist() if pd.notna(x)]
 new_liq_avg = (sum(new_liq_values)/len(new_liq_values)) if new_liq_values else None
@@ -719,7 +478,7 @@ with c2: st.metric("Volume 24h medio Top 10", fmt_int(vol24_avg))
 with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
-# ---------------- Tabella pairs & Meme Score ----------------
+# ---------------- Tabella PAIRS ----------------
 def _first_or_none(d, keys):
     for k in keys:
         try:
@@ -771,7 +530,6 @@ def build_table(df):
             nested_key="priceChange",
             nested_candidates=("h1","1h","m60","60m")
         )
-
         chg_4h = _get_change_pct(
             r,
             flat_keys=["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"],
@@ -785,7 +543,6 @@ def build_table(df):
                 nested_key="priceChange",
                 nested_candidates=("h6","6h","m360","360m")
             )
-
         chg_24h = _get_change_pct(
             r,
             flat_keys=["priceChange24hPct","priceChangeH24Pct","pc24h","priceChange24h"],
@@ -806,7 +563,7 @@ def build_table(df):
             "Change 24h (%)": chg_24h,
             "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
             "Pair Age": fmt_age(ageh),
-            "PairAgeHours": (float(ageh) if ageh is not None else None),  # per filtri tabella/strategia opzionali
+            "PairAgeHours": (float(ageh) if ageh is not None else None),  # per filtri tabella/diagnostica opzionali
             "Link": r.get("url",""),
             "Base Address": r.get("baseAddress",""),
             "baseSymbol": r.get("baseSymbol",""),
@@ -819,51 +576,81 @@ def build_table(df):
 
 df_pairs = build_table(df_view)
 
-# === Filtri SOLO tabella (non influiscono sulla strategia a meno che scelto) ===
+# === Filtri SOLO tabella ===
 df_pairs_table = df_pairs.copy()
 
-# Meme Score min (tabella)
 if not df_pairs_table.empty and pairs_meme_min > 0:
     df_pairs_table = df_pairs_table[
         pd.to_numeric(df_pairs_table["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)
     ]
 
-# PairAgeHours range (ore)
 if not df_pairs_table.empty and "PairAgeHours" in df_pairs_table.columns:
-    age_series_tbl = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce")
-    lo, hi = float(pairs_age_min_h), float(pairs_age_max_h)
-    df_pairs_table = df_pairs_table[age_series_tbl.between(lo, hi, inclusive="both")]
+    age_series = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce")
+    df_pairs_table = df_pairs_table[age_series.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
 
-# Liquidity (USD) — log filter tabella
 if pairs_liq_enable and not df_pairs_table.empty and "Liquidity (USD)" in df_pairs_table.columns:
-    liq_series_tbl = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
-    df_pairs_table = df_pairs_table[(liq_series_tbl >= pairs_liq_min) & (liq_series_tbl <= pairs_liq_max)]
+    liq_series = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
+    df_pairs_table = df_pairs_table[(liq_series >= pairs_liq_min) & (liq_series <= pairs_liq_max)]
 
-# Volume 24h — log filter tabella
 if pairs_vol_enable and not df_pairs_table.empty and "Volume 24h (USD)" in df_pairs_table.columns:
     vol_series_tbl = pd.to_numeric(df_pairs_table["Volume 24h (USD)"], errors="coerce").fillna(0)
     df_pairs_table = df_pairs_table[(vol_series_tbl >= pairs_vol_min) & (vol_series_tbl <= pairs_vol_max)]
 
-# === Filtri opzionali anche sulla strategia ===
-df_pairs_strategy = df_pairs.copy()
-if pairs_filters_to_strategy and not df_pairs_strategy.empty:
-    # Meme Score → strategia
+# === Filtri opzionali anche sulla diagnostica ===
+df_pairs_diag = df_pairs.copy()
+if pairs_filters_to_strategy and not df_pairs_diag.empty:
     if apply_meme_to_strat and pairs_meme_min > 0:
-        df_pairs_strategy = df_pairs_strategy[
-            pd.to_numeric(df_pairs_strategy["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)
+        df_pairs_diag = df_pairs_diag[
+            pd.to_numeric(df_pairs_diag["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)
         ]
-    # Pair Age → strategia
-    if apply_age_to_strat and "PairAgeHours" in df_pairs_strategy.columns:
-        age_series_str = pd.to_numeric(df_pairs_strategy["PairAgeHours"], errors="coerce")
-        df_pairs_strategy = df_pairs_strategy[age_series_str.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
-    # Liquidity (log) → strategia
-    if apply_liq_to_strat and pairs_liq_enable and "Liquidity (USD)" in df_pairs_strategy.columns:
-        liq_series_str = pd.to_numeric(df_pairs_strategy["Liquidity (USD)"], errors="coerce").fillna(0)
-        df_pairs_strategy = df_pairs_strategy[(liq_series_str >= pairs_liq_min) & (liq_series_str <= pairs_liq_max)]
-    # Volume 24h (log) → strategia
-    if apply_vol_to_strat and pairs_vol_enable and "Volume 24h (USD)" in df_pairs_strategy.columns:
-        vol_series_str = pd.to_numeric(df_pairs_strategy["Volume 24h (USD)"], errors="coerce").fillna(0)
-        df_pairs_strategy = df_pairs_strategy[(vol_series_str >= pairs_vol_min) & (vol_series_str <= pairs_vol_max)]
+    if apply_age_to_strat and "PairAgeHours" in df_pairs_diag.columns:
+        age_series_str = pd.to_numeric(df_pairs_diag["PairAgeHours"], errors="coerce")
+        df_pairs_diag = df_pairs_diag[age_series_str.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
+    if apply_liq_to_strat and pairs_liq_enable and "Liquidity (USD)" in df_pairs_diag.columns:
+        liq_series_str = pd.to_numeric(df_pairs_diag["Liquidity (USD)"], errors="coerce").fillna(0)
+        df_pairs_diag = df_pairs_diag[(liq_series_str >= pairs_liq_min) & (liq_series_str <= pairs_liq_max)]
+    if apply_vol_to_strat and pairs_vol_enable and "Volume 24h (USD)" in df_pairs_diag.columns:
+        vol_series_str = pd.to_numeric(df_pairs_diag["Volume 24h (USD)"], errors="coerce").fillna(0)
+        df_pairs_diag = df_pairs_diag[(vol_series_str >= pairs_vol_min) & (vol_series_str <= pairs_vol_max)]
+
+# --- Pillola riassuntiva: Filtri PAIRS applicati alla diagnostica ---
+df_pairs_used = df_pairs_diag if (pairs_filters_to_strategy) else df_pairs
+def _fmt_exp_range(lo_exp, hi_exp):
+    try:
+        return f"10^{lo_exp:g}–10^{hi_exp:g}"
+    except Exception:
+        return f"10^{lo_exp}–10^{hi_exp}"
+
+applied = []
+if pairs_filters_to_strategy:
+    if apply_meme_to_strat and int(pairs_meme_min) > 0:
+        applied.append(f"Meme ≥ {int(pairs_meme_min)}")
+    if apply_age_to_strat and (float(pairs_age_min_h) > 0.0 or float(pairs_age_max_h) < 10000.0):
+        applied.append(f"Age {pairs_age_min_h:g}–{pairs_age_max_h:g}h")
+    if apply_liq_to_strat and pairs_liq_enable and (pairs_liq_exp_min > 0.0 or pairs_liq_exp_max < 12.0):
+        applied.append(f"Liq {_fmt_exp_range(pairs_liq_exp_min, pairs_liq_exp_max)}")
+    if apply_vol_to_strat and pairs_vol_enable and (pairs_vol_exp_min > 0.0 or pairs_vol_exp_max < 12.0):
+        applied.append(f"Vol24 {_fmt_exp_range(pairs_vol_exp_min, pairs_vol_exp_max)}")
+
+base_n = 0 if df_pairs is None or df_pairs.empty else len(df_pairs)
+used_n = 0 if df_pairs_used is None or df_pairs_used.empty else len(df_pairs_used)
+pct = (used_n / base_n * 100.0) if base_n > 0 else 0.0
+
+if pairs_filters_to_strategy:
+    if applied:
+        st.success(
+            f"**PAIRS→Diagnostica: ON** • Filtri attivi: " + ", ".join(applied) +
+            f" • Universo: **{used_n}/{base_n}** (≈ {pct:.1f}%)",
+            icon="🧠"
+        )
+    else:
+        st.info(
+            f"**PAIRS→Diagnostica: ON** • Nessun filtro effettivo (range completi/valori neutri). "
+            f"Universo: **{used_n}/{base_n}** (≈ {pct:.1f}%)",
+            icon="ℹ️"
+        )
+else:
+    st.caption("PAIRS→Diagnostica: **OFF** — i filtri PAIRS impattano solo **Tabella/Top 10**, non la diagnostica.")
 
 # ---------------- Charts (usano la tabella filtrata) ----------------
 left, right = st.columns(2)
@@ -921,7 +708,7 @@ if not df_pairs_table.empty:
 else:
     st.caption("Nessuna coppia disponibile con i filtri attuali.")
 
-# ---------------- Diagnostica Strategia ----------------
+# ---------------- Diagnostica mercato (NO trading) ----------------
 def market_heat_value(df: pd.DataFrame, topN: int) -> float:
     if df is None or df.empty:
         return 0.0
@@ -930,19 +717,15 @@ def market_heat_value(df: pd.DataFrame, topN: int) -> float:
     top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(topN)))
     return float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
 
-st.markdown("### Diagnostica strategia")
-df_pairs_used = df_pairs_strategy if (pairs_filters_to_strategy) else df_pairs
+st.markdown("### Diagnostica mercato")
 if df_pairs_used is None or df_pairs_used.empty:
-    if pairs_filters_to_strategy:
-        st.warning("Universo strategia vuoto dopo l'applicazione dei filtri PAIRS alla strategia. Allarga i range o disattiva l'opzione.")
-    else:
-        st.caption("Nessuna coppia post-filtri provider/watchlist/volume.")
+    st.caption("Nessuna coppia post-filtri (provider/watchlist/volume e, se attivo, PAIRS→Diagnostica).")
 else:
     heat_val = market_heat_value(df_pairs_used, int(st.session_state.get("heat_topN", 10)))
     heat_thr = float(st.session_state.get("strat_heat_avg", 120))
     st.caption(f"Market heat (media **Txns1h** top {int(st.session_state.get('heat_topN', 10))} per **Volume 24h**): "
                f"**{int(heat_val)}** vs soglia **{int(heat_thr)}** → "
-               f"{'OK ✅' if heat_val >= heat_thr else 'BLOCCO ⛔️'}")
+               f"{'OK ✅' if heat_val >= heat_thr else 'BASSO 🔻'}")
 
     s = df_pairs_used.copy()
     total = len(s)
@@ -977,189 +760,7 @@ else:
     cols[6].metric("Turnover OK", c_turn)
     cols[7].metric("Change24 OK", c_chg)
 
-# === Adaptive Relax ============================================================
-def _count_candidates(df: pd.DataFrame, cfg) -> int:
-    if df is None or df.empty:
-        return 0
-    def _reasons(row):
-        reasons = []
-        try:
-            liq = float(row.get("Liquidity (USD)", 0) or 0)
-            vol = float(row.get("Volume 24h (USD)", 0) or 0)
-            tx1 = int(row.get("Txns 1h", 0) or 0)
-            meme = int(row.get("Meme Score", 0) or 0)
-            chg = row.get("Change 24h (%)", None); chg = float(chg) if chg is not None else 0.0
-            dex = str(row.get("DEX", "")).lower()
-        except Exception:
-            return ["parse"]
-        if not (float(cfg.liq_min) <= liq <= float(cfg.liq_max)): reasons.append("liq")
-        if cfg.allow_dex and len(cfg.allow_dex) > 0 and dex not in cfg.allow_dex: reasons.append("dex")
-        if meme < int(cfg.meme_score_min): reasons.append("meme")
-        if tx1 < int(cfg.txns1h_min): reasons.append("tx1h")
-        turnover = (vol / max(1.0, liq)) if liq > 0 else 0.0
-        if turnover < float(cfg.turnover_min): reasons.append("turnover")
-        if chg < float(cfg.chg24_min) or chg > float(cfg.chg24_max): reasons.append("chg24")
-        return reasons
-    return sum(1 for _, r in df.iterrows() if len(_reasons(r)) == 0)
-
-def relax_strategy_if_empty(df: pd.DataFrame, cfg):
-    allowed = tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))
-    base = dict(
-        allow_dex=allowed,
-        heat_tx1h_topN=cfg.heat_tx1h_topN,
-        heat_tx1h_avg_min=cfg.heat_tx1h_avg_min,
-    )
-    steps = [
-        cfg,
-        StratConfig(**base, meme_score_min=max(0, int(cfg.meme_score_min) - 10),
-                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
-        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
-                    txns1h_min=max(0, int(cfg.txns1h_min * 0.8)), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
-        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
-                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-                    turnover_min=max(0.0, float(cfg.turnover_min) * 0.8), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
-        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
-                    txns1h_min=int(cfg.txns1h_min), liq_min=max(0.0, float(cfg.liq_min) * 0.5), liq_max=float(cfg.liq_max) * 1.5,
-                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min), chg24_max=float(cfg.chg24_max)),
-        StratConfig(**base, meme_score_min=int(cfg.meme_score_min),
-                    txns1h_min=int(cfg.txns1h_min), liq_min=float(cfg.liq_min), liq_max=float(cfg.liq_max),
-                    turnover_min=float(cfg.turnover_min), chg24_min=float(cfg.chg24_min) - 10, chg24_max=float(cfg.chg24_max) + 50),
-    ]
-    chosen = steps[0]
-    for i, c in enumerate(steps):
-        if _count_candidates(df, c) > 0:
-            chosen = c
-            if i > 0: st.info(f"Adaptive relax attivo: step {i} (soglie alleggerite).")
-            break
-    return chosen
-
-# ---------------- Trading (Paper) ----------------
-st.markdown("## 🧪 Trading — Paper Mode")
-
-# Costruisci scale extra per partial TP
-extra_scales = []
-if ptp_extra_mode == "Runner 3R":
-    extra_scales = [(3.0, float(runner_3r_frac))]
-elif ptp_extra_mode == "3R + 5R (25% / 25%)":
-    extra_scales = [(3.0, 0.25), (5.0, 0.25)]
-
-r_cfg = RiskConfig(
-    position_usd=float(st.session_state.get("pos_usd",50.0)),
-    max_positions=int(st.session_state.get("max_pos",3)),
-    stop_loss_pct=float(st.session_state.get("stop_pct",20))/100.0,
-    take_profit_pct=float(st.session_state.get("tp_pct",40))/100.0,
-    trailing_pct=float(st.session_state.get("trail_pct",15))/100.0,
-    daily_loss_limit_usd=float(st.session_state.get("day_loss",200.0)),
-    max_positions_per_symbol=int(st.session_state.get("max_per_symbol",1)),
-    symbol_cooldown_min=int(st.session_state.get("cooldown_min",20)),
-    allow_pyramiding=bool(st.session_state.get("allow_pyr", False)),
-    pyramid_add_on_trigger_pct=float(st.session_state.get("add_on_pct",8))/100.0,
-    time_stop_min=int(st.session_state.get("time_stop_min",60)),
-    be_trigger_pct=float(st.session_state.get("be_trig",10))/100.0,
-    be_lock_profit_pct=float(st.session_state.get("be_lock",2))/100.0,
-    dd_lock_pct=float(st.session_state.get("dd_lock",6))/100.0,
-
-    direction=("long" if direction.startswith("Long only") else ("short" if direction.startswith("Short") else "both")),
-    use_r_multiple=bool(use_r_mult),
-    tp_r_multiple=float(tp_r_mult),
-
-    partial_tp_enable=bool(ptp_enable),
-    partial_tp_fraction=float(ptp_frac),
-    partial_scales=extra_scales,
-)
-
-s_cfg = StratConfig(
-    meme_score_min=int(st.session_state.get("strat_meme",70)),
-    txns1h_min=int(st.session_state.get("strat_txns",250)),
-    liq_min=float(liq_min_sweet),
-    liq_max=float(liq_max_sweet),
-    turnover_min=float(st.session_state.get("strat_turnover",1.2)),
-    chg24_min=float(st.session_state.get("chg_min",-8)),
-    chg24_max=float(st.session_state.get("chg_max",180)),
-    allow_dex=tuple(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])),
-    heat_tx1h_topN=int(st.session_state.get("heat_topN",10)),
-    heat_tx1h_avg_min=float(st.session_state.get("strat_heat_avg",120)),
-)
-
-# Applica relax sul dataset che userà la strategia (df_pairs_used)
-df_pairs_used = df_pairs_strategy if (pairs_filters_to_strategy) else df_pairs
-active_s_cfg = s_cfg
-if df_pairs_used is not None and not df_pairs_used.empty:
-    active_s_cfg = relax_strategy_if_empty(df_pairs_used, s_cfg)
-
-# Init/aggiorna engine
-if "trade_engine" not in st.session_state or st.session_state["trade_engine"] is None:
-    st.session_state["trade_engine"] = TradeEngine(r_cfg, active_s_cfg, bm_check=None, sent_check=None)
-else:
-    eng_tmp = st.session_state["trade_engine"]
-    eng_tmp.risk.cfg = r_cfg
-    eng_tmp.strategy.cfg = active_s_cfg
-    eng_tmp.bm_check = None
-    eng_tmp.sent_check = None
-
-eng = st.session_state["trade_engine"]
-
-# Esecuzione step strategia
-if df_pairs_used is None or df_pairs_used.empty:
-    if pairs_filters_to_strategy:
-        st.info("Strategia in attesa: i filtri PAIRS (applicati alla strategia) non hanno prodotto candidati.")
-    else:
-        st.info("Nessun dato per la strategia al momento.")
-    df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
-else:
-    if running:
-        df_signals, df_open, df_closed = eng.step(df_pairs_used)
-    else:
-        df_signals = pd.DataFrame(); df_open = pd.DataFrame(); df_closed = pd.DataFrame()
-        st.info("Strategia in pausa — premi ▶️ Start per riattivare.")
-
-st.markdown("**Segnali (candidati all'ingresso)**")
-if not df_signals.empty: st.dataframe(df_signals.head(12), use_container_width=True)
-else: st.caption("Nessun segnale valido con i parametri attuali.")
-
-st.markdown("**Posizioni aperte (Paper)**")
-if not df_open.empty:
-    cols = st.columns([3,2,2,2,2,2,2])
-    cols[0].write("Pair"); cols[1].write("Entry"); cols[2].write("Last"); cols[3].write("PnL $"); cols[4].write("PnL %"); cols[5].write("Aperta da"); cols[6].write("Azioni")
-    for _, r in df_open.iterrows():
-        c = st.columns([3,2,2,2,2,2,2])
-        c[0].write(f"{r['symbol']} ({r['label']})")
-        c[1].write(f"{r['entry']:.8f}"); c[2].write(f"{r['last']:.8f}")
-        c[3].write(f"{r['pnl_usd']:.2f}"); c[4].write(f"{r['pnl_pct']*100:.2f}%"); c[5].write(r['opened_ago'])
-        if c[6].button("Chiudi", key=f"close_{r['id']}"):
-            try: px = float(r["last"]); eng.close_by_id(str(r["id"]), px)
-            except Exception: pass
-    st.caption(f"Posizioni aperte: {len(df_open)} / max {st.session_state['max_pos']}")
-else:
-    st.caption("Nessuna posizione aperta.")
-
-st.markdown("**Ultime chiusure**")
-if not df_closed.empty: st.dataframe(df_closed, use_container_width=True)
-else: st.caption("Nessuna chiusura registrata (ancora).")
-
-st.markdown("**Performance (Paper)**")
-open_pnl = float(pd.to_numeric(df_open["pnl_usd"], errors="coerce").fillna(0).sum()) if not df_open.empty else 0.0
-realized = float(eng.risk.state.daily_pnl) if eng else 0.0
-total_today = open_pnl + realized
-m1, m2, m3 = st.columns(3)
-with m1: st.metric("PnL Aperto (Unrealized)", f"{open_pnl:.2f} USD")
-with m2: st.metric("PnL Giornaliero (Realizzato)", f"{realized:.2f} USD")
-with m3: st.metric("Totale Oggi", f"{total_today:.2f} USD")
-
-if not df_closed.empty:
-    try:
-        pnl_series = pd.to_numeric(df_closed["pnl_usd"], errors="coerce").fillna(0).cumsum()
-        perf_df = pd.DataFrame({"Trade #": range(1, len(pnl_series)+1), "CumPnL": pnl_series})
-        figp = px.line(perf_df, x="Trade #", y="CumPnL", title="Cumulative PnL (closed)")
-        st.plotly_chart(figp, use_container_width=True)
-    except Exception:
-        st.caption("Impossibile generare la curva PnL.")
-else:
-    st.caption("Nessuna chiusura → curva PnL in attesa.")
-
-# ---------------- ALERT TELEGRAM (dalla tabella) ----------------
+# ---------------- ALERT TELEGRAM ----------------
 def tg_send(text: str) -> tuple[bool, str | None]:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
     try:
@@ -1204,106 +805,6 @@ if running and enable_alerts and (df_pairs_table is not None) and not df_pairs_t
     except Exception as e:
         st.caption(f"Alert Telegram: errore — {e}")
 
-# ---------------- LIVE MIRROR (Jupiter) ----------------
-st.markdown("#### Live Mirror")
-if "live_positions" not in st.session_state:
-    st.session_state["live_positions"] = {}  # id_trade -> dict(mints, qty_base, last_sig/url)
-
-live_cfg = LiveConfig(mode=live_mode, slippage_bps=int(slip_bps),
-                      rpc_url=rpc_url or None, public_key=pub_key or None, private_key_b58=priv_b58 or None)
-jup = JupiterConnector(live_cfg)
-
-def find_mints_for_symbol(symbol: str) -> tuple[str | None, str | None]:
-    try:
-        base_sym, quote_sym = (symbol or "").split("/", 1)
-    except Exception:
-        return (None, None)
-    hit = None
-    try:
-        dfh = df_view[(df_view["baseSymbol"]==base_sym) & (df_view["quoteSymbol"]==quote_sym)]
-        if not dfh.empty: hit = dfh.iloc[0]
-    except Exception: pass
-    base_mint = hit.get("baseAddress", None) if hit is not None else None
-    quote_mint = hit.get("quoteAddress", None) if hit is not None else None
-    if not quote_mint:
-        qs = quote_sym.upper()
-        quote_mint = MINT_USDC if qs in ("USDC","USDT") else (MINT_SOL if qs in ("SOL","WSOL") else MINT_USDC)
-    return (base_mint, quote_mint)
-
-if not running:
-    st.caption("Live: app in pausa — nessuna operazione verrà replicata finché non riattivi ▶️ Start.")
-else:
-    live_log = []
-
-    curr_ids = set()
-    if not df_open.empty and "id" in df_open.columns:
-        curr_ids = set(str(x) for x in df_open["id"].tolist())
-    prev_ids = set(st.session_state["live_positions"].keys())
-
-    # APERTURE
-    new_ids = curr_ids - prev_ids
-    for tid in list(new_ids):
-        try:
-            r = df_open[df_open["id"].astype(str) == tid].iloc[0]
-            symbol = r.get("symbol","")
-            label  = str(r.get("label","")).lower()
-            # ignora SHORT in live (spot)
-            if "short" in label:
-                live_log.append(f"SKIP LIVE (short) — {symbol}")
-                st.session_state["live_positions"][tid] = {"symbol":symbol, "skip":"short"}
-                continue
-            base_mint, quote_mint = find_mints_for_symbol(symbol)
-            if not base_mint:
-                live_log.append(f"BUY {symbol} → mint base non trovato")
-                continue
-            size_usd = float(st.session_state.get("pos_usd", 50.0))
-            px_usd   = float(r.get("entry") or r.get("last") or 0.0)
-            mode, payload = jup.build_buy(quote_mint, base_mint, size_usd, px_usd)
-            qty_base_est = size_usd / max(px_usd, 1e-9) if px_usd else 0.0
-            st.session_state["live_positions"][tid] = {"symbol":symbol, "base_mint": base_mint, "quote_mint": quote_mint,
-                                                       "qty_base": qty_base_est, "last_sig": None, "last_url": None}
-            if mode == "deeplink":
-                st.session_state["live_positions"][tid]["last_url"] = payload
-                live_log.append(f"BUY {symbol} → [Jupiter link]({payload})")
-            elif mode == "sent":
-                st.session_state["live_positions"][tid]["last_sig"] = payload
-                live_log.append(f"BUY {symbol} → tx: `{payload}`")
-            else:
-                live_log.append(f"BUY {symbol} → {payload}")
-        except Exception as e:
-            live_log.append(f"BUY error: {e}")
-
-    # CHIUSURE
-    closed_ids = prev_ids - curr_ids
-    for tid in list(closed_ids):
-        info = st.session_state["live_positions"].get(tid)
-        if not info:
-            continue
-        try:
-            if info.get("skip") == "short":
-                live_log.append("SELL (skip short live)")
-            else:
-                symbol = info.get("symbol","?")
-                base_mint = info["base_mint"]; quote_mint = info["quote_mint"]; qty_base = float(info.get("qty_base", 0))
-                mode, payload = jup.build_sell(base_mint, quote_mint, qty_base)
-                if mode == "deeplink":
-                    live_log.append(f"SELL {symbol} → [Jupiter link]({payload})")
-                elif mode == "sent":
-                    live_log.append(f"SELL {symbol} → tx: `{payload}`")
-                else:
-                    live_log.append(f"SELL {symbol} → {payload}")
-        except Exception as e:
-            live_log.append(f"SELL error: {e}")
-        finally:
-            st.session_state["live_positions"].pop(tid, None)
-
-    if live_cfg.mode == "off":
-        st.caption("Live: OFF")
-    elif not live_log:
-        st.caption("Live: nessuna operazione da replicare in questo tick.")
-    else:
-        for line in live_log: st.write("• " + line)
-
 # ---------------- Diagnostica finale ----------------
 st.subheader("Diagnostica")
 d1, d2, d3, d4, d5 = st.columns(5)
@@ -1317,7 +818,7 @@ with d5:
 st.caption(
     f"Stato esecuzione: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • "
     f"TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f} • "
-    f"Filtri PAIRS→Strategia: {'ON' if pairs_filters_to_strategy else 'OFF'}"
+    f"PAIRS→Diagnostica: {'ON' if pairs_filters_to_strategy else 'OFF'}"
 )
 
 st.session_state["last_refresh_ts"] = time.time()
