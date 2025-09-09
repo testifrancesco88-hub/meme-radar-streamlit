@@ -1,5 +1,5 @@
-# streamlit_app.py — Meme Radar (no-trading) + Drill-down Social v17.0
-# - No trading: solo radar, KPI, filtri, Top10, watchlist, alert Telegram, diagnostica
+# streamlit_app.py — Meme Radar (no-trading) + Drill-down Social v19.0
+# - Radar: KPI, filtri (incl. Pair Age in ORE/MINUTI e toggle <60m), Top10, watchlist, alert Telegram, diagnostica
 # - Tabella con selezione riga → pannello "Token drill-down" (logo, quick links, mini-grafici)
 # - Social & Sito dal payload DexScreener (info.websites / info.socials)
 # - Badge affidabilità social (🛡️ strong / 🟡 weak / 🔴 suspicious) + warning se solo "other"
@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from urllib.parse import urlparse  # <— per valutazione domini social
+from urllib.parse import urlparse
 
 from market_data import MarketDataProvider
 
@@ -21,6 +21,9 @@ st.title("Solana Meme Coin Radar")
 REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
 PROXY_TICKET  = float(os.getenv("PROXY_TICKET_USD", "150"))
 BIRDEYE_URL   = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
+
+# Limite massimo per lo slider di età (in ore)
+AGE_LIMIT_HOURS = 10000.0  # ≈ 416 giorni
 
 SEARCH_QUERIES = [
     "chain:solana raydium","chain:solana orca","chain:solana meteora","chain:solana lifinity",
@@ -49,12 +52,10 @@ with st.sidebar:
     col_run1, col_run2 = st.columns(2)
     if col_run1.button("▶️ Start", disabled=st.session_state["app_running"]):
         st.session_state["app_running"] = True
-        st.toast("Esecuzione avviata", icon="✅")
-        st.rerun()
+        st.toast("Esecuzione avviata", icon="✅"); st.rerun()
     if col_run2.button("⏹ Stop", type="primary", disabled=not st.session_state["app_running"]):
         st.session_state["app_running"] = False
-        st.toast("Esecuzione in pausa", icon="⏸️")
-        st.rerun()
+        st.toast("Esecuzione in pausa", icon="⏸️"); st.rerun()
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh", value=True)
@@ -116,11 +117,46 @@ with st.sidebar:
         "Meme Score min (PAIRS)", 0, 100, 0,
         help="Applica un minimo di Meme Score alla tabella."
     )
-    pairs_age_min_h, pairs_age_max_h = st.slider(
-        "Pair Age (ore) — range",
-        min_value=0.0, max_value=10000.0, value=(0.0, 10000.0), step=0.5,
-        help="Filtra per età della pair (in ore) solo nella tabella."
-    )
+
+    # >>> Pair Age — ORE/MINUTI + toggle <60m <<<
+    st.markdown("**Pair Age — range**")
+    age_unit = st.radio("Unità", ["Ore", "Minuti"], index=0, horizontal=True, key="pairs_age_unit")
+
+    if age_unit == "Ore":
+        pairs_age_min_h, pairs_age_max_h = st.slider(
+            "Intervallo (ore)",
+            min_value=0.0, max_value=float(AGE_LIMIT_HOURS),
+            value=(0.0, float(AGE_LIMIT_HOURS)), step=0.5,
+            key="pairs_age_range_h",
+            help="Filtra per età della pair (in ore) solo nella tabella."
+        )
+        pairs_age_min_m = int(round(pairs_age_min_h * 60))
+        pairs_age_max_m = int(round(pairs_age_max_h * 60))
+    else:
+        max_min = int(AGE_LIMIT_HOURS * 60)
+        pairs_age_min_m, pairs_age_max_m = st.slider(
+            "Intervallo (minuti)",
+            min_value=0, max_value=max_min,
+            value=(0, max_min), step=1,
+            key="pairs_age_range_m",
+            help="Filtra per età della pair (in minuti) solo nella tabella."
+        )
+        # conversione interna: logica in ore
+        pairs_age_min_h = pairs_age_min_m / 60.0
+        pairs_age_max_h = pairs_age_max_m / 60.0
+
+    # Toggle one-click: solo nuovissime < 60 min
+    fresh60 = st.toggle("Solo nuovissime (< 60 min)", value=False, key="fresh60_toggle",
+                        help="Override rapido: mostra solo pair con età < 60 minuti.")
+    if fresh60:
+        pairs_age_min_h, pairs_age_max_h = 0.0, 1.0
+        pairs_age_min_m, pairs_age_max_m = 0, 60
+        st.caption("**Override attivo:** filtro età forzato a 0–60 minuti.")
+    else:
+        st.caption(f"Filtro età: {pairs_age_min_h:.2f}–{pairs_age_max_h:.2f} h  "
+                   f"({pairs_age_min_m}–{pairs_age_max_m} min)")
+
+    # ---- Liquidity log-range (solo tabella)
     st.markdown("**Liquidity (USD) — range (log)**")
     pairs_liq_enable = st.toggle(
         "Abilita filtro Liquidity (tabella, log scale)",
@@ -139,6 +175,7 @@ with st.sidebar:
     else:
         st.caption("Filtro liquidity disattivato (tabella mostra tutte le liquidità).")
 
+    # ---- Volume log-range (solo tabella)
     st.markdown("**Volume 24h (USD) — range (log)**")
     pairs_vol_enable = st.toggle(
         "Abilita filtro Volume 24h (tabella, log scale)",
@@ -538,7 +575,7 @@ def build_table(df):
             nested_key="priceChange",
             nested_candidates=("h4","4h","m240","240m")
         )
-        if chg_4h is None and show_h6_fallback:
+        if show_h6_fallback and chg_4h is None:
             chg_4h = _get_change_pct(
                 r,
                 flat_keys=["priceChange6hPct","priceChangeH6Pct","pc6h","priceChange6h"],
@@ -568,7 +605,7 @@ def build_table(df):
             "PairAgeHours": (float(ageh) if ageh is not None else None),
             "Link": r.get("url",""),
             "Base Address": r.get("baseAddress",""),
-            "Pair Address": r.get("pairAddress",""),   # per drill-down
+            "Pair Address": r.get("pairAddress",""),
             "baseSymbol": r.get("baseSymbol",""),
             "quoteSymbol": r.get("quoteSymbol",""),
         })
@@ -628,8 +665,14 @@ applied = []
 if pairs_filters_to_strategy:
     if apply_meme_to_strat and int(pairs_meme_min) > 0:
         applied.append(f"Meme ≥ {int(pairs_meme_min)}")
-    if apply_age_to_strat and (float(pairs_age_min_h) > 0.0 or float(pairs_age_max_h) < 10000.0):
-        applied.append(f"Age {pairs_age_min_h:g}–{pairs_age_max_h:g}h")
+    # Age (mostra h o m in base al toggle fresh60 / unità)
+    if apply_age_to_strat and (float(pairs_age_min_h) > 0.0 or float(pairs_age_max_h) < AGE_LIMIT_HOURS):
+        if st.session_state.get("fresh60_toggle"):
+            applied.append("Age < 60m")
+        elif st.session_state.get("pairs_age_unit", "Ore") == "Minuti":
+            applied.append(f"Age {int(pairs_age_min_m)}–{int(pairs_age_max_m)}m")
+        else:
+            applied.append(f"Age {pairs_age_min_h:g}–{pairs_age_max_h:g}h")
     if apply_liq_to_strat and pairs_liq_enable and (pairs_liq_exp_min > 0.0 or pairs_liq_exp_max < 12.0):
         applied.append(f"Liq {_fmt_exp_range(pairs_liq_exp_min, pairs_liq_exp_max)}")
     if apply_vol_to_strat and pairs_vol_enable and (pairs_vol_exp_min > 0.0 or pairs_vol_exp_max < 12.0):
@@ -768,7 +811,6 @@ if not df_pairs_table.empty:
 
     # --- Social helpers ---
     def _collect_socials(info: dict) -> dict:
-        """Raccoglie i link utili da info.websites / info.socials di DexScreener."""
         if not isinstance(info, dict):
             return {}
         links = {}
@@ -1015,8 +1057,7 @@ if not df_pairs_table.empty:
 
                 # (a) Change % per timeframe
                 try:
-                    tfs = []
-                    vals = []
+                    tfs = []; vals = []
                     for tf in ("m5","h1","h6","h24"):
                         v = _pc_val(pair, tf)
                         if v is not None:
@@ -1092,8 +1133,8 @@ else:
     c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
     c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
     if vmin is None: vmin = 0
-    if vmax > 0:
-        c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vmax))
+    if vol24_max > 0:
+        c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vol24_max))
     else:
         c_vol = cnt((s["Volume 24h (USD)"] >= vmin))
     c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
