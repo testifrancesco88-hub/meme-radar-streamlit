@@ -369,7 +369,7 @@ def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     local_weights = tuple(weights or (20,20,25,20,15))
     f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), sweet_min, sweet_max) +
          local_weights[4]*score_dex(dex))
     return round(100.0 * f / max(1e-6, sum(local_weights)))
 
@@ -552,7 +552,10 @@ def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
-        mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
+        mscore = compute_meme_score_row(
+            r, (w_symbol, w_age, w_txns, w_liq, w_dex),
+            sweet_min=liq_min_sweet, sweet_max=liq_max_sweet
+        )
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
         chg_1h = _get_change_pct(r, ["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"], "priceChange", ("h1","1h","m60","60m"))
         chg_4h = _get_change_pct(r, ["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"], "priceChange", ("h4","4h","m240","240m"))
@@ -830,7 +833,7 @@ with tab_radar:
 
         if selected_row is not None:
             pair_addr = None
-            if "Pair Address" in df_pairs.columns and pd.notna(selected_row.get("Pair Address","")):
+            if ("Pair Address" in selected_row.index) and pd.notna(selected_row.get("Pair Address","")):
                 pair_addr = str(selected_row.get("Pair Address"))
             if (not pair_addr) and isinstance(selected_row.get("Link",""), str) and "/solana/" in selected_row.get("Link",""):
                 try: pair_addr = selected_row["Link"].split("/solana/")[1].split("?")[0]
@@ -989,7 +992,7 @@ with tab_radar:
             try: return int(mask.sum())
             except Exception: return 0
         c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
-        c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
+        c_dex = cnt(s["DEX"].fillna("").str.lower().isin(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])))
         c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
         c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
         if vmin is None: vmin = 0
@@ -1235,7 +1238,7 @@ with tab_entry:
                 _liqmax = 0 if _liqmax == 0 else min(1_000_000_000, int(_liqmax * 2))
                 _agemin = max(0, _agemin - 5)
                 _agemax = min(720, _agemax + 60)
-                _cap24  = min(300, _cap_24h + 30)
+                _cap24  = min(300, _cap24 + 30)
 
                 m_tx  = (tx_col >= _tx)
                 m_liq = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
