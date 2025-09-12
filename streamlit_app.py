@@ -1221,8 +1221,10 @@ with tab_entry:
 
         dfE = dfC[mask].copy()
 
-        # Auto-relax
+        # Auto-relax (NON modifica i key dei widget per evitare StreamlitAPIException)
         relax_applied = False
+        relaxed_params = None  # per messaggio/info
+
         if auto_relax and (dfE.empty or len(dfE) < targetN):
             relax_applied = True
             _tx, _ch1min, _ch1max = int(tx_min), int(ch1_min), int(ch1_max)
@@ -1251,14 +1253,13 @@ with tab_entry:
                 if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
                 dfE = dfC[m_relaxed].copy()
                 if len(dfE) >= targetN or len(dfE) > 0:
-                    st.session_state["ef_tx_min"] = _tx
-                    st.session_state["ef_ch1_min"] = _ch1min
-                    st.session_state["ef_ch1_max"] = _ch1max
-                    st.session_state["ef_liq_min"] = _liqmin
-                    st.session_state["ef_liq_max"] = _liqmax
-                    st.session_state["ef_age_min_m"] = _agemin
-                    st.session_state["ef_age_max_m"] = _agemax
-                    st.session_state["ef_cap_24h"] = _cap24
+                    relaxed_params = {
+                        "tx_min": _tx, "ch1_min": _ch1min, "ch1_max": _ch1max,
+                        "liq_min": _liqmin, "liq_max": _liqmax,
+                        "age_min_m": _agemin, "age_max_m": _agemax,
+                        "cap_24h": _cap24
+                    }
+                    st.session_state["_ef_last_relax"] = relaxed_params  # solo info (non widget)
                     break
 
         # Diagnostica rapida
@@ -1277,12 +1278,17 @@ with tab_entry:
         if dfE.empty:
             st.warning("Nessun candidato con questi parametri. Prova un preset o allarga i range.")
         else:
-            if relax_applied:
-                st.info(f"Auto-relax applicato → Tx≥{st.session_state['ef_tx_min']}, "
-                        f"H1∈[{st.session_state['ef_ch1_min']},{st.session_state['ef_ch1_max']}]%, "
-                        f"Liq≥{st.session_state['ef_liq_min']}{' & ≤'+str(st.session_state['ef_liq_max']) if st.session_state['ef_liq_max']>0 else ''}, "
-                        f"Age {st.session_state['ef_age_min_m']}-{st.session_state['ef_age_max_m']} min, "
-                        f"24h≤{st.session_state['ef_cap_24h']}%.", icon="🪄")
+            if relax_applied and relaxed_params:
+                st.info(
+                    f"Auto-relax applicato → "
+                    f"Tx≥{relaxed_params['tx_min']}, "
+                    f"H1∈[{relaxed_params['ch1_min']},{relaxed_params['ch1_max']}]%, "
+                    f"Liq≥{relaxed_params['liq_min']}"
+                    f"{' & ≤'+str(relaxed_params['liq_max']) if relaxed_params['liq_max']>0 else ''}, "
+                    f"Age {relaxed_params['age_min_m']}-{relaxed_params['age_max_m']} min, "
+                    f"24h≤{relaxed_params['cap_24h']}%.",
+                    icon="🪄"
+                )
 
             # Reasons
             reasons = []
