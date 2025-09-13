@@ -1,8 +1,6 @@
-# streamlit_app.py — Meme Radar (no trading) + Drill-down + ROI/ATH/DD + Survivors + Winners + Equity + Entry Finder (smart+presets)
+# streamlit_app.py — Meme Radar (no trading) + Drill-down + ROI/ATH/DD + Survivors + Winners + Equity + Entry Finder (smart+presets+badge) + Telegram Alerts
 # Requisiti: streamlit, plotly, pandas, requests; file market_data.py con MarketDataProvider
-
-import os, time, math, random, datetime, threading, pickle
-from pathlib import Path
+import os, time, math, random, datetime, threading
 import pandas as pd
 import plotly.express as px
 import requests
@@ -31,18 +29,9 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Persistenza / Snapshot
-STATE_FILE   = os.getenv("STATE_FILE", "meme_radar_state.pkl")
-SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "snapshots"))
-SNAPSHOT_DIR.mkdir(exist_ok=True)
-
 # =============== Session State ===============
 if "app_running" not in st.session_state: st.session_state["app_running"] = True
 if "last_refresh_ts" not in st.session_state: st.session_state["last_refresh_ts"] = time.time()
-if "state_loaded" not in st.session_state: st.session_state["state_loaded"] = False
-if "last_autosave_ts" not in st.session_state: st.session_state["last_autosave_ts"] = 0.0
-if "last_snapshot_path" not in st.session_state: st.session_state["last_snapshot_path"] = ""
-if "autosave_debounce_until" not in st.session_state: st.session_state["autosave_debounce_until"] = 0.0
 
 # Profit metrics baseline/ath per token
 for k in ("baseline_px","ath_px"):
@@ -54,210 +43,6 @@ if "eq_init_capital" not in st.session_state: st.session_state["eq_init_capital"
 if "eq_equity" not in st.session_state: st.session_state["eq_equity"] = float(st.session_state["eq_init_capital"])
 if "eq_history" not in st.session_state: st.session_state["eq_history"] = []   # [{ts,equity,ret,n}]
 if "eq_last_prices" not in st.session_state: st.session_state["eq_last_prices"] = {}
-# Note per token
-if "token_notes" not in st.session_state: st.session_state["token_notes"] = {}
-
-# ================= Helpers =================
-def load_persistent_state():
-    try:
-        with open(STATE_FILE, "rb") as f:
-            data = pickle.load(f)
-        for k in ("baseline_px","ath_px","eq_history","eq_equity","eq_init_capital","token_notes"):
-            if k in data: st.session_state[k] = data[k]
-        st.session_state["state_loaded"] = True
-        st.toast("Stato ricaricato", icon="📦")
-    except Exception:
-        pass
-
-def save_persistent_state():
-    data = {k: st.session_state.get(k) for k in ("baseline_px","ath_px","eq_history","eq_equity","eq_init_capital","token_notes")}
-    try:
-        with open(STATE_FILE, "wb") as f:
-            pickle.dump(data, f)
-        st.toast("Stato salvato", icon="💾")
-    except Exception as e:
-        st.warning(f"Save state error: {e}")
-
-if not st.session_state.get("state_loaded"):
-    load_persistent_state()
-
-def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
-    last = (None, None)
-    for i in range(tries):
-        try:
-            r = requests.get(url, headers=headers or UA_HEADERS, timeout=15)
-            code = r.status_code
-            if r.ok: return r.json(), code
-            last = (None, code)
-            if code in (429,500,502,503,504):
-                time.sleep(base_backoff*(i+1) + random.uniform(0,0.3)); continue
-            break
-        except Exception:
-            last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
-    return last
-
-def provider_has_errors(codes_obj) -> bool:
-    try:
-        items = list(codes_obj.values()) if isinstance(codes_obj, dict) else list(codes_obj or [])
-    except Exception:
-        items = []
-    bad_set = {429, 500, 502, 503, 504}
-    for c in items:
-        try:
-            ic = int(str(c).split()[0])
-            if ic in bad_set or ic >= 500 or ic == 0:
-                return True
-        except Exception:
-            continue
-    return False
-
-def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
-
-def hours_since_ms(ms_or_s):
-    if ms_or_s is None: return None
-    try:
-        v = int(ms_or_s)
-        if v > 10_000_000_000: v = v/1000.0
-        return max(0.0, (time.time() - v) / 3600.0)
-    except Exception: return None
-
-def ms_to_dt(ms_or_s):
-    if not ms_or_s: return ""
-    try:
-        v = int(ms_or_s)
-        if v > 10_000_000_000: v = v//1000
-        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
-    except Exception: return str(ms_or_s)
-
-def fmt_age(hours):
-    if hours is None: return ""
-    if hours < 1: return f"{int(round(hours*60))}m"
-    if hours < 48:
-        h = int(hours); m = int(round((hours - h) * 60))
-        return f"{h}h {m}m"
-    d = int(hours // 24); h = int(hours % 24)
-    return f"{d}d {h}h"
-
-def safe_series_mean(s):
-    vals = []
-    for x in s:
-        try:
-            if pd.notna(x): vals.append(float(x))
-        except Exception: pass
-    return (sum(vals)/len(vals)) if vals else None
-
-def safe_sort(df, col, ascending=False):
-    if df is None or df.empty or col not in df.columns: return df
-    return df.sort_values(by=[col], ascending=ascending)
-
-def to_float0(x, default=0.0):
-    if x is None: return default
-    try:
-        v = float(x); return v if math.isfinite(v) else default
-    except (TypeError, ValueError):
-        try:
-            s = str(x).replace(",", "").strip().replace("%", "")
-            v = float(s) if s else default
-            return v if math.isfinite(v) else default
-        except Exception:
-            return default
-
-def to_int0(x, default=0):
-    v = to_float0(x, float(default)); return int(round(v))
-
-# Meme Score helpers
-STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
-WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
-DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
-
-def s_sigmoid(x, k=0.02):
-    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
-    except Exception: return 0.0
-def score_symbol(s):
-    S=(s or "").upper()
-    return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
-def score_age(hours):
-    if hours is None: return 0.5
-    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
-def score_liq(liq, mn, mx):
-    if liq is None or liq <= 0: return 0.0
-    try: mn = float(mn) if mn is not None else 0.0
-    except Exception: mn = 0.0
-    try: mx = float(mx) if mx not in (None, 0) else float("inf")
-    except Exception: mx = float("inf")
-    if mn <= liq <= mx: return 1.0
-    if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
-    return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
-def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
-
-def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
-    base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
-    dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
-    liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
-    tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
-    ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
-    local_weights = tuple(weights or (20,20,25,20,15))
-    f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
-         local_weights[4]*score_dex(dex))
-    return round(100.0 * f / max(1e-6, sum(local_weights)))
-
-# Color helpers / badges
-def _bg_bucket(series, lo, hi, inverse=False):
-    styles = []
-    for v in series:
-        try: val = float(v)
-        except Exception:
-            styles.append("")
-            continue
-        if not inverse:
-            color = "#e9f7ef" if val >= hi else ("#fff7d6" if val >= lo else "#ffeaea")
-        else:
-            color = "#e9f7ef" if val <= lo else ("#fff7d6" if val <= hi else "#ffeaea")
-        styles.append(f"background-color: {color}")
-    return styles
-
-def _fmt_thousands(x):
-    try: return f"{int(round(float(x))):,}".replace(",", ".")
-    except Exception: return str(x)
-
-def _fmt_float(x, n=2):
-    try: return f"{float(x):.{n}f}"
-    except Exception: return ""
-
-def _traffic_badge(val, lo, hi, inverse=False):
-    try: v = float(val)
-    except Exception: return " "
-    return ("🟢" if (v >= hi) else ("🟡" if (v >= lo) else "🔴")) if not inverse else ("🟢" if (v <= lo) else ("🟡" if (v <= hi) else "🔴"))
-
-def _combine_badges(emojis):
-    g = sum(1 for e in emojis if e == "🟢")
-    r = sum(1 for e in emojis if e == "🔴")
-    if g > r: return "🟢"
-    if r > g: return "🔴"
-    return "🟡"
-
-def _insert_after(lst, anchor, new_item):
-    try:
-        if new_item in lst: return lst
-        i = lst.index(anchor)
-        lst.insert(i+1, new_item)
-    except ValueError:
-        pass
-    return lst
-
-# ============== Provider init ==============
-if "provider" not in st.session_state:
-    prov = MarketDataProvider(refresh_sec=REFRESH_SEC, preserve_on_empty=True)
-    prov.set_queries(SEARCH_QUERIES)
-    st.session_state["provider"] = prov
-    prov.start_auto_refresh()  # aggiorna cache provider (non forza il rerun UI)
-
-provider: MarketDataProvider = st.session_state["provider"]
-try:
-    pass
-except Exception:
-    pass
 
 # ================= Sidebar =================
 with st.sidebar:
@@ -424,6 +209,9 @@ with st.sidebar:
     st.markdown("**Trailing-stop alert**")
     enable_trailing    = st.toggle("Abilita trailing-stop alert", value=False)
     trailing_dd_thr    = st.number_input("Soglia Drawdown (%)", value=-15.0, step=1.0)
+    st.markdown("**Entry Finder alert (🟢)**")
+    enable_entry_alerts = st.toggle("Abilita alert Entry Finder (🟢)", value=False)
+    entry_alert_max_per_run = st.number_input("Max alert Entry per refresh", min_value=1, value=3, step=1)
     st.markdown("**Rate-limit**")
     alert_cooldown_min = st.number_input("Cooldown alert (min)", min_value=1, value=30, step=5)
     alert_max_per_run  = st.number_input("Max alert per refresh (hit)", min_value=1, value=3, step=1)
@@ -438,26 +226,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Errore Telegram: {e}")
     if st.button("Test Telegram"): _tg_send_test()
-
-    # Stato & Snapshot
-    st.divider(); st.subheader("Stato & Snapshot")
-    autosave_on  = st.toggle("Autosave stato su disco", value=st.session_state.get("autosave_on", False), key="autosave_on",
-                             help="Salva automaticamente ROI/ATH/Equity/Note")
-    autosave_min = st.number_input("Intervallo autosave (min)", min_value=1, value=int(st.session_state.get("autosave_min", 10)),
-                                   step=1, key="autosave_min")
-
-    auto_snapshot_eqs = st.toggle("Auto snapshot EQS (CSV)", value=st.session_state.get("auto_snapshot_eqs", False), key="auto_snapshot_eqs")
-    snapshot_topk     = st.number_input("Snapshot: Top K per EQS", min_value=5, max_value=200,
-                                        value=int(st.session_state.get("snapshot_topk", 50)), step=5, key="snapshot_topk")
-
-    skip_on_err = st.toggle("Autosave: salta se provider ha errori (429/5xx)",
-                            value=st.session_state.get("autosave_skip_err", True), key="autosave_skip_err")
-    debounce_sec = st.number_input("Autosave debounce (sec)", min_value=10, value=int(st.session_state.get("autosave_debounce_sec", 90)),
-                                   step=10, key="autosave_debounce_sec")
-
-    colS1, colS2 = st.columns(2)
-    if colS1.button("💾 Salva ora"): save_persistent_state()
-    if colS2.button("📸 Snapshot EQS (manuale)", key="snapshot_manual"): st.session_state["_do_manual_snapshot"] = True
 
 # ---------- Stato Esecuzione ----------
 running = bool(st.session_state.get("app_running", True))
@@ -501,7 +269,121 @@ with util_col1: st.caption(f"Prossimo refresh ~{secs_left}s")
 with util_col2:
     if st.button("Aggiorna ora", use_container_width=True): st.rerun()
 
-# ============== Provider filters init (apply) ==============
+# ================= Helpers =================
+def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
+    last = (None, None)
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers or UA_HEADERS, timeout=15)
+            code = r.status_code
+            if r.ok: return r.json(), code
+            last = (None, code)
+            if code in (429,500,502,503,504):
+                time.sleep(base_backoff*(i+1) + random.uniform(0,0.3)); continue
+            break
+        except Exception:
+            last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
+    return last
+
+def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
+
+def hours_since_ms(ms_or_s):
+    if ms_or_s is None: return None
+    try:
+        v = int(ms_or_s)
+        if v > 10_000_000_000: v = v/1000.0
+        return max(0.0, (time.time() - v) / 3600.0)
+    except Exception: return None
+
+def ms_to_dt(ms_or_s):
+    if not ms_or_s: return ""
+    try:
+        v = int(ms_or_s)
+        if v > 10_000_000_000: v = v//1000
+        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
+    except Exception: return str(ms_or_s)
+
+def fmt_age(hours):
+    if hours is None: return ""
+    if hours < 1: return f"{int(round(hours*60))}m"
+    if hours < 48:
+        h = int(hours); m = int(round((hours - h) * 60))
+        return f"{h}h {m}m"
+    d = int(hours // 24); h = int(hours % 24)
+    return f"{d}d {h}h"
+
+def safe_series_mean(s):
+    vals = []
+    for x in s:
+        try:
+            if pd.notna(x): vals.append(float(x))
+        except Exception: pass
+    return (sum(vals)/len(vals)) if vals else None
+
+def safe_sort(df, col, ascending=False):
+    if df is None or df.empty or col not in df.columns: return df
+    return df.sort_values(by=[col], ascending=ascending)
+
+def to_float0(x, default=0.0):
+    if x is None: return default
+    try:
+        v = float(x); return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        try:
+            s = str(x).replace(",", "").strip().replace("%", "")
+            v = float(s) if s else default
+            return v if math.isfinite(v) else default
+        except Exception:
+            return default
+
+def to_int0(x, default=0):
+    v = to_float0(x, float(default)); return int(round(v))
+
+# Meme Score helpers
+STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
+WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
+DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
+
+def s_sigmoid(x, k=0.02):
+    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
+    except Exception: return 0.0
+def score_symbol(s):
+    S=(s or "").upper()
+    return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
+def score_age(hours):
+    if hours is None: return 0.5
+    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
+def score_liq(liq, mn, mx):
+    if liq is None or liq <= 0: return 0.0
+    try: mn = float(mn) if mn is not None else 0.0
+    except Exception: mn = 0.0
+    try: mx = float(mx) if mx not in (None, 0) else float("inf")
+    except Exception: mx = float("inf")
+    if mn <= liq <= mx: return 1.0
+    if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
+    return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
+def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
+
+def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
+    base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
+    dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
+    liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
+    tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
+    ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
+    local_weights = tuple(weights or (20,20,25,20,15))
+    f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
+         local_weights[4]*score_dex(dex))
+    return round(100.0 * f / max(1e-6, sum(local_weights)))
+
+# ============== Provider init ==============
+if "provider" not in st.session_state:
+    prov = MarketDataProvider(refresh_sec=REFRESH_SEC, preserve_on_empty=True)
+    prov.set_queries(SEARCH_QUERIES)
+    st.session_state["provider"] = prov
+    prov.start_auto_refresh()  # aggiorna cache provider (non forza il rerun UI)
+
+provider: MarketDataProvider = st.session_state["provider"]
 try:
     if disable_all_filters:
         provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
@@ -824,22 +706,6 @@ if running and st.session_state.get("eq_enabled", True):
     topn_tick = int(st.session_state.get("eq_topN_tab", 10))
     _equity_tick(df_pairs_table, topN=topn_tick)
 
-# Utils snapshot
-def _eqs_cols_subset(df):
-    wanted = ["Pair","DEX","EQS (0–100)","Meme Score","Txns 1h","Liquidity (USD)","Volume 24h (USD)",
-              "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
-              "ROI (%)","ATH (%)","Drawdown (%)","Pair Age","Base Address","Pair Address","Link","Note"]
-    return [c for c in wanted if c in df.columns]
-
-def make_eqs_snapshot_csv(df_sorted, topk: int, path: Path | None = None) -> Path:
-    topk = int(topk)
-    cols = _eqs_cols_subset(df_sorted)
-    ts = int(time.time())
-    out = path or (SNAPSHOT_DIR / f"eqs_snapshot_{ts}.csv")
-    df_sorted.head(topk)[cols].to_csv(out, index=False)
-    st.session_state["last_snapshot_path"] = str(out)
-    return out
-
 # ============================ TABS ============================
 tab_radar, tab_winners, tab_equity, tab_entry = st.tabs(
     ["📡 Radar", "🏆 Winners Now", "📈 Equity Curve", "🎯 Entry Finder"]
@@ -872,57 +738,19 @@ with tab_radar:
         base_for_view = df_pairs_table
         df_pairs_for_view = base_for_view.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else base_for_view
 
-        # --- Note per token (colonna testuale persistente) ---
-        notes = []
-        for _, r in df_pairs_for_view.iterrows():
-            base_addr = r.get("Base Address","")
-            pair_addr = r.get("Pair Address","")
-            key = base_addr or pair_addr or ""
-            notes.append(st.session_state["token_notes"].get(key, ""))
         df_pairs_for_view = df_pairs_for_view.copy()
-        df_pairs_for_view["Note"] = notes
-
-        # Colonne da mostrare
         if "Select" not in df_pairs_for_view.columns:
             df_pairs_for_view.insert(0, "Select", False)
 
         display_cols = ["Select","Pair","DEX","Meme Score","Price (USD)",
                         "ROI (%)","ATH (%)","Drawdown (%)",
                         "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
-                        "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link",
-                        # opzionali/nuove metriche
-                        "EQS (0–100)","Flow Acc","B/S (5m)","Impact $1k (%)","#Top10 %","Buy/Sell Tax %","Security Flags",
-                        "Note"]
+                        "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]
         if not show_pair_age and "Pair Age" in display_cols:
             display_cols.remove("Pair Age")
-        # === Badge sintetici per metrica ===
-        if "EQS (0–100)" in df_pairs_for_view.columns and "EQS Badge" not in df_pairs_for_view.columns:
-            df_pairs_for_view["EQS Badge"] = df_pairs_for_view["EQS (0–100)"].apply(lambda v: _traffic_badge(v, 50, 70, inverse=False))
-            display_cols = _insert_after(display_cols, "EQS (0–100)", "EQS Badge")
-        if "Flow Acc" in df_pairs_for_view.columns and "Flow Badge" not in df_pairs_for_view.columns:
-            df_pairs_for_view["Flow Badge"] = df_pairs_for_view["Flow Acc"].apply(lambda v: _traffic_badge(v, 1.00, 1.10, inverse=False))
-            display_cols = _insert_after(display_cols, "Flow Acc", "Flow Badge")
-        if "Impact $1k (%)" in df_pairs_for_view.columns and "Impact Badge" not in df_pairs_for_view.columns:
-            df_pairs_for_view["Impact Badge"] = df_pairs_for_view["Impact $1k (%)"].apply(lambda v: _traffic_badge(v, 1.0, 3.0, inverse=True))
-            display_cols = _insert_after(display_cols, "Impact $1k (%)", "Impact Badge")
-        if "Entry Badge" not in df_pairs_for_view.columns:
-            eb = []
-            for _, rr in df_pairs_for_view.iterrows():
-                badges = []
-                if "EQS Badge" in df_pairs_for_view.columns:    badges.append(rr.get("EQS Badge", ""))
-                if "Flow Badge" in df_pairs_for_view.columns:   badges.append(rr.get("Flow Badge", ""))
-                if "Impact Badge" in df_pairs_for_view.columns: badges.append(rr.get("Impact Badge", ""))
-                eb.append(_combine_badges([b for b in badges if b]))
-            df_pairs_for_view["Entry Badge"] = eb
-            if "EQS (0–100)" in display_cols:
-                display_cols = _insert_after(display_cols, "EQS Badge" if "EQS Badge" in display_cols else "EQS (0–100)", "Entry Badge")
-            elif "Meme Score" in display_cols:
-                display_cols = _insert_after(display_cols, "Meme Score", "Entry Badge")
-            else:
-                display_cols.append("Entry Badge")
 
         edited = st.data_editor(
-            df_pairs_for_view[[c for c in display_cols if c in df_pairs_for_view.columns]],
+            df_pairs_for_view[display_cols],
             key="pairs_editor",
             hide_index=True,
             use_container_width=True,
@@ -940,36 +768,8 @@ with tab_radar:
                 "Change 1h (%)": st.column_config.NumberColumn(format="%.2f"),
                 "Change 4h/6h (%)": st.column_config.NumberColumn(format="%.2f"),
                 "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
-                # Progress / extra
-                "EQS (0–100)": st.column_config.ProgressColumn("EQS (0–100)", min_value=0, max_value=100, format="%.1f"),
-                "Flow Acc": st.column_config.ProgressColumn("Flow Acc (x)", min_value=0.0, max_value=2.0, format="%.2f",
-                                                            help="1.0 ≈ neutro; >1 accelera"),
-                "B/S (5m)": st.column_config.ProgressColumn("B/S (5m)", min_value=0.0, max_value=3.0, format="%.2f",
-                                                            help=">1 prevalgono i buy"),
-                "Impact $1k (%)": st.column_config.NumberColumn(format="%.2f"),
-                "#Top10 %": st.column_config.NumberColumn(format="%.1f"),
-                "Buy/Sell Tax %": st.column_config.TextColumn(),
-                "Security Flags": st.column_config.TextColumn(),
-                "Note": st.column_config.TextColumn(help="Appunti locali (si salvano con Autosave/Salva ora)"),
-                # Badges
-                "EQS Badge": st.column_config.TextColumn(help="Badge EQS (≥70 🟢, 50–69 🟡, <50 🔴)"),
-                "Flow Badge": st.column_config.TextColumn(help="Badge Flow Acc (≥1.10 🟢, 1.00–1.09 🟡, <1.00 🔴)"),
-                "Impact Badge": st.column_config.TextColumn(help="Badge Slippage (≤1.0% 🟢, 1.0–3.0% 🟡, >3.0% 🔴)"),
-                "Entry Badge": st.column_config.TextColumn(help="Sintesi di EQS, Flow, Impact"),
             }
         )
-
-        # Sync note editate → session_state["token_notes"]
-        try:
-            for i, row in edited.iterrows():
-                orig = df_pairs_for_view.loc[i]
-                key = (orig.get("Base Address","") or orig.get("Pair Address","") or "").strip()
-                if not key: continue
-                txt = str(row.get("Note","")).strip()
-                if txt: st.session_state["token_notes"][key] = txt
-                else: st.session_state["token_notes"].pop(key, None)
-        except Exception:
-            pass
 
         try:
             sel_idx = edited.index[edited["Select"] == True].tolist()
@@ -988,24 +788,6 @@ with tab_radar:
         cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
         if survivors_only: cap += "  •  Filtro: Survivors 60m"
         st.caption(cap)
-
-        # Snapshot EQS (manuale/auto) + download
-        eqs_sorted = None
-        if df_pairs_table is not None and not df_pairs_table.empty and "EQS (0–100)" in df_pairs_table.columns:
-            eqs_sorted = df_pairs_table.sort_values(by=["EQS (0–100)"], ascending=False).reset_index(drop=True)
-        if eqs_sorted is not None and st.session_state.get("_do_manual_snapshot"):
-            p = make_eqs_snapshot_csv(eqs_sorted, st.session_state.get("snapshot_topk", 50))
-            st.success(f"Snapshot creato: {Path(p).name}")
-            st.session_state["_do_manual_snapshot"] = False
-        if eqs_sorted is not None and st.session_state.get("auto_snapshot_eqs", False):
-            latest = SNAPSHOT_DIR / "eqs_snapshot_latest.csv"
-            make_eqs_snapshot_csv(eqs_sorted, st.session_state.get("snapshot_topk", 50), latest)
-
-        lp = st.session_state.get("last_snapshot_path","")
-        if lp and os.path.exists(lp):
-            with open(lp, "rb") as f:
-                st.download_button("📥 Scarica ultimo snapshot EQS", data=f.read(),
-                                   file_name=os.path.basename(lp), mime="text/csv", key="dl_ezs_last")
 
         # Drill-down
         def _fetch_pair_details_safely(pair_addr: str):
@@ -1106,6 +888,9 @@ with tab_radar:
 
                     _HUB_DOMAINS = {"linktr.ee","links.linktr.ee","beacons.ai","linkin.bio"}
                     _SUSPICIOUS_DOMAINS = {"forms.gle","docs.google.com","site.google.com","notion.so","notion.site","pastebin.com","pastelink.net"}
+                    def _hostname(url: str) -> str:
+                        try: return urlparse(url).hostname or ""
+                        except Exception: return ""
                     def _domain_in(set_domains, url):
                         host = _hostname(url).lower()
                         return any(host == d or host.endswith("." + d) for d in set_domains)
@@ -1231,36 +1016,6 @@ with tab_radar:
         cols[6].metric("Turnover OK", c_turn)
         cols[7].metric("Change24 OK", c_chg)
 
-    # 🌈 Anteprima a colori (read-only)
-    st.markdown("#### 🌈 Anteprima a colori (read-only)")
-    show_color_preview = st.toggle("Mostra anteprima con colorazione condizionale", value=True, key="color_preview_toggle")
-    if show_color_preview and (df_pairs_table is not None) and not df_pairs_table.empty:
-        prev_cols = [c for c in [
-            "Pair","DEX","EQS (0–100)","Flow Acc","Impact $1k (%)",
-            "Txns 1h","Liquidity (USD)","Change 1h (%)","Pair Age","Link"
-        ] if c in df_pairs_table.columns]
-
-        if prev_cols:
-            df_prev = df_pairs_table[prev_cols].copy()
-            if "Txns 1h" in df_prev.columns: df_prev["Txns 1h"] = df_prev["Txns 1h"].map(_fmt_thousands)
-            if "Liquidity (USD)" in df_prev.columns: df_prev["Liquidity (USD)"] = df_prev["Liquidity (USD)"].map(_fmt_thousands)
-            if "Change 1h (%)" in df_prev.columns: df_prev["Change 1h (%)"] = df_prev["Change 1h (%)"].map(lambda x: _fmt_float(x,2))
-
-            styler = df_prev.style
-            if "EQS (0–100)" in df_prev.columns:
-                styler = styler.apply(_bg_bucket, lo=50, hi=70, subset=["EQS (0–100)"])
-            if "Flow Acc" in df_prev.columns:
-                styler = styler.apply(_bg_bucket, lo=1.00, hi=1.10, subset=["Flow Acc"])
-            if "Impact $1k (%)" in df_prev.columns:
-                styler = styler.apply(_bg_bucket, lo=1.0, hi=3.0, inverse=True, subset=["Impact $1k (%)"])
-
-            st.dataframe(styler, use_container_width=True)
-            st.caption("Legenda: 🟢 buono • 🟡 medio • 🔴 scarso (per Impact$1k la scala è inversa: più basso è meglio)")
-        else:
-            st.caption("Nessuna colonna target per la preview colorata.")
-    else:
-        st.caption("Anteprima colorata disattivata.")
-
 with tab_winners:
     st.markdown("### 🏆 Winners Now")
     if df_pairs_table.empty:
@@ -1337,9 +1092,9 @@ with tab_equity:
         csv = df_eq[["t","equity","ret","n"]].to_csv(index=False).encode("utf-8")
         st.download_button("📥 Scarica equity.csv", data=csv, file_name="equity_curve.csv", mime="text/csv")
 
-# ===================== Entry Finder (smart + presets) =====================
+# ===================== Entry Finder (smart + presets + badge) =====================
 with tab_entry:
-    st.markdown("### 🎯 Entry Finder — scanner ingressi (smart + presets)")
+    st.markdown("### 🎯 Entry Finder — scanner ingressi (smart + presets + badge)")
 
     # Preset definitions
     ENTRY_PRESETS = {
@@ -1372,6 +1127,16 @@ with tab_entry:
             "trend_pos": True,
             "allow_missing_ch1": True, "allow_missing_h4": True,
             "survivor": False, "targetN": 15
+        },
+        "Aggressivo": {
+            "ms_min": 55, "tx_min": 120,
+            "liq_min": 5_000, "liq_max": 200_000,
+            "age_min_m": 0, "age_max_m": 240,
+            "ch1_min": -10, "ch1_max": 35,
+            "cap_24h": 220,
+            "trend_pos": True,
+            "allow_missing_ch1": True, "allow_missing_h4": True,
+            "survivor": False, "targetN": 15
         }
     }
     def apply_preset(p):
@@ -1385,12 +1150,14 @@ with tab_entry:
     if _tx_heat >= 900: suggested = "On-Fire"
     elif _tx_heat >= 250: suggested = "Medio"
 
-    cP1, cP2, cP3, cP4 = st.columns([1,1,1,2])
+    cP1, cP2, cP3, cP4, cP5 = st.columns([1,1,1,2,1])
     if cP1.button("🥶 Fiacco"): apply_preset(ENTRY_PRESETS["Fiacco"])
     if cP2.button("🙂 Medio"): apply_preset(ENTRY_PRESETS["Medio"])
     if cP3.button("🔥 On-Fire"): apply_preset(ENTRY_PRESETS["On-Fire"])
     if cP4.button(f"🤖 Suggerisci preset (heat={_tx_heat})"):
         apply_preset(ENTRY_PRESETS[suggested])
+    if cP5.button("⚡ Aggressivo"):
+        apply_preset(ENTRY_PRESETS["Aggressivo"])
 
     st.caption("Tip: puoi anche ignorare i filtri PAIRS per scansionare l’universo grezzo.")
 
@@ -1401,6 +1168,13 @@ with tab_entry:
     )
     df_base_for_entry = df_pairs_table if st.session_state.get("ef_source","").startswith("Usa") else df_pairs
     st.caption(f"Universo di lavoro: {0 if df_base_for_entry is None else len(df_base_for_entry)}")
+
+    badge_mode = st.radio(
+        "Entry Badge mode",
+        ["Normale", "Aggressivo"],
+        horizontal=True,
+        key="ef_badge_mode"
+    )
 
     if df_base_for_entry is None or df_base_for_entry.empty:
         st.info("Nessuna coppia disponibile con la sorgente selezionata.")
@@ -1469,15 +1243,16 @@ with tab_entry:
 
         dfE = dfC[mask].copy()
 
-        # Auto-relax (non scrive nelle chiavi widget per evitare errori di stato)
+        # Auto-relax (no writes su session_state)
         relax_applied = False
-        relaxed_params = None
+        relaxed_vals = None
         if auto_relax and (dfE.empty or len(dfE) < targetN):
             relax_applied = True
             _tx, _ch1min, _ch1max = int(tx_min), int(ch1_min), int(ch1_max)
             _liqmin, _liqmax = int(liq_min_e), int(liq_max_e)
             _agemin, _agemax = int(age_min_m), int(age_max_m)
             _cap24 = int(cap_24h)
+            _allow_h1, _allow_h4m = True, True
 
             for _ in range(10):
                 _tx = max(50, _tx - 50)
@@ -1491,16 +1266,16 @@ with tab_entry:
                 m_tx  = (tx_col >= _tx)
                 m_liq = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
                 m_age = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
-                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both"))
-                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ((ch4_col > -9998))
+                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if _allow_h1 else ( (ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both") )
+                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ( (ch4_col > -9998) | _allow_h4m )
                 m_c24 = (ch24_col <= _cap24) | (ch24_col < -9998)
 
                 m_relaxed = m_ms & m_tx & m_liq & m_age & m_ch1 & m_ch4 & m_c24
                 if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
                 dfE = dfC[m_relaxed].copy()
                 if len(dfE) >= targetN or len(dfE) > 0:
-                    relaxed_params = dict(tx=_tx, ch1min=_ch1min, ch1max=_ch1max, liqmin=_liqmin, liqmax=_liqmax,
-                                          agemin=_agemin, agemax=_agemax, cap24=_cap24)
+                    relaxed_vals = dict(tx=_tx, ch1min=_ch1min, ch1max=_ch1max, liqmin=_liqmin, liqmax=_liqmax,
+                                        agemin=_agemin, agemax=_agemax, cap24=_cap24)
                     break
 
         # Diagnostica rapida
@@ -1519,12 +1294,12 @@ with tab_entry:
         if dfE.empty:
             st.warning("Nessun candidato con questi parametri. Prova un preset o allarga i range.")
         else:
-            if relax_applied and relaxed_params is not None:
-                st.info(f"Auto-relax applicato → Tx≥{relaxed_params['tx']}, "
-                        f"H1∈[{relaxed_params['ch1min']},{relaxed_params['ch1max']}]%, "
-                        f"Liq≥{relaxed_params['liqmin']}{' & ≤'+str(relaxed_params['liqmax']) if relaxed_params['liqmax']>0 else ''}, "
-                        f"Age {relaxed_params['agemin']}-{relaxed_params['agemax']} min, "
-                        f"24h≤{relaxed_params['cap24']}%.", icon="🪄")
+            if relax_applied and relaxed_vals:
+                st.info(f"Auto-relax applicato → Tx≥{relaxed_vals['tx']}, "
+                        f"H1∈[{relaxed_vals['ch1min']},{relaxed_vals['ch1max']}]%, "
+                        f"Liq≥{relaxed_vals['liqmin']}{' & ≤'+str(relaxed_vals['liqmax']) if relaxed_vals['liqmax']>0 else ''}, "
+                        f"Age {relaxed_vals['agemin']}-{relaxed_vals['agemax']} min, "
+                        f"24h≤{relaxed_vals['cap24']}%.", icon="🪄")
 
             # Reasons
             reasons = []
@@ -1553,13 +1328,75 @@ with tab_entry:
                 reasons.append(", ".join(rs))
             dfE["Reasons"] = reasons
 
-            # Entry Badge porting (se presente nel radar)
-            try:
-                if "Entry Badge" in df_pairs_for_view.columns and "Entry Badge" not in dfE.columns:
-                    base_map = df_pairs_for_view.set_index(["Base Address","Pair Address"])["Entry Badge"].to_dict()
-                    dfE["Entry Badge"] = dfE.apply(lambda r: base_map.get((r.get("Base Address",""), r.get("Pair Address","")), ""), axis=1)
-            except Exception:
-                pass
+            # Badge params
+            params_badge = {
+                "tx_min": tx_min,
+                "ms_min": ms_min,
+                "liq_min": liq_min_e,
+                "liq_max": liq_max_e,
+                "allow_missing_ch1": allow_missing_ch1,
+                "allow_missing_h4": allow_missing_h4,
+                "survivors_gate": survivors_gate,
+            }
+
+            def _entry_badge_for_row(r, params, mode="Normale"):
+                """
+                mode:
+                  - Normale: più prudente → 🟢 se score>=4 su 5
+                  - Aggressivo: anticipa → 🟢 se score>=3 su 5, soglie un filo allargate
+                """
+                try:
+                    tx1 = float(r.get("Txns 1h", 0) or 0)
+                    ms  = float(r.get("Meme Score", 0) or 0)
+                    liq = float(r.get("Liquidity (USD)", 0) or 0)
+                    ch1 = r.get("Change 1h (%)", None); ch1 = float(ch1) if pd.notna(ch1) else None
+                    ch4 = r.get("Change 4h/6h (%)", None); ch4 = float(ch4) if pd.notna(ch4) else None
+                    ch24= r.get("Change 24h (%)", None); ch24 = float(ch24) if pd.notna(ch24) else None
+                    ageh= r.get("PairAgeHours", None); ageh = float(ageh) if pd.notna(ageh) else None
+                    roi = r.get("ROI (%)", None); roi = float(roi) if pd.notna(roi) else None
+                    vol = float(r.get("Volume 24h (USD)", 0) or 0)
+                except Exception:
+                    return "🟡"
+
+                agg = (mode == "Aggressivo")
+
+                # Trend
+                trend_ok = ((ch4 is None) and params["allow_missing_h4"]) or (ch4 is not None and ch4 > (0 if not agg else -2))
+
+                # Momentum
+                ch1_min_loc = min(params.get("ch1_min", -999), -10) if agg else max(params.get("ch1_min", -999), -5)
+                ch1_max_loc = max(params.get("ch1_max", 999), 30) if agg else min(params.get("ch1_max", 999), 25)
+                if pd.isna(r.get("Change 1h (%)")):
+                    mom_ok = params["allow_missing_ch1"]
+                else:
+                    try:
+                        v = float(r.get("Change 1h (%)"))
+                        mom_ok = (ch1_min_loc <= v <= ch1_max_loc)
+                    except Exception:
+                        mom_ok = False
+
+                # Flow
+                flow_ok = (tx1 >= (1.1 if agg else 1.2) * params["tx_min"]) or (ms >= params["ms_min"] + (5 if agg else 10))
+
+                # Impact / Turnover
+                liq_ok = (liq >= params["liq_min"]) and ((params["liq_max"] == 0) or (liq <= params["liq_max"] if params["liq_max"]>0 else True))
+                turnover = (vol / liq) if liq > 0 else 0.0
+                impact_ok = liq_ok and (turnover >= (0.7 if agg else 1.0))
+
+                # Survivability (se richiesto)
+                surv_ok = (not params["survivors_gate"]) or ((ageh is not None and ageh >= 1.0) and (roi is not None and roi > 0))
+
+                score = sum([trend_ok, mom_ok, flow_ok, impact_ok, surv_ok])
+                green_cut = 3 if agg else 4
+                if score >= green_cut: return "🟢"
+                if score >= 2: return "🟡"
+                return "🔴"
+
+            # Inietta ch1_min/ch1_max in params_badge per coerenza con badge
+            params_badge["ch1_min"] = ch1_min
+            params_badge["ch1_max"] = ch1_max
+
+            dfE["Entry Badge"] = dfE.apply(lambda r: _entry_badge_for_row(r, params_badge, st.session_state.get("ef_badge_mode","Normale")), axis=1)
 
             # Ordinamento & show
             if sort_mode.startswith("Momentum"):
@@ -1573,14 +1410,66 @@ with tab_entry:
                          "Liquidity (USD)","Volume 24h (USD)",
                          "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
                          "ROI (%)","ATH (%)","Drawdown (%)",
-                         "Pair Age","Link","Reasons"]
+                         "Pair Age","Link","Reasons","Base Address","Pair Address"]
             show_cols = [c for c in keep_cols if c in dfE.columns]
             topN_show = int(st.session_state.get("ef_topN_show", 25))
             st.success(f"Candidati: {len(dfE)} — mostrati i primi {min(topN_show, len(dfE))}", icon="🎯")
             st.dataframe(dfE[show_cols].head(topN_show), use_container_width=True, hide_index=True)
             st.caption("Tip: apri **📡 Radar** e spunta la riga per il drill-down con i link Jupiter/Raydium.")
 
-# ============== Alert Telegram ==============
+            # ===================== Entry Finder Telegram Alerts (🟢) =====================
+            def tg_send(text: str):
+                if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
+                try:
+                    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                     params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
+                    return (True, None) if r.ok else (False, f"status={r.status_code}")
+                except Exception as e:
+                    return False, str(e)
+
+            if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
+            cooldown = int(alert_cooldown_min) * 60
+            now = time.time()
+
+            if running and enable_entry_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                try:
+                    df_green = dfE[dfE["Entry Badge"] == "🟢"].copy()
+                    sent_now = 0
+                    max_send = int(entry_alert_max_per_run)
+                    if not df_green.empty:
+                        # Ordina per qualità: Meme Score, Txns 1h, (facoltativo) Change 1h
+                        if "Change 1h (%)" in df_green.columns:
+                            df_green = df_green.sort_values(by=["Meme Score","Txns 1h","Change 1h (%)"], ascending=[False, False, False])
+                        else:
+                            df_green = df_green.sort_values(by=["Meme Score","Txns 1h"], ascending=[False, False])
+                        for _, row in df_green.head(max_send*2).iterrows():
+                            addr = str(row.get("Base Address","")) or row.get("Pair") or str(row.get("Pair Address",""))
+                            last_ts = st.session_state["tg_sent"].get(("entry", addr), 0)
+                            if now - last_ts < cooldown: continue
+                            pair = row.get("Pair",""); dex = row.get("DEX",""); ms = int(row.get("Meme Score",0) or 0)
+                            tx1 = int(row.get("Txns 1h",0) or 0); liq = int(row.get("Liquidity (USD)",0) or 0)
+                            vol = int(row.get("Volume 24h (USD)",0) or 0)
+                            px  = row.get("Price (USD)", None); ch1 = row.get("Change 1h (%)", None); ch4=row.get("Change 4h/6h (%)", None)
+                            link= row.get("Link","")
+                            badge = row.get("Entry Badge","")
+                            txt = f"🟢 Entry Finder — {pair}\nDEX: {dex} | Badge: {badge}\nMemeScore: {ms} | Tx1h: {tx1:,}\nLiq: ${liq:,} | Vol24h: ${vol:,}"
+                            if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
+                            if ch1 is not None:
+                                try: txt += f" | H1: {float(ch1):.2f}%"
+                                except Exception: pass
+                            if ch4 is not None:
+                                try: txt += f" | H4/6: {float(ch4):.2f}%"
+                                except Exception: pass
+                            if link: txt += f"\n{link}"
+                            ok, err = tg_send(txt)
+                            if ok:
+                                st.session_state["tg_sent"][("entry", addr)] = now
+                                sent_now += 1
+                                if sent_now >= max_send: break
+                except Exception as e:
+                    st.caption(f"Alert Telegram (entry): errore — {e}")
+
+# ============== Alert Telegram (Hit Radar / Trailing) ==============
 def tg_send(text: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
     try:
@@ -1668,24 +1557,4 @@ st.caption(
     f"TopN={int(st.session_state.get('eq_topN_tab', 10))} • Equity=${st.session_state.get('eq_equity', 0):,.2f}".replace(",", ".")
 )
 
-# === Aggiorna timestamp ===
 st.session_state["last_refresh_ts"] = time.time()
-
-# === Autosave periodico + difensivo (debounce) ===
-if st.session_state.get("autosave_on", False):
-    now_ts = time.time()
-    interval = max(60, int(st.session_state.get("autosave_min", 10)) * 60)  # min 60s
-    due = (now_ts - float(st.session_state.get("last_autosave_ts", 0))) >= interval
-    deb_until = float(st.session_state.get("autosave_debounce_until", 0))
-    ok_window = now_ts >= deb_until
-
-    if st.session_state.get("autosave_skip_err", True) and provider_has_errors(codes):
-        st.session_state["autosave_debounce_until"] = now_ts + int(st.session_state.get("autosave_debounce_sec", 90))
-        ok_window = False
-
-    if due and ok_window:
-        save_persistent_state()
-        st.session_state["last_autosave_ts"] = now_ts
-        st.caption("Autosave completato ✅")
-    elif due and not ok_window:
-        st.caption("Autosave rinviato (debounce attivo) ⏳")
