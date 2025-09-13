@@ -1,6 +1,8 @@
 # streamlit_app.py — Meme Radar (no trading) + Drill-down + ROI/ATH/DD + Survivors + Winners + Equity + Entry Finder (smart+presets)
 # Requisiti: streamlit, plotly, pandas, requests; file market_data.py con MarketDataProvider
-import os, time, math, random, datetime, threading
+
+import os, time, math, random, datetime, threading, pickle
+from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import requests
@@ -29,9 +31,18 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# Persistenza / Snapshot
+STATE_FILE   = os.getenv("STATE_FILE", "meme_radar_state.pkl")
+SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "snapshots"))
+SNAPSHOT_DIR.mkdir(exist_ok=True)
+
 # =============== Session State ===============
 if "app_running" not in st.session_state: st.session_state["app_running"] = True
 if "last_refresh_ts" not in st.session_state: st.session_state["last_refresh_ts"] = time.time()
+if "state_loaded" not in st.session_state: st.session_state["state_loaded"] = False
+if "last_autosave_ts" not in st.session_state: st.session_state["last_autosave_ts"] = 0.0
+if "last_snapshot_path" not in st.session_state: st.session_state["last_snapshot_path"] = ""
+if "autosave_debounce_until" not in st.session_state: st.session_state["autosave_debounce_until"] = 0.0
 
 # Profit metrics baseline/ath per token
 for k in ("baseline_px","ath_px"):
@@ -43,6 +54,210 @@ if "eq_init_capital" not in st.session_state: st.session_state["eq_init_capital"
 if "eq_equity" not in st.session_state: st.session_state["eq_equity"] = float(st.session_state["eq_init_capital"])
 if "eq_history" not in st.session_state: st.session_state["eq_history"] = []   # [{ts,equity,ret,n}]
 if "eq_last_prices" not in st.session_state: st.session_state["eq_last_prices"] = {}
+# Note per token
+if "token_notes" not in st.session_state: st.session_state["token_notes"] = {}
+
+# ================= Helpers =================
+def load_persistent_state():
+    try:
+        with open(STATE_FILE, "rb") as f:
+            data = pickle.load(f)
+        for k in ("baseline_px","ath_px","eq_history","eq_equity","eq_init_capital","token_notes"):
+            if k in data: st.session_state[k] = data[k]
+        st.session_state["state_loaded"] = True
+        st.toast("Stato ricaricato", icon="📦")
+    except Exception:
+        pass
+
+def save_persistent_state():
+    data = {k: st.session_state.get(k) for k in ("baseline_px","ath_px","eq_history","eq_equity","eq_init_capital","token_notes")}
+    try:
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(data, f)
+        st.toast("Stato salvato", icon="💾")
+    except Exception as e:
+        st.warning(f"Save state error: {e}")
+
+if not st.session_state.get("state_loaded"):
+    load_persistent_state()
+
+def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
+    last = (None, None)
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers or UA_HEADERS, timeout=15)
+            code = r.status_code
+            if r.ok: return r.json(), code
+            last = (None, code)
+            if code in (429,500,502,503,504):
+                time.sleep(base_backoff*(i+1) + random.uniform(0,0.3)); continue
+            break
+        except Exception:
+            last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
+    return last
+
+def provider_has_errors(codes_obj) -> bool:
+    try:
+        items = list(codes_obj.values()) if isinstance(codes_obj, dict) else list(codes_obj or [])
+    except Exception:
+        items = []
+    bad_set = {429, 500, 502, 503, 504}
+    for c in items:
+        try:
+            ic = int(str(c).split()[0])
+            if ic in bad_set or ic >= 500 or ic == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
+
+def hours_since_ms(ms_or_s):
+    if ms_or_s is None: return None
+    try:
+        v = int(ms_or_s)
+        if v > 10_000_000_000: v = v/1000.0
+        return max(0.0, (time.time() - v) / 3600.0)
+    except Exception: return None
+
+def ms_to_dt(ms_or_s):
+    if not ms_or_s: return ""
+    try:
+        v = int(ms_or_s)
+        if v > 10_000_000_000: v = v//1000
+        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
+    except Exception: return str(ms_or_s)
+
+def fmt_age(hours):
+    if hours is None: return ""
+    if hours < 1: return f"{int(round(hours*60))}m"
+    if hours < 48:
+        h = int(hours); m = int(round((hours - h) * 60))
+        return f"{h}h {m}m"
+    d = int(hours // 24); h = int(hours % 24)
+    return f"{d}d {h}h"
+
+def safe_series_mean(s):
+    vals = []
+    for x in s:
+        try:
+            if pd.notna(x): vals.append(float(x))
+        except Exception: pass
+    return (sum(vals)/len(vals)) if vals else None
+
+def safe_sort(df, col, ascending=False):
+    if df is None or df.empty or col not in df.columns: return df
+    return df.sort_values(by=[col], ascending=ascending)
+
+def to_float0(x, default=0.0):
+    if x is None: return default
+    try:
+        v = float(x); return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        try:
+            s = str(x).replace(",", "").strip().replace("%", "")
+            v = float(s) if s else default
+            return v if math.isfinite(v) else default
+        except Exception:
+            return default
+
+def to_int0(x, default=0):
+    v = to_float0(x, float(default)); return int(round(v))
+
+# Meme Score helpers
+STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
+WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
+DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
+
+def s_sigmoid(x, k=0.02):
+    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
+    except Exception: return 0.0
+def score_symbol(s):
+    S=(s or "").upper()
+    return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
+def score_age(hours):
+    if hours is None: return 0.5
+    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
+def score_liq(liq, mn, mx):
+    if liq is None or liq <= 0: return 0.0
+    try: mn = float(mn) if mn is not None else 0.0
+    except Exception: mn = 0.0
+    try: mx = float(mx) if mx not in (None, 0) else float("inf")
+    except Exception: mx = float("inf")
+    if mn <= liq <= mx: return 1.0
+    if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
+    return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
+def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
+
+def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
+    base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
+    dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
+    liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
+    tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
+    ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
+    local_weights = tuple(weights or (20,20,25,20,15))
+    f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
+         local_weights[4]*score_dex(dex))
+    return round(100.0 * f / max(1e-6, sum(local_weights)))
+
+# Color helpers / badges
+def _bg_bucket(series, lo, hi, inverse=False):
+    styles = []
+    for v in series:
+        try: val = float(v)
+        except Exception:
+            styles.append("")
+            continue
+        if not inverse:
+            color = "#e9f7ef" if val >= hi else ("#fff7d6" if val >= lo else "#ffeaea")
+        else:
+            color = "#e9f7ef" if val <= lo else ("#fff7d6" if val <= hi else "#ffeaea")
+        styles.append(f"background-color: {color}")
+    return styles
+
+def _fmt_thousands(x):
+    try: return f"{int(round(float(x))):,}".replace(",", ".")
+    except Exception: return str(x)
+
+def _fmt_float(x, n=2):
+    try: return f"{float(x):.{n}f}"
+    except Exception: return ""
+
+def _traffic_badge(val, lo, hi, inverse=False):
+    try: v = float(val)
+    except Exception: return " "
+    return ("🟢" if (v >= hi) else ("🟡" if (v >= lo) else "🔴")) if not inverse else ("🟢" if (v <= lo) else ("🟡" if (v <= hi) else "🔴"))
+
+def _combine_badges(emojis):
+    g = sum(1 for e in emojis if e == "🟢")
+    r = sum(1 for e in emojis if e == "🔴")
+    if g > r: return "🟢"
+    if r > g: return "🔴"
+    return "🟡"
+
+def _insert_after(lst, anchor, new_item):
+    try:
+        if new_item in lst: return lst
+        i = lst.index(anchor)
+        lst.insert(i+1, new_item)
+    except ValueError:
+        pass
+    return lst
+
+# ============== Provider init ==============
+if "provider" not in st.session_state:
+    prov = MarketDataProvider(refresh_sec=REFRESH_SEC, preserve_on_empty=True)
+    prov.set_queries(SEARCH_QUERIES)
+    st.session_state["provider"] = prov
+    prov.start_auto_refresh()  # aggiorna cache provider (non forza il rerun UI)
+
+provider: MarketDataProvider = st.session_state["provider"]
+try:
+    pass
+except Exception:
+    pass
 
 # ================= Sidebar =================
 with st.sidebar:
@@ -224,6 +439,26 @@ with st.sidebar:
             st.error(f"Errore Telegram: {e}")
     if st.button("Test Telegram"): _tg_send_test()
 
+    # Stato & Snapshot
+    st.divider(); st.subheader("Stato & Snapshot")
+    autosave_on  = st.toggle("Autosave stato su disco", value=st.session_state.get("autosave_on", False), key="autosave_on",
+                             help="Salva automaticamente ROI/ATH/Equity/Note")
+    autosave_min = st.number_input("Intervallo autosave (min)", min_value=1, value=int(st.session_state.get("autosave_min", 10)),
+                                   step=1, key="autosave_min")
+
+    auto_snapshot_eqs = st.toggle("Auto snapshot EQS (CSV)", value=st.session_state.get("auto_snapshot_eqs", False), key="auto_snapshot_eqs")
+    snapshot_topk     = st.number_input("Snapshot: Top K per EQS", min_value=5, max_value=200,
+                                        value=int(st.session_state.get("snapshot_topk", 50)), step=5, key="snapshot_topk")
+
+    skip_on_err = st.toggle("Autosave: salta se provider ha errori (429/5xx)",
+                            value=st.session_state.get("autosave_skip_err", True), key="autosave_skip_err")
+    debounce_sec = st.number_input("Autosave debounce (sec)", min_value=10, value=int(st.session_state.get("autosave_debounce_sec", 90)),
+                                   step=10, key="autosave_debounce_sec")
+
+    colS1, colS2 = st.columns(2)
+    if colS1.button("💾 Salva ora"): save_persistent_state()
+    if colS2.button("📸 Snapshot EQS (manuale)", key="snapshot_manual"): st.session_state["_do_manual_snapshot"] = True
+
 # ---------- Stato Esecuzione ----------
 running = bool(st.session_state.get("app_running", True))
 st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
@@ -266,121 +501,7 @@ with util_col1: st.caption(f"Prossimo refresh ~{secs_left}s")
 with util_col2:
     if st.button("Aggiorna ora", use_container_width=True): st.rerun()
 
-# ================= Helpers =================
-def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
-    last = (None, None)
-    for i in range(tries):
-        try:
-            r = requests.get(url, headers=headers or UA_HEADERS, timeout=15)
-            code = r.status_code
-            if r.ok: return r.json(), code
-            last = (None, code)
-            if code in (429,500,502,503,504):
-                time.sleep(base_backoff*(i+1) + random.uniform(0,0.3)); continue
-            break
-        except Exception:
-            last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
-    return last
-
-def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
-
-def hours_since_ms(ms_or_s):
-    if ms_or_s is None: return None
-    try:
-        v = int(ms_or_s)
-        if v > 10_000_000_000: v = v/1000.0
-        return max(0.0, (time.time() - v) / 3600.0)
-    except Exception: return None
-
-def ms_to_dt(ms_or_s):
-    if not ms_or_s: return ""
-    try:
-        v = int(ms_or_s)
-        if v > 10_000_000_000: v = v//1000
-        return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
-    except Exception: return str(ms_or_s)
-
-def fmt_age(hours):
-    if hours is None: return ""
-    if hours < 1: return f"{int(round(hours*60))}m"
-    if hours < 48:
-        h = int(hours); m = int(round((hours - h) * 60))
-        return f"{h}h {m}m"
-    d = int(hours // 24); h = int(hours % 24)
-    return f"{d}d {h}h"
-
-def safe_series_mean(s):
-    vals = []
-    for x in s:
-        try:
-            if pd.notna(x): vals.append(float(x))
-        except Exception: pass
-    return (sum(vals)/len(vals)) if vals else None
-
-def safe_sort(df, col, ascending=False):
-    if df is None or df.empty or col not in df.columns: return df
-    return df.sort_values(by=[col], ascending=ascending)
-
-def to_float0(x, default=0.0):
-    if x is None: return default
-    try:
-        v = float(x); return v if math.isfinite(v) else default
-    except (TypeError, ValueError):
-        try:
-            s = str(x).replace(",", "").strip().replace("%", "")
-            v = float(s) if s else default
-            return v if math.isfinite(v) else default
-        except Exception:
-            return default
-
-def to_int0(x, default=0):
-    v = to_float0(x, float(default)); return int(round(v))
-
-# Meme Score helpers
-STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","ELON","CAT","KITTY","MOON","PUMP","FLOKI","BABYDOGE"}
-WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
-DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
-
-def s_sigmoid(x, k=0.02):
-    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
-    except Exception: return 0.0
-def score_symbol(s):
-    S=(s or "").upper()
-    return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
-def score_age(hours):
-    if hours is None: return 0.5
-    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
-def score_liq(liq, mn, mx):
-    if liq is None or liq <= 0: return 0.0
-    try: mn = float(mn) if mn is not None else 0.0
-    except Exception: mn = 0.0
-    try: mx = float(mx) if mx not in (None, 0) else float("inf")
-    except Exception: mx = float("inf")
-    if mn <= liq <= mx: return 1.0
-    if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
-    return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
-def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
-
-def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
-    base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
-    dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
-    liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
-    tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
-    ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
-    local_weights = tuple(weights or (20,20,25,20,15))
-    f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), sweet_min, sweet_max) +
-         local_weights[4]*score_dex(dex))
-    return round(100.0 * f / max(1e-6, sum(local_weights)))
-
-# ============== Provider init ==============
-if "provider" not in st.session_state:
-    prov = MarketDataProvider(refresh_sec=REFRESH_SEC, preserve_on_empty=True)
-    prov.set_queries(SEARCH_QUERIES)
-    st.session_state["provider"] = prov
-    prov.start_auto_refresh()  # aggiorna cache provider (non forza il rerun UI)
-
-provider: MarketDataProvider = st.session_state["provider"]
+# ============== Provider filters init (apply) ==============
 try:
     if disable_all_filters:
         provider.set_filters(only_raydium=False, min_liq=0, exclude_quotes=[])
@@ -552,10 +673,7 @@ def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
-        mscore = compute_meme_score_row(
-            r, (w_symbol, w_age, w_txns, w_liq, w_dex),
-            sweet_min=liq_min_sweet, sweet_max=liq_max_sweet
-        )
+        mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
         ageh = hours_since_ms(r.get("pairCreatedAt", 0))
         chg_1h = _get_change_pct(r, ["priceChange1hPct","priceChangeH1Pct","pc1h","priceChange1h"], "priceChange", ("h1","1h","m60","60m"))
         chg_4h = _get_change_pct(r, ["priceChange4hPct","priceChangeH4Pct","pc4h","priceChange4h"], "priceChange", ("h4","4h","m240","240m"))
@@ -706,6 +824,22 @@ if running and st.session_state.get("eq_enabled", True):
     topn_tick = int(st.session_state.get("eq_topN_tab", 10))
     _equity_tick(df_pairs_table, topN=topn_tick)
 
+# Utils snapshot
+def _eqs_cols_subset(df):
+    wanted = ["Pair","DEX","EQS (0–100)","Meme Score","Txns 1h","Liquidity (USD)","Volume 24h (USD)",
+              "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
+              "ROI (%)","ATH (%)","Drawdown (%)","Pair Age","Base Address","Pair Address","Link","Note"]
+    return [c for c in wanted if c in df.columns]
+
+def make_eqs_snapshot_csv(df_sorted, topk: int, path: Path | None = None) -> Path:
+    topk = int(topk)
+    cols = _eqs_cols_subset(df_sorted)
+    ts = int(time.time())
+    out = path or (SNAPSHOT_DIR / f"eqs_snapshot_{ts}.csv")
+    df_sorted.head(topk)[cols].to_csv(out, index=False)
+    st.session_state["last_snapshot_path"] = str(out)
+    return out
+
 # ============================ TABS ============================
 tab_radar, tab_winners, tab_equity, tab_entry = st.tabs(
     ["📡 Radar", "🏆 Winners Now", "📈 Equity Curve", "🎯 Entry Finder"]
@@ -738,19 +872,57 @@ with tab_radar:
         base_for_view = df_pairs_table
         df_pairs_for_view = base_for_view.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else base_for_view
 
+        # --- Note per token (colonna testuale persistente) ---
+        notes = []
+        for _, r in df_pairs_for_view.iterrows():
+            base_addr = r.get("Base Address","")
+            pair_addr = r.get("Pair Address","")
+            key = base_addr or pair_addr or ""
+            notes.append(st.session_state["token_notes"].get(key, ""))
         df_pairs_for_view = df_pairs_for_view.copy()
+        df_pairs_for_view["Note"] = notes
+
+        # Colonne da mostrare
         if "Select" not in df_pairs_for_view.columns:
             df_pairs_for_view.insert(0, "Select", False)
 
         display_cols = ["Select","Pair","DEX","Meme Score","Price (USD)",
                         "ROI (%)","ATH (%)","Drawdown (%)",
                         "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
-                        "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]
+                        "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link",
+                        # opzionali/nuove metriche
+                        "EQS (0–100)","Flow Acc","B/S (5m)","Impact $1k (%)","#Top10 %","Buy/Sell Tax %","Security Flags",
+                        "Note"]
         if not show_pair_age and "Pair Age" in display_cols:
             display_cols.remove("Pair Age")
+        # === Badge sintetici per metrica ===
+        if "EQS (0–100)" in df_pairs_for_view.columns and "EQS Badge" not in df_pairs_for_view.columns:
+            df_pairs_for_view["EQS Badge"] = df_pairs_for_view["EQS (0–100)"].apply(lambda v: _traffic_badge(v, 50, 70, inverse=False))
+            display_cols = _insert_after(display_cols, "EQS (0–100)", "EQS Badge")
+        if "Flow Acc" in df_pairs_for_view.columns and "Flow Badge" not in df_pairs_for_view.columns:
+            df_pairs_for_view["Flow Badge"] = df_pairs_for_view["Flow Acc"].apply(lambda v: _traffic_badge(v, 1.00, 1.10, inverse=False))
+            display_cols = _insert_after(display_cols, "Flow Acc", "Flow Badge")
+        if "Impact $1k (%)" in df_pairs_for_view.columns and "Impact Badge" not in df_pairs_for_view.columns:
+            df_pairs_for_view["Impact Badge"] = df_pairs_for_view["Impact $1k (%)"].apply(lambda v: _traffic_badge(v, 1.0, 3.0, inverse=True))
+            display_cols = _insert_after(display_cols, "Impact $1k (%)", "Impact Badge")
+        if "Entry Badge" not in df_pairs_for_view.columns:
+            eb = []
+            for _, rr in df_pairs_for_view.iterrows():
+                badges = []
+                if "EQS Badge" in df_pairs_for_view.columns:    badges.append(rr.get("EQS Badge", ""))
+                if "Flow Badge" in df_pairs_for_view.columns:   badges.append(rr.get("Flow Badge", ""))
+                if "Impact Badge" in df_pairs_for_view.columns: badges.append(rr.get("Impact Badge", ""))
+                eb.append(_combine_badges([b for b in badges if b]))
+            df_pairs_for_view["Entry Badge"] = eb
+            if "EQS (0–100)" in display_cols:
+                display_cols = _insert_after(display_cols, "EQS Badge" if "EQS Badge" in display_cols else "EQS (0–100)", "Entry Badge")
+            elif "Meme Score" in display_cols:
+                display_cols = _insert_after(display_cols, "Meme Score", "Entry Badge")
+            else:
+                display_cols.append("Entry Badge")
 
         edited = st.data_editor(
-            df_pairs_for_view[display_cols],
+            df_pairs_for_view[[c for c in display_cols if c in df_pairs_for_view.columns]],
             key="pairs_editor",
             hide_index=True,
             use_container_width=True,
@@ -768,8 +940,36 @@ with tab_radar:
                 "Change 1h (%)": st.column_config.NumberColumn(format="%.2f"),
                 "Change 4h/6h (%)": st.column_config.NumberColumn(format="%.2f"),
                 "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
+                # Progress / extra
+                "EQS (0–100)": st.column_config.ProgressColumn("EQS (0–100)", min_value=0, max_value=100, format="%.1f"),
+                "Flow Acc": st.column_config.ProgressColumn("Flow Acc (x)", min_value=0.0, max_value=2.0, format="%.2f",
+                                                            help="1.0 ≈ neutro; >1 accelera"),
+                "B/S (5m)": st.column_config.ProgressColumn("B/S (5m)", min_value=0.0, max_value=3.0, format="%.2f",
+                                                            help=">1 prevalgono i buy"),
+                "Impact $1k (%)": st.column_config.NumberColumn(format="%.2f"),
+                "#Top10 %": st.column_config.NumberColumn(format="%.1f"),
+                "Buy/Sell Tax %": st.column_config.TextColumn(),
+                "Security Flags": st.column_config.TextColumn(),
+                "Note": st.column_config.TextColumn(help="Appunti locali (si salvano con Autosave/Salva ora)"),
+                # Badges
+                "EQS Badge": st.column_config.TextColumn(help="Badge EQS (≥70 🟢, 50–69 🟡, <50 🔴)"),
+                "Flow Badge": st.column_config.TextColumn(help="Badge Flow Acc (≥1.10 🟢, 1.00–1.09 🟡, <1.00 🔴)"),
+                "Impact Badge": st.column_config.TextColumn(help="Badge Slippage (≤1.0% 🟢, 1.0–3.0% 🟡, >3.0% 🔴)"),
+                "Entry Badge": st.column_config.TextColumn(help="Sintesi di EQS, Flow, Impact"),
             }
         )
+
+        # Sync note editate → session_state["token_notes"]
+        try:
+            for i, row in edited.iterrows():
+                orig = df_pairs_for_view.loc[i]
+                key = (orig.get("Base Address","") or orig.get("Pair Address","") or "").strip()
+                if not key: continue
+                txt = str(row.get("Note","")).strip()
+                if txt: st.session_state["token_notes"][key] = txt
+                else: st.session_state["token_notes"].pop(key, None)
+        except Exception:
+            pass
 
         try:
             sel_idx = edited.index[edited["Select"] == True].tolist()
@@ -788,6 +988,24 @@ with tab_radar:
         cap += "  (Se H4 mancante, mostrata H6)" if show_h6_fallback else ""
         if survivors_only: cap += "  •  Filtro: Survivors 60m"
         st.caption(cap)
+
+        # Snapshot EQS (manuale/auto) + download
+        eqs_sorted = None
+        if df_pairs_table is not None and not df_pairs_table.empty and "EQS (0–100)" in df_pairs_table.columns:
+            eqs_sorted = df_pairs_table.sort_values(by=["EQS (0–100)"], ascending=False).reset_index(drop=True)
+        if eqs_sorted is not None and st.session_state.get("_do_manual_snapshot"):
+            p = make_eqs_snapshot_csv(eqs_sorted, st.session_state.get("snapshot_topk", 50))
+            st.success(f"Snapshot creato: {Path(p).name}")
+            st.session_state["_do_manual_snapshot"] = False
+        if eqs_sorted is not None and st.session_state.get("auto_snapshot_eqs", False):
+            latest = SNAPSHOT_DIR / "eqs_snapshot_latest.csv"
+            make_eqs_snapshot_csv(eqs_sorted, st.session_state.get("snapshot_topk", 50), latest)
+
+        lp = st.session_state.get("last_snapshot_path","")
+        if lp and os.path.exists(lp):
+            with open(lp, "rb") as f:
+                st.download_button("📥 Scarica ultimo snapshot EQS", data=f.read(),
+                                   file_name=os.path.basename(lp), mime="text/csv", key="dl_ezs_last")
 
         # Drill-down
         def _fetch_pair_details_safely(pair_addr: str):
@@ -833,7 +1051,7 @@ with tab_radar:
 
         if selected_row is not None:
             pair_addr = None
-            if ("Pair Address" in selected_row.index) and pd.notna(selected_row.get("Pair Address","")):
+            if "Pair Address" in df_pairs.columns and pd.notna(selected_row.get("Pair Address","")):
                 pair_addr = str(selected_row.get("Pair Address"))
             if (not pair_addr) and isinstance(selected_row.get("Link",""), str) and "/solana/" in selected_row.get("Link",""):
                 try: pair_addr = selected_row["Link"].split("/solana/")[1].split("?")[0]
@@ -992,7 +1210,7 @@ with tab_radar:
             try: return int(mask.sum())
             except Exception: return 0
         c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
-        c_dex = cnt(s["DEX"].fillna("").str.lower().isin(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"])))
+        c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
         c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
         c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
         if vmin is None: vmin = 0
@@ -1012,6 +1230,36 @@ with tab_radar:
         cols[5].metric("Vol24 OK", c_vol)
         cols[6].metric("Turnover OK", c_turn)
         cols[7].metric("Change24 OK", c_chg)
+
+    # 🌈 Anteprima a colori (read-only)
+    st.markdown("#### 🌈 Anteprima a colori (read-only)")
+    show_color_preview = st.toggle("Mostra anteprima con colorazione condizionale", value=True, key="color_preview_toggle")
+    if show_color_preview and (df_pairs_table is not None) and not df_pairs_table.empty:
+        prev_cols = [c for c in [
+            "Pair","DEX","EQS (0–100)","Flow Acc","Impact $1k (%)",
+            "Txns 1h","Liquidity (USD)","Change 1h (%)","Pair Age","Link"
+        ] if c in df_pairs_table.columns]
+
+        if prev_cols:
+            df_prev = df_pairs_table[prev_cols].copy()
+            if "Txns 1h" in df_prev.columns: df_prev["Txns 1h"] = df_prev["Txns 1h"].map(_fmt_thousands)
+            if "Liquidity (USD)" in df_prev.columns: df_prev["Liquidity (USD)"] = df_prev["Liquidity (USD)"].map(_fmt_thousands)
+            if "Change 1h (%)" in df_prev.columns: df_prev["Change 1h (%)"] = df_prev["Change 1h (%)"].map(lambda x: _fmt_float(x,2))
+
+            styler = df_prev.style
+            if "EQS (0–100)" in df_prev.columns:
+                styler = styler.apply(_bg_bucket, lo=50, hi=70, subset=["EQS (0–100)"])
+            if "Flow Acc" in df_prev.columns:
+                styler = styler.apply(_bg_bucket, lo=1.00, hi=1.10, subset=["Flow Acc"])
+            if "Impact $1k (%)" in df_prev.columns:
+                styler = styler.apply(_bg_bucket, lo=1.0, hi=3.0, inverse=True, subset=["Impact $1k (%)"])
+
+            st.dataframe(styler, use_container_width=True)
+            st.caption("Legenda: 🟢 buono • 🟡 medio • 🔴 scarso (per Impact$1k la scala è inversa: più basso è meglio)")
+        else:
+            st.caption("Nessuna colonna target per la preview colorata.")
+    else:
+        st.caption("Anteprima colorata disattivata.")
 
 with tab_winners:
     st.markdown("### 🏆 Winners Now")
@@ -1221,17 +1469,15 @@ with tab_entry:
 
         dfE = dfC[mask].copy()
 
-        # Auto-relax (NON modifica i key dei widget per evitare StreamlitAPIException)
+        # Auto-relax (non scrive nelle chiavi widget per evitare errori di stato)
         relax_applied = False
-        relaxed_params = None  # per messaggio/info
-
+        relaxed_params = None
         if auto_relax and (dfE.empty or len(dfE) < targetN):
             relax_applied = True
             _tx, _ch1min, _ch1max = int(tx_min), int(ch1_min), int(ch1_max)
             _liqmin, _liqmax = int(liq_min_e), int(liq_max_e)
             _agemin, _agemax = int(age_min_m), int(age_max_m)
             _cap24 = int(cap_24h)
-            _allow_h1, _allow_h4m = True, True
 
             for _ in range(10):
                 _tx = max(50, _tx - 50)
@@ -1245,21 +1491,16 @@ with tab_entry:
                 m_tx  = (tx_col >= _tx)
                 m_liq = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
                 m_age = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
-                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if _allow_h1 else ( (ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both") )
-                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ( (ch4_col > -9998) | _allow_h4m )
+                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both"))
+                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ((ch4_col > -9998))
                 m_c24 = (ch24_col <= _cap24) | (ch24_col < -9998)
 
                 m_relaxed = m_ms & m_tx & m_liq & m_age & m_ch1 & m_ch4 & m_c24
                 if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
                 dfE = dfC[m_relaxed].copy()
                 if len(dfE) >= targetN or len(dfE) > 0:
-                    relaxed_params = {
-                        "tx_min": _tx, "ch1_min": _ch1min, "ch1_max": _ch1max,
-                        "liq_min": _liqmin, "liq_max": _liqmax,
-                        "age_min_m": _agemin, "age_max_m": _agemax,
-                        "cap_24h": _cap24
-                    }
-                    st.session_state["_ef_last_relax"] = relaxed_params  # solo info (non widget)
+                    relaxed_params = dict(tx=_tx, ch1min=_ch1min, ch1max=_ch1max, liqmin=_liqmin, liqmax=_liqmax,
+                                          agemin=_agemin, agemax=_agemax, cap24=_cap24)
                     break
 
         # Diagnostica rapida
@@ -1278,17 +1519,12 @@ with tab_entry:
         if dfE.empty:
             st.warning("Nessun candidato con questi parametri. Prova un preset o allarga i range.")
         else:
-            if relax_applied and relaxed_params:
-                st.info(
-                    f"Auto-relax applicato → "
-                    f"Tx≥{relaxed_params['tx_min']}, "
-                    f"H1∈[{relaxed_params['ch1_min']},{relaxed_params['ch1_max']}]%, "
-                    f"Liq≥{relaxed_params['liq_min']}"
-                    f"{' & ≤'+str(relaxed_params['liq_max']) if relaxed_params['liq_max']>0 else ''}, "
-                    f"Age {relaxed_params['age_min_m']}-{relaxed_params['age_max_m']} min, "
-                    f"24h≤{relaxed_params['cap_24h']}%.",
-                    icon="🪄"
-                )
+            if relax_applied and relaxed_params is not None:
+                st.info(f"Auto-relax applicato → Tx≥{relaxed_params['tx']}, "
+                        f"H1∈[{relaxed_params['ch1min']},{relaxed_params['ch1max']}]%, "
+                        f"Liq≥{relaxed_params['liqmin']}{' & ≤'+str(relaxed_params['liqmax']) if relaxed_params['liqmax']>0 else ''}, "
+                        f"Age {relaxed_params['agemin']}-{relaxed_params['agemax']} min, "
+                        f"24h≤{relaxed_params['cap24']}%.", icon="🪄")
 
             # Reasons
             reasons = []
@@ -1317,6 +1553,14 @@ with tab_entry:
                 reasons.append(", ".join(rs))
             dfE["Reasons"] = reasons
 
+            # Entry Badge porting (se presente nel radar)
+            try:
+                if "Entry Badge" in df_pairs_for_view.columns and "Entry Badge" not in dfE.columns:
+                    base_map = df_pairs_for_view.set_index(["Base Address","Pair Address"])["Entry Badge"].to_dict()
+                    dfE["Entry Badge"] = dfE.apply(lambda r: base_map.get((r.get("Base Address",""), r.get("Pair Address","")), ""), axis=1)
+            except Exception:
+                pass
+
             # Ordinamento & show
             if sort_mode.startswith("Momentum"):
                 dfE = dfE.sort_values(by=["Change 1h (%)","Meme Score","Txns 1h"], ascending=[False, False, False])
@@ -1325,7 +1569,7 @@ with tab_entry:
             else:
                 dfE = dfE.sort_values(by=["PairAgeHours","Meme Score"], ascending=[True, False])
 
-            keep_cols = ["Pair","DEX","Meme Score","Price (USD)","Txns 1h",
+            keep_cols = ["Entry Badge","Pair","DEX","Meme Score","Price (USD)","Txns 1h",
                          "Liquidity (USD)","Volume 24h (USD)",
                          "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
                          "ROI (%)","ATH (%)","Drawdown (%)",
@@ -1424,4 +1668,24 @@ st.caption(
     f"TopN={int(st.session_state.get('eq_topN_tab', 10))} • Equity=${st.session_state.get('eq_equity', 0):,.2f}".replace(",", ".")
 )
 
+# === Aggiorna timestamp ===
 st.session_state["last_refresh_ts"] = time.time()
+
+# === Autosave periodico + difensivo (debounce) ===
+if st.session_state.get("autosave_on", False):
+    now_ts = time.time()
+    interval = max(60, int(st.session_state.get("autosave_min", 10)) * 60)  # min 60s
+    due = (now_ts - float(st.session_state.get("last_autosave_ts", 0))) >= interval
+    deb_until = float(st.session_state.get("autosave_debounce_until", 0))
+    ok_window = now_ts >= deb_until
+
+    if st.session_state.get("autosave_skip_err", True) and provider_has_errors(codes):
+        st.session_state["autosave_debounce_until"] = now_ts + int(st.session_state.get("autosave_debounce_sec", 90))
+        ok_window = False
+
+    if due and ok_window:
+        save_persistent_state()
+        st.session_state["last_autosave_ts"] = now_ts
+        st.caption("Autosave completato ✅")
+    elif due and not ok_window:
+        st.caption("Autosave rinviato (debounce attivo) ⏳")
