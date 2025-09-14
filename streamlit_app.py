@@ -7,7 +7,6 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from market_data import MarketDataProvider
@@ -16,9 +15,9 @@ from market_data import MarketDataProvider
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
 
-REFRESH_SEC     = int(os.getenv("REFRESH_SEC", "60"))
-PROXY_TICKET    = float(os.getenv("PROXY_TICKET_USD", "150"))
-BIRDEYE_URL     = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
+REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
+PROXY_TICKET  = float(os.getenv("PROXY_TICKET_USD", "150"))
+BIRDEYE_URL   = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
 AGE_LIMIT_HOURS = 10000.0
 
 SEARCH_QUERIES = [
@@ -27,37 +26,20 @@ SEARCH_QUERIES = [
     "chain:solana pump",
 ]
 UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 MemeRadar/1.1",
+    "User-Agent": "Mozilla/5.0 MemeRadar/1.0",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# HTTP session riusabile
+# Reuse a single HTTP session (resilienza + performance)
 _SESSION = requests.Session()
 _SESSION.headers.update(UA_HEADERS)
-
-def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
-    last = (None, None)
-    for i in range(tries):
-        try:
-            r = _SESSION.get(url, headers=headers, timeout=15)
-            if r.ok:
-                return r.json(), r.status_code
-            last = (None, r.status_code)
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(base_backoff * (i + 1) + random.uniform(0, 0.3))
-                continue
-            break
-        except Exception:
-            last = (None, "ERR")
-            time.sleep(base_backoff * (i + 1) + random.uniform(0, 0.3))
-    return last
 
 # =============== Session State ===============
 if "app_running" not in st.session_state: st.session_state["app_running"] = True
 if "last_refresh_ts" not in st.session_state: st.session_state["last_refresh_ts"] = time.time()
 
-# Profit metrics baseline/ath per token (chiave: pairAddress preferito)
+# Profit metrics baseline/ath per token (key = pairAddress)
 for k in ("baseline_px","ath_px"):
     if k not in st.session_state: st.session_state[k] = {}
 
@@ -67,15 +49,7 @@ if "eq_init_capital" not in st.session_state: st.session_state["eq_init_capital"
 if "eq_equity" not in st.session_state: st.session_state["eq_equity"] = float(st.session_state["eq_init_capital"])
 if "eq_history" not in st.session_state: st.session_state["eq_history"] = []   # [{ts,equity,ret,n}]
 if "eq_last_prices" not in st.session_state: st.session_state["eq_last_prices"] = {}
-
-# Colonne DataFrame centralizzate
-C = SimpleNamespace(
-    MEME="Meme Score", PAIR="Pair", DEX="DEX", LIQ="Liquidity (USD)", TX1H="Txns 1h", VOL24="Volume 24h (USD)",
-    PRICE="Price (USD)", ROI="ROI (%)", ATH="ATH (%)", DD="Drawdown (%)",
-    CH1="Change 1h (%)", CH4="Change 4h/6h (%)", CH24="Change 24h (%)",
-    CREATED="Created (UTC)", AGE="Pair Age", AGEH="PairAgeHours", LINK="Link",
-    BASEA="Base Address", PAIRA="Pair Address", BASES="baseSymbol", QUOTES="quoteSymbol",
-)
+if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
 
 # ================= Sidebar =================
 with st.sidebar:
@@ -251,16 +225,19 @@ with st.sidebar:
     def _tg_send_test():
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             st.warning("Inserisci BOT_TOKEN e CHAT_ID."); return
-        ok, err = tg_send("✅ Test dal Meme Radar")
-        if ok: st.success("Messaggio di test inviato ✅")
-        else:  st.error(f"Errore Telegram: {err}")
+        try:
+            rq = _SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar", "disable_web_page_preview": True}, timeout=15)
+            st.success("Messaggio di test inviato ✅" if rq.ok else f"Telegram {rq.status_code}.")
+        except Exception as e:
+            st.error(f"Errore Telegram: {e}")
     if st.button("Test Telegram"): _tg_send_test()
 
 # ---------- Stato Esecuzione ----------
 running = bool(st.session_state.get("app_running", True))
 st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
 
-# 🔁 Auto-refresh safe (senza thread esterni)
+# 🔁 Auto-refresh (senza thread secondari, fallback HTML meta-refresh)
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -278,10 +255,8 @@ if effective_auto_refresh:
     if st_autorefresh:
         st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
     else:
-        # fallback semplice: ad ogni run aspetta REFRESH_SEC e ritriggera
-        if secs_left == 0:
-            time.sleep(max(1, REFRESH_SEC))
-            st.rerun()
+        # Fallback universale (HTML meta refresh)
+        st.markdown(f"<meta http-equiv='refresh' content='{REFRESH_SEC}'>", unsafe_allow_html=True)
 
 util_col1, util_col2 = st.columns([5, 1])
 with util_col1:
@@ -291,6 +266,21 @@ with util_col2:
         st.rerun()
 
 # ================= Helpers =================
+def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
+    last = (None, None)
+    for i in range(tries):
+        try:
+            r = _SESSION.get(url, headers=headers or UA_HEADERS, timeout=15)
+            code = r.status_code
+            if r.ok: return r.json(), code
+            last = (None, code)
+            if code in (429,500,502,503,504):
+                time.sleep(base_backoff*(i+1) + random.uniform(0,0.3)); continue
+            break
+        except Exception:
+            last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
+    return last
+
 def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
 
 def hours_since_ms(ms_or_s):
@@ -350,19 +340,15 @@ STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","E
 WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
 DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
 
-def s_sigmoid(x, k=0.02, center=200.0):
-    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - center)))
+def s_sigmoid(x, k=0.02):
+    try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
     except Exception: return 0.0
-
 def score_symbol(s):
     S=(s or "").upper()
     return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
-
 def score_age(hours):
     if hours is None: return 0.5
-    h = max(0.0, float(hours))
-    return max(0.0, min(1.0, 1.0 - (h/72.0)**0.6))  # concava: favorisce < 2h
-
+    return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
 def score_liq(liq, mn, mx):
     if liq is None or liq <= 0: return 0.0
     try: mn = float(mn) if mn is not None else 0.0
@@ -372,10 +358,10 @@ def score_liq(liq, mn, mx):
     if mn <= liq <= mx: return 1.0
     if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
     return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
-
 def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
 def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
+    """Usa i parametri passati (no variabili globali)"""
     base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
     dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
     liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
@@ -383,13 +369,14 @@ def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     w_symbol_, w_age_, w_txns_, w_liq_, w_dex_ = tuple(weights or (20,20,25,20,15))
 
-    liq_score = score_liq((liq or 0.0), sweet_min, sweet_max)  # ✅ usa i parametri
+    liq_score = score_liq((liq or 0.0), sweet_min, sweet_max)
     f = (w_symbol_ * score_symbol(base) +
          w_age_    * score_age(ageh) +
-         w_txns_   * s_sigmoid(tx1) +
-         w_liq_    * liq_score +
+         w_txns_   * s_sigmoid(tx1)  +
+         w_liq_    * liq_score       +
          w_dex_    * score_dex(dex))
-    return round(100.0 * f / max(1e-6, (w_symbol_+w_age_+w_txns_+w_liq_+w_dex_)))
+    denom = max(1e-6, (w_symbol_+w_age_+w_txns_+w_liq_+w_dex_))
+    return round(100.0 * f / denom)
 
 # ============== Provider init ==============
 if "provider" not in st.session_state:
@@ -410,11 +397,11 @@ except Exception:
                          exclude_quotes=[])
 
 df_provider, ts = provider.get_snapshot()
-df_provider = df_provider if isinstance(df_provider, pd.DataFrame) else pd.DataFrame()
 codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
 # ============== Watchlist & Volume filtro dataset ==============
+df_provider = df_provider if isinstance(df_provider, pd.DataFrame) else pd.DataFrame()
 df_view = df_provider.copy()
 pre_count = len(df_view)
 
@@ -505,10 +492,11 @@ with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
 # ============== ROI/ATH/DD helpers ==============
 def _addr_key_from_rowdict(rdict):
+    # Preferisci SEMPRE pairAddress (pool univoco)
     for k in ("pairAddress","Pair Address","baseAddress","Base Address"):
         v = rdict.get(k)
         if v: return str(v)
-    return rdict.get("Pair") or None
+    return rdict.get("Pair") or rdict.get("pair") or None
 
 def update_profit_metrics_from_raw(rdict):
     addr = _addr_key_from_rowdict(rdict)
@@ -580,24 +568,24 @@ def build_table(df):
         roi_pct, ath_pct, dd_pct = update_profit_metrics_from_raw(r)
 
         rows.append({
-            C.MEME: mscore,
-            C.PAIR: f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
-            C.DEX: r.get("dexId",""),
-            C.LIQ: to_int0(r.get("liquidityUsd"), 0),
-            C.TX1H: to_int0(r.get("txns1h"), 0),
-            C.VOL24: to_int0(r.get("volume24hUsd"), 0),
-            C.PRICE: (None if r.get("priceUsd") in (None, "") else to_float0(r.get("priceUsd"), None)),
-            C.ROI: roi_pct, C.ATH: ath_pct, C.DD: dd_pct,
-            C.CH1: chg_1h, C.CH4: chg_4h, C.CH24: chg_24h,
-            C.CREATED: ms_to_dt(r.get("pairCreatedAt", 0)),
-            C.AGE: fmt_age(ageh), C.AGEH: (float(ageh) if ageh is not None else None),
-            C.LINK: r.get("url",""),
-            C.BASEA: r.get("baseAddress",""), C.PAIRA: r.get("pairAddress",""),
-            C.BASES: r.get("baseSymbol",""), C.QUOTES: r.get("quoteSymbol",""),
+            "Meme Score": mscore,
+            "Pair": f"{r.get('baseSymbol','')}/{r.get('quoteSymbol','')}",
+            "DEX": r.get("dexId",""),
+            "Liquidity (USD)": to_int0(r.get("liquidityUsd"), 0),
+            "Txns 1h": to_int0(r.get("txns1h"), 0),
+            "Volume 24h (USD)": to_int0(r.get("volume24hUsd"), 0),
+            "Price (USD)": (None if r.get("priceUsd") in (None, "") else to_float0(r.get("priceUsd"), None)),
+            "ROI (%)": roi_pct, "ATH (%)": ath_pct, "Drawdown (%)": dd_pct,
+            "Change 1h (%)": chg_1h, "Change 4h/6h (%)": chg_4h, "Change 24h (%)": chg_24h,
+            "Created (UTC)": ms_to_dt(r.get("pairCreatedAt", 0)),
+            "Pair Age": fmt_age(ageh), "PairAgeHours": (float(ageh) if ageh is not None else None),
+            "Link": r.get("url",""),
+            "Base Address": r.get("baseAddress",""), "Pair Address": r.get("pairAddress",""),
+            "baseSymbol": r.get("baseSymbol",""), "quoteSymbol": r.get("quoteSymbol",""),
         })
     out = pd.DataFrame(rows)
     if not out.empty and sort_by_meme:
-        out = out.sort_values(by=[C.MEME, C.TX1H, C.LIQ], ascending=[False, False, False])
+        out = out.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
     return out
 
 df_pairs = build_table(df_view)
@@ -605,34 +593,34 @@ df_pairs = build_table(df_view)
 # === Filtri SOLO tabella ===
 df_pairs_table = df_pairs.copy()
 if not df_pairs_table.empty and pairs_meme_min > 0:
-    df_pairs_table = df_pairs_table[pd.to_numeric(df_pairs_table[C.MEME], errors="coerce").fillna(0) >= int(pairs_meme_min)]
-if not df_pairs_table.empty and C.AGEH in df_pairs_table.columns:
-    age_series = pd.to_numeric(df_pairs_table[C.AGEH], errors="coerce")
+    df_pairs_table = df_pairs_table[pd.to_numeric(df_pairs_table["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)]
+if not df_pairs_table.empty and "PairAgeHours" in df_pairs_table.columns:
+    age_series = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce")
     df_pairs_table = df_pairs_table[age_series.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
-if pairs_liq_enable and not df_pairs_table.empty and C.LIQ in df_pairs_table.columns:
-    liq_series = pd.to_numeric(df_pairs_table[C.LIQ], errors="coerce").fillna(0)
+if pairs_liq_enable and not df_pairs_table.empty and "Liquidity (USD)" in df_pairs_table.columns:
+    liq_series = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
     df_pairs_table = df_pairs_table[(liq_series >= pairs_liq_min) & (liq_series <= pairs_liq_max)]
-if pairs_vol_enable and not df_pairs_table.empty and C.VOL24 in df_pairs_table.columns:
-    vol_series_tbl = pd.to_numeric(df_pairs_table[C.VOL24], errors="coerce").fillna(0)
+if pairs_vol_enable and not df_pairs_table.empty and "Volume 24h (USD)" in df_pairs_table.columns:
+    vol_series_tbl = pd.to_numeric(df_pairs_table["Volume 24h (USD)"], errors="coerce").fillna(0)
     df_pairs_table = df_pairs_table[(vol_series_tbl >= pairs_vol_min) & (vol_series_tbl <= pairs_vol_max)]
 if survivors_only and not df_pairs_table.empty:
-    age_series = pd.to_numeric(df_pairs_table[C.AGEH], errors="coerce").fillna(0)
-    roi_series = pd.to_numeric(df_pairs_table[C.ROI], errors="coerce")
+    age_series = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce").fillna(0)
+    roi_series = pd.to_numeric(df_pairs_table["ROI (%)"], errors="coerce")
     df_pairs_table = df_pairs_table[(age_series >= 1.0) & (roi_series > 0)]
 
 # === PAIRS → Diagnostica (opzionale) ===
 df_pairs_diag = df_pairs.copy()
 if pairs_filters_to_strategy and not df_pairs_diag.empty:
     if apply_meme_to_strat and pairs_meme_min > 0:
-        df_pairs_diag = df_pairs_diag[pd.to_numeric(df_pairs_diag[C.MEME], errors="coerce").fillna(0) >= int(pairs_meme_min)]
-    if apply_age_to_strat and C.AGEH in df_pairs_diag.columns:
-        age_series_str = pd.to_numeric(df_pairs_diag[C.AGEH], errors="coerce")
+        df_pairs_diag = df_pairs_diag[pd.to_numeric(df_pairs_diag["Meme Score"], errors="coerce").fillna(0) >= int(pairs_meme_min)]
+    if apply_age_to_strat and "PairAgeHours" in df_pairs_diag.columns:
+        age_series_str = pd.to_numeric(df_pairs_diag["PairAgeHours"], errors="coerce")
         df_pairs_diag = df_pairs_diag[age_series_str.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
-    if apply_liq_to_strat and pairs_liq_enable and C.LIQ in df_pairs_diag.columns:
-        liq_series_str = pd.to_numeric(df_pairs_diag[C.LIQ], errors="coerce").fillna(0)
+    if apply_liq_to_strat and pairs_liq_enable and "Liquidity (USD)" in df_pairs_diag.columns:
+        liq_series_str = pd.to_numeric(df_pairs_diag["Liquidity (USD)"], errors="coerce").fillna(0)
         df_pairs_diag = df_pairs_diag[(liq_series_str >= pairs_liq_min) & (liq_series_str <= pairs_liq_max)]
-    if apply_vol_to_strat and pairs_vol_enable and C.VOL24 in df_pairs_diag.columns:
-        vol_series_str = pd.to_numeric(df_pairs_diag[C.VOL24], errors="coerce").fillna(0)
+    if apply_vol_to_strat and pairs_vol_enable and "Volume 24h (USD)" in df_pairs_diag.columns:
+        vol_series_str = pd.to_numeric(df_pairs_diag["Volume 24h (USD)"], errors="coerce").fillna(0)
         df_pairs_diag = df_pairs_diag[(vol_series_str >= pairs_vol_min) & (vol_series_str <= pairs_vol_max)]
 
 df_pairs_used = df_pairs_diag if (pairs_filters_to_strategy) else df_pairs
@@ -665,18 +653,18 @@ else:
 
 # ============== Equity helpers & tick ==============
 def _addr_from_row(row: dict):
-    for k in (C.PAIRA, C.BASEA):
+    for k in ("Pair Address","Base Address"):
         v = row.get(k)
         if isinstance(v, str) and v: return v
-    return row.get(C.PAIR)
+    return row.get("Pair")
 
 def _select_top_roi(df_pairs_table: pd.DataFrame, topN: int) -> pd.DataFrame:
     if df_pairs_table is None or df_pairs_table.empty: return pd.DataFrame()
     tmp = df_pairs_table.copy()
-    tmp["ROI_val"] = pd.to_numeric(tmp[C.ROI], errors="coerce")
+    tmp["ROI_val"] = pd.to_numeric(tmp["ROI (%)"], errors="coerce")
     tmp = tmp.dropna(subset=["ROI_val"])
     if tmp.empty:
-        tmp["c1_val"] = pd.to_numeric(tmp[C.CH1], errors="coerce")
+        tmp["c1_val"] = pd.to_numeric(tmp["Change 1h (%)"], errors="coerce")
         tmp = tmp.dropna(subset=["c1_val"]).sort_values(by="c1_val", ascending=False).head(topN)
     else:
         tmp = tmp.sort_values(by="ROI_val", ascending=False).head(topN)
@@ -684,11 +672,11 @@ def _select_top_roi(df_pairs_table: pd.DataFrame, topN: int) -> pd.DataFrame:
 
 def _equity_tick(df_pairs_table: pd.DataFrame, topN: int = 10) -> None:
     if df_pairs_table is None or df_pairs_table.empty: return
-    sel = _select_top_roi(df_pairs_table, topN); 
+    sel = _select_top_roi(df_pairs_table, topN)
     if sel.empty: return
     curr_prices = {}
     for _, row in sel.iterrows():
-        addr = _addr_from_row(row); px = row.get(C.PRICE)
+        addr = _addr_from_row(row); px = row.get("Price (USD)")
         try:
             if addr and px is not None and float(px) > 0: curr_prices[addr] = float(px)
         except Exception: pass
@@ -731,8 +719,8 @@ with tab_radar:
     left, right = st.columns(2)
     with left:
         if not df_pairs_table.empty:
-            df_top = df_pairs_table.sort_values(by=[C.VOL24], ascending=False).head(10)
-            df_chart = pd.DataFrame({"Token": df_top[C.PAIR], "Volume 24h": df_top[C.VOL24].fillna(0)})
+            df_top = df_pairs_table.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10)
+            df_chart = pd.DataFrame({"Token": df_top["Pair"], "Volume 24h": df_top["Volume 24h (USD)"].fillna(0)})
             fig = px.bar(df_chart, x="Token", y="Volume 24h", title="Top 10 Volume 24h (tabella filtrata)")
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -751,18 +739,18 @@ with tab_radar:
     st.markdown("### Pairs (post-filtri)")
     if not df_pairs_table.empty:
         base_for_view = df_pairs_table
-        df_pairs_for_view = base_for_view.sort_values(by=[C.VOL24], ascending=False).head(10) if show_top10_table else base_for_view
+        df_pairs_for_view = base_for_view.sort_values(by=["Volume 24h (USD)"], ascending=False).head(10) if show_top10_table else base_for_view
 
         df_pairs_for_view = df_pairs_for_view.copy()
         if "Select" not in df_pairs_for_view.columns:
             df_pairs_for_view.insert(0, "Select", False)
 
-        display_cols = ["Select",C.PAIR,C.DEX,C.MEME,C.PRICE,
-                        C.ROI,C.ATH,C.DD,
-                        C.CH1,C.CH4,C.CH24,
-                        C.TX1H,C.LIQ,C.VOL24,C.AGE,C.LINK]
-        if not show_pair_age and C.AGE in display_cols:
-            display_cols.remove(C.AGE)
+        display_cols = ["Select","Pair","DEX","Meme Score","Price (USD)",
+                        "ROI (%)","ATH (%)","Drawdown (%)",
+                        "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
+                        "Txns 1h","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]
+        if not show_pair_age and "Pair Age" in display_cols:
+            display_cols.remove("Pair Age")
 
         edited = st.data_editor(
             df_pairs_for_view[display_cols],
@@ -772,17 +760,17 @@ with tab_radar:
             disabled=False,
             column_config={
                 "Select": st.column_config.CheckboxColumn(help="Spunta per aprire il pannello drill-down"),
-                C.LINK: st.column_config.LinkColumn("Link"),
-                C.LIQ: st.column_config.NumberColumn(format="%,d"),
-                C.VOL24: st.column_config.NumberColumn(format="%,d"),
-                C.MEME: st.column_config.NumberColumn(help="0–100"),
-                C.PRICE: st.column_config.NumberColumn(format="%.8f"),
-                C.ROI: st.column_config.NumberColumn(format="%.2f"),
-                C.ATH: st.column_config.NumberColumn(format="%.2f"),
-                C.DD: st.column_config.NumberColumn(format="%.2f"),
-                C.CH1: st.column_config.NumberColumn(format="%.2f"),
-                C.CH4: st.column_config.NumberColumn(format="%.2f"),
-                C.CH24: st.column_config.NumberColumn(format="%.2f"),
+                "Link": st.column_config.LinkColumn("Link"),
+                "Liquidity (USD)": st.column_config.NumberColumn(format="%,d"),
+                "Volume 24h (USD)": st.column_config.NumberColumn(format="%,d"),
+                "Meme Score": st.column_config.NumberColumn(help="0–100"),
+                "Price (USD)": st.column_config.NumberColumn(format="%.8f"),
+                "ROI (%)": st.column_config.NumberColumn(format="%.2f"),
+                "ATH (%)": st.column_config.NumberColumn(format="%.2f"),
+                "Drawdown (%)": st.column_config.NumberColumn(format="%.2f"),
+                "Change 1h (%)": st.column_config.NumberColumn(format="%.2f"),
+                "Change 4h/6h (%)": st.column_config.NumberColumn(format="%.2f"),
+                "Change 24h (%)": st.column_config.NumberColumn(format="%.2f"),
             }
         )
 
@@ -793,9 +781,9 @@ with tab_radar:
         selected_row = df_pairs_for_view.loc[sel_idx[-1]] if sel_idx else None
 
         try:
-            n1 = pd.to_numeric(df_pairs_for_view.loc[edited.index, C.CH1], errors="coerce").notna().sum()
-            n4 = pd.to_numeric(df_pairs_for_view.loc[edited.index, C.CH4], errors="coerce").notna().sum()
-            nroi = pd.to_numeric(df_pairs_for_view.loc[edited.index, C.ROI], errors="coerce").notna().sum()
+            n1 = pd.to_numeric(df_pairs_for_view.loc[edited.index, "Change 1h (%)"], errors="coerce").notna().sum()
+            n4 = pd.to_numeric(df_pairs_for_view.loc[edited.index, "Change 4h/6h (%)"], errors="coerce").notna().sum()
+            nroi = pd.to_numeric(df_pairs_for_view.loc[edited.index, "ROI (%)"], errors="coerce").notna().sum()
             st.caption(f"Diagnostica Change/ROI: 1h {n1}/{len(edited)} • 4h/6h {n4}/{len(edited)} • ROI {nroi}/{len(edited)}")
         except Exception:
             pass
@@ -848,18 +836,17 @@ with tab_radar:
 
         if selected_row is not None:
             pair_addr = None
-            if C.PAIRA in df_pairs.columns and pd.notna(selected_row.get(C.PAIRA,"")):
-                pair_addr = str(selected_row.get(C.PAIRA))
-            if (not pair_addr) and isinstance(selected_row.get(C.LINK,""), str) and "/solana/" in selected_row.get(C.LINK,""):
-                try: pair_addr = selected_row[C.LINK].split("/solana/")[1].split("?")[0]
+            if "Pair Address" in df_pairs.columns and pd.notna(selected_row.get("Pair Address","")):
+                pair_addr = str(selected_row.get("Pair Address"))
+            if (not pair_addr) and isinstance(selected_row.get("Link",""), str) and "/solana/" in selected_row.get("Link",""):
+                try: pair_addr = selected_row["Link"].split("/solana/")[1].split("?")[0]
                 except Exception: pass
 
             st.markdown("#### 🔎 Token drill-down")
             if not pair_addr:
                 st.info("Impossibile determinare il Pair Address.")
             else:
-                with st.spinner("Carico dettagli pair…"):
-                    pair, http_code = _fetch_pair_details_safely(pair_addr)
+                pair, http_code = _fetch_pair_details_safely(pair_addr)
                 if not pair:
                     st.warning(f"Nessun dettaglio disponibile (DexScreener {http_code}).")
                 else:
@@ -984,9 +971,9 @@ with tab_radar:
     # Diagnostica mercato
     def market_heat_value(df: pd.DataFrame, topN: int) -> float:
         if df is None or df.empty: return 0.0
-        if C.VOL24 not in df.columns or C.TX1H not in df.columns: return 0.0
-        top = df.sort_values(by=[C.VOL24], ascending=False).head(max(1, int(topN)))
-        return float(pd.to_numeric(top[C.TX1H], errors="coerce").fillna(0).mean())
+        if "Volume 24h (USD)" not in df.columns or "Txns 1h" not in df.columns: return 0.0
+        top = df.sort_values(by=["Volume 24h (USD)"], ascending=False).head(max(1, int(topN)))
+        return float(pd.to_numeric(top["Txns 1h"], errors="coerce").fillna(0).mean())
 
     st.markdown("### Diagnostica mercato")
     if df_pairs_used is None or df_pairs_used.empty:
@@ -1001,22 +988,22 @@ with tab_radar:
         s = df_pairs_used.copy()
         total = len(s)
         try:
-            chg_series = pd.to_numeric(s[C.CH24], errors="coerce").fillna(0)
+            chg_series = pd.to_numeric(s["Change 24h (%)"], errors="coerce").fillna(0)
         except Exception:
             chg_series = pd.Series([0]*len(s))
         def cnt(mask):
             try: return int(mask.sum())
             except Exception: return 0
-        c_liq = cnt((s[C.LIQ] >= float(liq_min_sweet)) & (s[C.LIQ] <= float(liq_max_sweet)))
-        c_dex = cnt(s[C.DEX].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
-        c_meme = cnt(s[C.MEME] >= int(st.session_state.get("strat_meme", 70)))
-        c_tx   = cnt(s[C.TX1H] >= int(st.session_state.get("strat_txns", 250)))
+        c_liq = cnt((s["Liquidity (USD)"] >= float(liq_min_sweet)) & (s["Liquidity (USD)"] <= float(liq_max_sweet)))
+        c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
+        c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
+        c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
         if vmin is None: vmin = 0
         if vol24_max > 0:
-            c_vol = cnt((s[C.VOL24] >= vmin) & (s[C.VOL24] <= vol24_max))
+            c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vol24_max))
         else:
-            c_vol = cnt((s[C.VOL24] >= vmin))
-        c_turn = cnt((s[C.VOL24] / s[C.LIQ].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
+            c_vol = cnt((s["Volume 24h (USD)"] >= vmin))
+        c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
         c_chg  = cnt((chg_series >= float(st.session_state.get("chg_min", -8))) & (chg_series <= float(st.session_state.get("chg_max", 180))))
 
         cols = st.columns(8)
@@ -1035,9 +1022,9 @@ with tab_winners:
         st.info("Nessuna coppia disponibile con i filtri tabella attuali.")
     else:
         df_roi = df_pairs_table.copy()
-        df_roi["ROI_val"] = pd.to_numeric(df_roi[C.ROI], errors="coerce")
+        df_roi["ROI_val"] = pd.to_numeric(df_roi["ROI (%)"], errors="coerce")
         df_roi = df_roi.dropna(subset=["ROI_val"]).sort_values(by="ROI_val", ascending=False).head(20)
-        cols_keep = [C.PAIR,C.DEX,C.PRICE,C.ROI,C.ATH,C.DD,C.CH1,C.LIQ,C.VOL24,C.AGE,C.LINK]
+        cols_keep = ["Pair","DEX","Price (USD)","ROI (%)","ATH (%)","Drawdown (%)","Change 1h (%)","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]
         if df_roi.empty:
             st.warning("Nessun ROI calcolabile (prezzi non disponibili).")
         else:
@@ -1046,13 +1033,13 @@ with tab_winners:
 
         st.divider()
         df_c1 = df_pairs_table.copy()
-        df_c1["c1_val"] = pd.to_numeric(df_c1[C.CH1], errors="coerce")
+        df_c1["c1_val"] = pd.to_numeric(df_c1["Change 1h (%)"], errors="coerce")
         df_c1 = df_c1.dropna(subset=["c1_val"]).sort_values(by="c1_val", ascending=False).head(20)
         if df_c1.empty:
             st.warning("Change 1h non disponibile.")
         else:
             st.markdown("**Top 20 per Change 1h (%)**")
-            st.dataframe(df_c1[[C.PAIR,C.DEX,C.PRICE,C.CH1,C.LIQ,C.VOL24,C.AGE,C.LINK]],
+            st.dataframe(df_c1[["Pair","DEX","Price (USD)","Change 1h (%)","Liquidity (USD)","Volume 24h (USD)","Pair Age","Link"]],
                          use_container_width=True, hide_index=True)
         st.caption(f"Survivors 60m attivo: {'SÌ' if survivors_only else 'NO'}")
 
@@ -1215,15 +1202,15 @@ with tab_entry:
         def _num(s, col, default=0.0):
             if col not in s.columns: return pd.Series([default]*len(s))
             return pd.to_numeric(s[col], errors="coerce").fillna(default)
-        age_h   = pd.to_numeric(dfC.get(C.AGEH), errors="coerce")
-        ms_col  = _num(dfC, C.MEME)
-        tx_col  = _num(dfC, C.TX1H)
-        liq_col = _num(dfC, C.LIQ)
-        vol_col = _num(dfC, C.VOL24)
-        ch1_col = _num(dfC, C.CH1, default=-9999)
-        ch4_col = _num(dfC, C.CH4, default=-9999)
-        ch24_col= _num(dfC, C.CH24, default=-9999)
-        roi_col = _num(dfC, C.ROI, default=-9999)
+        age_h   = pd.to_numeric(dfC.get("PairAgeHours"), errors="coerce")
+        ms_col  = _num(dfC, "Meme Score")
+        tx_col  = _num(dfC, "Txns 1h")
+        liq_col = _num(dfC, "Liquidity (USD)")
+        vol_col = _num(dfC, "Volume 24h (USD)")
+        ch1_col = _num(dfC, "Change 1h (%)", default=-9999)
+        ch4_col = _num(dfC, "Change 4h/6h (%)", default=-9999)
+        ch24_col= _num(dfC, "Change 24h (%)", default=-9999)
+        roi_col = _num(dfC, "ROI (%)", default=-9999)
 
         # Maschere
         m_ms  = (ms_col >= ms_min)
@@ -1241,4 +1228,353 @@ with tab_entry:
             m_ch4 = (has_h4 | allow_missing_h4)
         m_ch24 = (ch24_col <= cap_24h) | (ch24_col < -9998)
 
-        mask = m_ms & m_tx & m_liq & m_age & m_vol & m_ch1 &
+        mask = m_ms & m_tx & m_liq & m_age & m_vol & m_ch1 & m_ch4 & m_ch24
+        if survivors_gate:
+            mask = mask & ((age_h >= 1.0) & (roi_col > 0))
+
+        dfE = dfC[mask].copy()
+
+        # --- Auto-relax (senza toccare subito session_state) ---
+        relax_applied = False
+        relaxed_values = None  # parametri proposti (opzionali)
+
+        if auto_relax and (dfE.empty or len(dfE) < targetN):
+            relax_applied = True
+
+            _tx      = int(tx_min)
+            _ch1min  = int(ch1_min)
+            _ch1max  = int(ch1_max)
+            _liqmin  = int(liq_min_e)
+            _liqmax  = int(liq_max_e)
+            _volmin  = int(vol_min_e)
+            _volmax  = int(vol_max_e)
+            _agemin  = int(age_min_m)
+            _agemax  = int(age_max_m)
+            _cap24   = int(cap_24h)
+
+            for _ in range(10):
+                # allenta i vincoli
+                _tx     = max(50, _tx - 50)
+                _ch1min -= 3
+                _ch1max += 5
+                _liqmin = max(0, _liqmin - 5000)
+                _liqmax = 0 if _liqmax == 0 else min(1_000_000_000, int(_liqmax * 2))
+                _volmin = max(0, _volmin - 20_000)
+                _volmax = 0 if _volmax == 0 else min(2_000_000_000, int(_volmax * 2))
+                _agemin = max(0, _agemin - 5)
+                _agemax = min(720, _agemax + 60)
+                _cap24  = min(300, _cap24 + 30)
+
+                m_tx   = (tx_col >= _tx)
+                m_liq  = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
+                m_age  = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
+                m_vol  = (vol_col >= _volmin) & ((_volmax == 0) | (vol_col <= _volmax))
+                m_ch1r = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if allow_missing_ch1 else ((ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both"))
+                m_ch4r = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ((ch4_col > -9998) | allow_missing_h4)
+                m_c24r = (ch24_col <= _cap24) | (ch24_col < -9998)
+
+                m_relaxed = m_ms & m_tx & m_liq & m_age & m_vol & m_ch1r & m_ch4r & m_c24r
+                if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
+                dfE = dfC[m_relaxed].copy()
+                if len(dfE) >= targetN or len(dfE) > 0:
+                    relaxed_values = {
+                        "ef_tx_min": _tx,
+                        "ef_ch1_min": _ch1min,
+                        "ef_ch1_max": _ch1max,
+                        "ef_liq_min": _liqmin,
+                        "ef_liq_max": _liqmax,
+                        "ef_vol_min": _volmin,
+                        "ef_vol_max": _volmax,
+                        "ef_age_min_m": _agemin,
+                        "ef_age_max_m": _agemax,
+                        "ef_cap_24h": _cap24,
+                    }
+                    break
+
+        # Diagnostica rapida
+        def _diag_counts():
+            return {
+                "Universe": len(dfC),
+                "H1 n/d": int((ch1_col <= -9998).sum()),
+                "H4/6 n/d": int((ch4_col <= -9998).sum())
+            }
+        diag = _diag_counts()
+        cols = st.columns(3)
+        cols[0].metric("Universe", diag.get("Universe", 0))
+        cols[1].metric("H1 n/d", diag.get("H1 n/d", 0))
+        cols[2].metric("H4/6 n/d", diag.get("H4/6 n/d", 0))
+
+        # Entry grade + badge sintetico
+        def _entry_grade(row) -> tuple[int, str]:
+            # 0–100 + badge
+            ms = float(row.get("Meme Score", 0) or 0)
+            tx = float(row.get("Txns 1h", 0) or 0)
+            liq= float(row.get("Liquidity (USD)", 0) or 0)
+            vol= float(row.get("Volume 24h (USD)", 0) or 0)
+            c1 = row.get("Change 1h (%)", None)
+            c4 = row.get("Change 4h/6h (%)", None)
+            c24= row.get("Change 24h (%)", None)
+
+            heat = s_sigmoid(tx) * 100
+            sweet_liq = score_liq(liq, liq_min_sweet, liq_max_sweet) * 100
+            sweet_vol = 100.0 if (vol >= vol_min_e and (vol_max_e==0 or vol <= vol_max_e)) else (70.0 if vol>0 else 30.0)
+            mom_ok = 100.0 if (c1 is not None and ch1_min <= float(c1) <= ch1_max) else (60.0 if (c1 is None and allow_missing_ch1) else 20.0)
+            trend_ok = 100.0 if (c4 is not None and float(c4) > 0) else (60.0 if allow_missing_h4 else 20.0)
+            overext = 100.0 if (c24 is None or float(c24) <= cap_24h) else 40.0
+
+            grade = 0.25*ms + 0.2*heat + 0.15*sweet_liq + 0.1*sweet_vol + 0.15*mom_ok + 0.1*trend_ok + 0.05*overext
+            badge = "🟢" if grade >= 70 else ("🟡" if grade >= 55 else "🔴")
+            return int(round(grade)), badge
+
+        if dfE.empty:
+            st.warning("Nessun candidato con questi parametri. Prova un preset o allarga i range.")
+        else:
+            # Reasons
+            reasons = []
+            grades = []
+            badges = []
+            for _, r in dfE.iterrows():
+                rs = []
+                try:
+                    if float(r.get("Meme Score", 0)) >= ms_min: rs.append("MS✓")
+                    if float(r.get("Txns 1h", 0)) >= tx_min: rs.append("Tx1h✓")
+                    L = float(r.get("Liquidity (USD)", 0))
+                    if (L >= liq_min_e) and ((liq_max_e == 0) or (L <= liq_max_e)): rs.append("Liq✓")
+                    V = float(r.get("Volume 24h (USD)", 0))
+                    if (V >= vol_min_e) and ((vol_max_e == 0) or (V <= vol_max_e)): rs.append("Vol24✓")
+                    v1 = r.get("Change 1h (%)", None)
+                    if pd.isna(v1):
+                        if allow_missing_ch1: rs.append("H1 n/d✓")
+                    else:
+                        if ch1_min <= float(v1) <= ch1_max: rs.append("H1✓")
+                    v4 = r.get("Change 4h/6h (%)", None)
+                    if pd.isna(v4):
+                        if allow_missing_h4: rs.append("H4/6 n/d✓")
+                    else:
+                        if (not trend_pos) or float(v4) > 0: rs.append("H4/6✓")
+                    if float(r.get("Change 24h (%)", 9999)) <= cap_24h: rs.append("24h≤cap")
+                    if survivors_gate and float(r.get("ROI (%)", -999))>0 and float(r.get("PairAgeHours",0))>=1.0:
+                        rs.append("Survivor✓")
+                except Exception:
+                    pass
+                reasons.append(", ".join(rs))
+                g, b = _entry_grade(r)
+                grades.append(g); badges.append(b)
+
+            dfE["Reasons"] = reasons
+            dfE["Entry Grade"] = grades
+            dfE["Badge"] = badges
+
+            # Ordinamento & show
+            if sort_mode.startswith("Momentum"):
+                dfE = dfE.sort_values(by=["Change 1h (%)","Entry Grade","Meme Score"], ascending=[False, False, False])
+            elif sort_mode.startswith("Qualità"):
+                dfE = dfE.sort_values(by=["Entry Grade","Meme Score","Txns 1h"], ascending=[False, False, False])
+            else:
+                dfE = dfE.sort_values(by=["PairAgeHours","Entry Grade","Meme Score"], ascending=[True, False, False])
+
+            keep_cols = ["Badge","Entry Grade","Pair","DEX","Meme Score","Price (USD)","Txns 1h",
+                         "Liquidity (USD)","Volume 24h (USD)",
+                         "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
+                         "ROI (%)","ATH (%)","Drawdown (%)",
+                         "Pair Age","Link","Reasons"]
+            show_cols = [c for c in keep_cols if c in dfE.columns]
+            topN_show = int(st.session_state.get("ef_topN_show", 25))
+            st.success(f"Candidati: {len(dfE)} — mostrati i primi {min(topN_show, len(dfE))}", icon="🎯")
+            st.dataframe(dfE[show_cols].head(topN_show), use_container_width=True, hide_index=True)
+            st.caption("Badge: 🟢 forte | 🟡 medio | 🔴 debole. Tip: apri **📡 Radar** e spunta la riga per il drill-down Jupiter/Raydium.")
+
+            # === ALERT TELEGRAM: Entry Finder ===
+            def tg_send(text: str):
+                if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
+                try:
+                    r = _SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                     params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
+                    return (True, None) if r.ok else (False, f"status={r.status_code}")
+                except Exception as e:
+                    return False, str(e)
+
+            cooldown = int(alert_cooldown_min) * 60
+            now = time.time()
+            if running and enable_entry_alerts and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                max_send = int(alert_max_per_run)
+                sent = 0
+                for _, row in dfE.head(max_send*2).iterrows():
+                    if sent >= max_send: break
+                    addr = str(row.get("Base Address","")) or row.get("Pair")
+                    last_ts = st.session_state["tg_sent"].get(("entry", addr), 0)
+                    if now - last_ts < cooldown: continue
+                    pair = row.get("Pair",""); dex = row.get("DEX","")
+                    ms   = int(row.get("Meme Score",0) or 0)
+                    tx1  = int(row.get("Txns 1h",0) or 0)
+                    liq  = int(row.get("Liquidity (USD)",0) or 0)
+                    vol  = int(row.get("Volume 24h (USD)",0) or 0)
+                    px   = row.get("Price (USD)", None)
+                    ch1  = row.get("Change 1h (%)", None)
+                    link = row.get("Link","")
+                    grade= int(row.get("Entry Grade",0) or 0)
+                    badge= row.get("Badge","")
+                    txt = (f"🎯 ENTRY SIGNAL {badge} — {pair}\n"
+                           f"DEX: {dex} | Grade: {grade} | MS: {ms}\n"
+                           f"Tx1h: {tx1:,} | Liq: ${liq:,} | Vol24h: ${vol:,}")
+                    if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
+                    if ch1 is not None:
+                        try: txt += f"  |  H1: {float(ch1):.2f}%"
+                        except Exception: pass
+                    if link: txt += f"\n{link}"
+                    ok, err = tg_send(txt)
+                    if ok:
+                        st.session_state["tg_sent"][("entry", addr)] = now
+                        sent += 1
+
+        # Mostra proposta di parametri rilassati (senza scrivere in session finché non confermi)
+        if relax_applied and relaxed_values is not None:
+            st.info("Auto-relax: trovati parametri più larghi che generano risultati. Puoi applicarli ai widget.")
+            cols_apply = st.columns(2)
+            with cols_apply[0]:
+                if st.button("✅ Applica parametri rilassati"):
+                    st.session_state.update(relaxed_values)
+                    st.rerun()
+            with cols_apply[1]:
+                with st.expander("Vedi parametri proposti"):
+                    st.json(relaxed_values)
+
+# ===================== Paper Trading (vanilla) =====================
+with tab_paper:
+    st.markdown("### 🧪 Paper Trading — entry selezionate (vanilla)")
+    st.caption("Nota: simulazione didattica. Nessun trading reale.")
+    if df_pairs_table.empty:
+        st.info("Serve almeno una lista dalla tabella filtrata (PAIRS).")
+    else:
+        # Candidati “buoni” = ROI>0 OR Change1h>0 AND badge 🟢/🟡
+        dfPT = df_pairs_table.copy()
+        ch1 = pd.to_numeric(dfPT.get("Change 1h (%)"), errors="coerce")
+        roi = pd.to_numeric(dfPT.get("ROI (%)"), errors="coerce")
+        dfPT["posMomentum"] = (ch1 > 0) | (roi > 0)
+        # Entry grade semplice per ranking
+        def _pt_grade(row):
+            ms = float(row.get("Meme Score",0) or 0)
+            tx = float(row.get("Txns 1h",0) or 0)
+            liq= float(row.get("Liquidity (USD)",0) or 0)
+            heat = s_sigmoid(tx)*100
+            return 0.5*ms + 0.5*heat + 10*score_liq(liq, liq_min_sweet, liq_max_sweet)
+        dfPT["PT Grade"] = dfPT.apply(_pt_grade, axis=1)
+
+        good = dfPT[dfPT["posMomentum"]==True].sort_values(by=["PT Grade","Meme Score","Txns 1h"], ascending=[False,False,False])
+
+        colO1, colO2 = st.columns(2)
+        default_open = max(1, min(5, len(good)))
+        topN_open = colO1.number_input("Apri prime N (🟢)", min_value=1, max_value=100, value=default_open, step=1)
+        risk_per_pos = colO2.number_input("Risk% eq. per posizione", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+
+        st.markdown("**Candidati ordinati (PT Grade)**")
+        show_cols = ["Pair","DEX","Price (USD)","Meme Score","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Change 1h (%)","ROI (%)","PT Grade","Link"]
+        st.dataframe(good[show_cols].head(50), use_container_width=True, hide_index=True)
+
+        if st.button("📌 Simula entrata sulle prime N"):
+            # Semplice: alloca capitale per N posizioni, poi registra come 'aperto'
+            N = int(topN_open)
+            if N < 1 or good.empty:
+                st.warning("Nessun candidato o N<1.")
+            else:
+                cap = float(st.session_state.get("eq_equity", 1000.0))
+                risk_cap = cap * (risk_per_pos/100.0)
+                alloc = risk_cap  # qui 'risk' = allocazione flat
+                opened = []
+                for _, r in good.head(N).iterrows():
+                    px = r.get("Price (USD)")
+                    pair = r.get("Pair")
+                    if px is None or px==0: continue
+                    opened.append({"pair": pair, "price": float(px), "alloc": float(alloc)})
+                st.success(f"Aperte {len(opened)} posizioni paper (alloc≈${alloc:,.2f} cad.).".replace(",", "."))
+                with st.expander("Dettagli"):
+                    st.write(opened)
+
+# ============== Alert Telegram (global) ==============
+def tg_send(text: str):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
+    try:
+        r = _SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                         params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
+        return (True, None) if r.ok else (False, f"status={r.status_code}")
+    except Exception as e:
+        return False, str(e)
+
+tg_sent_now = 0
+cooldown = int(alert_cooldown_min) * 60
+now = time.time()
+
+# (A) Alert "hit radar"
+if running and enable_alerts and (df_pairs_table is not None) and not df_pairs_table.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        df_alert = df_pairs_table.copy()
+        mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
+        if int(alert_meme_min) > 0: mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
+        df_alert = df_alert[mask]
+        if not df_alert.empty:
+            df_alert = df_alert.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
+            max_send = int(alert_max_per_run)
+            for _, row in df_alert.head(max_send*2).iterrows():
+                addr = str(row.get("Base Address","")) or row.get("Pair")
+                last_ts = st.session_state["tg_sent"].get(("hit", addr), 0)
+                if now - last_ts < cooldown: continue
+                pair = row.get("Pair",""); dex = row.get("DEX",""); ms = int(row.get("Meme Score",0) or 0)
+                tx1 = int(row.get("Txns 1h",0) or 0); liq = int(row.get("Liquidity (USD)",0) or 0)
+                vol = int(row.get("Volume 24h (USD)",0) or 0)
+                px  = row.get("Price (USD)", None); chg = row.get("Change 24h (%)", None)
+                link= row.get("Link","")
+                txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
+                if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
+                if chg is not None:
+                    try: txt += f"  |  24h: {float(chg):.2f}%"
+                    except Exception: pass
+                if link: txt += f"\n{link}"
+                ok, err = tg_send(txt)
+                if ok:
+                    st.session_state["tg_sent"][("hit", addr)] = now
+                    tg_sent_now += 1
+                    if tg_sent_now >= max_send: break
+    except Exception as e:
+        st.caption(f"Alert Telegram (hit): errore — {e}")
+
+# (B) Trailing-stop alert su Drawdown
+if running and enable_trailing and (df_pairs_table is not None) and not df_pairs_table.empty and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        df_tr = df_pairs_table.copy()
+        dd_series = pd.to_numeric(df_tr["Drawdown (%)"], errors="coerce")
+        roi_series = pd.to_numeric(df_tr["ROI (%)"], errors="coerce")
+        mask_tr = (dd_series <= float(trailing_dd_thr)) & (roi_series >= 0)
+        df_tr = df_tr[mask_tr]
+        for _, row in df_tr.iterrows():
+            addr = str(row.get("Base Address","")) or row.get("Pair")
+            last_ts = st.session_state["tg_sent"].get(("trail", addr), 0)
+            if now - last_ts < cooldown: continue
+            pair = row.get("Pair",""); dd = row.get("Drawdown (%)"); roi=row.get("ROI (%)"); link=row.get("Link","")
+            txt = f"⚠️ Trailing stop — {pair}\nDD: {dd:.1f}%  |  ROI: {roi:.1f}%"
+            if link: txt += f"\n{link}"
+            ok, err = tg_send(txt)
+            if ok:
+                st.session_state["tg_sent"][("trail", addr)] = now
+                tg_sent_now += 1
+    except Exception as e:
+        st.caption(f"Alert Telegram (trailing): errore — {e}")
+
+# ============== Diagnostica finale ==============
+st.subheader("Diagnostica")
+d1, d2, d3, d4, d5 = st.columns(5)
+with d1: st.text(f"Query provider: {len(SEARCH_QUERIES)}  •  HTTP: {codes if codes else '—'}")
+with d2: st.text(f"Righe provider (post-filtri provider): {pre_count}")
+with d3: st.text(f"Righe dopo watchlist: {post_watch_count}")
+with d4: st.text(f"Righe dopo filtro volume: {post_vol_count}")
+with d5:
+    src = 'Birdeye' if (bird_ok and bird_tokens) else 'DexScreener (fallback)'
+    st.text(f"Nuove coin source: {src}")
+st.caption(
+    f"Stato: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • "
+    f"TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f} • "
+    f"PAIRS→Diagnostica: {'ON' if pairs_filters_to_strategy else 'OFF'} • "
+    f"EquityCurve: tracking={'ON' if st.session_state.get('eq_enabled', True) else 'OFF'} • "
+    f"TopN={int(st.session_state.get('eq_topN_tab', 10))} • Equity=${st.session_state.get('eq_equity', 0):,.2f}".replace(",", ".")
+)
+
+st.session_state["last_refresh_ts"] = time.time()
