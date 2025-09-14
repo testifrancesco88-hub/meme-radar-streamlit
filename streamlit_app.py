@@ -421,10 +421,10 @@ def norm_list(s):
 watchlist = norm_list(st.session_state.get("watchlist_input", ""))
 
 def is_watch_hit_row(r):
-    base = str(r.get("baseSymbol",""))).upper() if hasattr(r,"get") else str(r["baseSymbol"]).upper()
-    quote= str(r.get("quoteSymbol",""))).upper() if hasattr(r,"get") else str(r["quoteSymbol"]).upper()
-    addr = r.get("pairAddress","") if hasattr(r,"get") else r["pairAddress"]
-    return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
+    base = (str(r.get("baseSymbol", "")).upper() if hasattr(r, "get") else str(r["baseSymbol"]).upper())
+    quote = (str(r.get("quoteSymbol", "")).upper() if hasattr(r, "get") else str(r["quoteSymbol"]).upper())
+    addr = (r.get("pairAddress", "") if hasattr(r, "get") else r["pairAddress"])
+    return watchlist and (base in watchlist or quote in watchlist or addr in watchlist)
 
 if st.session_state.get("watchlist_only", False) and not df_view.empty:
     mask = df_view.apply(is_watch_hit_row, axis=1)
