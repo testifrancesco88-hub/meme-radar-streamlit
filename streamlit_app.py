@@ -1448,76 +1448,52 @@ with tab_paper:
         good = df_candidates[df_candidates.get("EntryBadge","") == "🟢"].copy()
         st.caption(f"Candidati Entry (🟢): {len(good)}")
 
-        # Apri posizioni sulle prime N 🟢
-        colO1, colO2 = st.columns(2)
-        topN_open = colO1.number_input("Apri prime N (🟢)", min_value=1, max_value=100, value=min(5, len(good)), step=1)
-        if colO2.button("Apri posizioni (paper)"):
-            opened = 0
-            for _, r in good.head(topN_open).iterrows():
-                pair = r.get("Pair","")
-                addr = str(r.get("Base Address","")) or pair
-                price = r.get("Price (USD)", None)
-                if not price or not pair: continue
-                # evita duplicati
-                exists = any(p.get("addr")==addr and p.get("open") for p in st.session_state["pt_positions"])
-                if exists: continue
-                st.session_state["pt_positions"].append({
-                    "ts_open": time.time(),
-                    "pair": pair,
-                    "addr": addr,
-                    "price_open": float(price),
-                    "size_usd": float(pt_size),
-                    "tp_pct": float(pt_tp),
-                    "sl_pct": float(pt_sl),
-                    "trail_pct": float(pt_trail),
-                    "peak_px": float(price),
-                    "open": True,
-                    "link": r.get("Link",""),
-                })
-                opened += 1
-            st.success(f"Aperte {opened} posizioni (paper).")
+# Apri posizioni sulle prime N
+colO1, colO2 = st.columns(2)
+n_good = int(len(good))
 
-    # Aggiornamento PnL/chiusure
-    def _update_paper_positions(df_price_source: pd.DataFrame):
-        if not st.session_state["pt_positions"]: return
-        price_map = {}
-        for _, row in df_pairs_table.iterrows():
-            addr = str(row.get("Base Address","")) or row.get("Pair")
-            px = row.get("Price (USD)", None)
-            try:
-                if addr and px is not None and float(px) > 0: price_map[addr] = float(px)
-            except Exception: pass
-
-        closed = 0
-        for pos in st.session_state["pt_positions"]:
-            if not pos.get("open"): continue
-            addr = pos["addr"]
-            px = price_map.get(addr)
-            if px is None: continue
-            # update peak
-            if px > pos["peak_px"]:
-                pos["peak_px"] = px
-            # returns
-            ret = (px / pos["price_open"] - 1.0) * 100.0
-            dd_from_peak = (px / pos["peak_px"] - 1.0) * 100.0
-
-            # Stop/TP/Trail
-            hit_tp = ret >= pos["tp_pct"]
-            hit_sl = ret <= -abs(pos["sl_pct"])
-            hit_trail = dd_from_peak <= -abs(pos["trail_pct"])
-
-            if hit_tp or hit_sl or hit_trail:
-                pos["open"] = False
-                pos["ts_close"] = time.time()
-                pos["price_close"] = px
-                pos["ret_pct"] = ret
-                st.session_state["pt_history"].append(pos.copy())
-                closed += 1
-        if closed > 0:
-            st.toast(f"PaperTrader: {closed} posizioni chiuse", icon="✅")
-
-    if running:
-        _update_paper_positions(df_pairs_table)
+if n_good == 0:
+    topN_open = colO1.number_input(
+        "Apri prime N (🟢)",
+        min_value=0, max_value=100, value=0, step=1,
+        key="pt_topN_open",
+        help="Nessun candidato 🟢 al momento."
+    )
+    colO2.button("Apri posizioni (paper)", disabled=True)
+else:
+    default_val = min(5, n_good)
+    topN_open = colO1.number_input(
+        "Apri prime N (🟢)",
+        min_value=1, max_value=n_good, value=default_val, step=1,
+        key="pt_topN_open"
+    )
+    if colO2.button("Apri posizioni (paper)"):
+        opened = 0
+        for _, r in good.head(int(topN_open)).iterrows():
+            pair = r.get("Pair","")
+            addr = str(r.get("Base Address","")) or pair
+            price = r.get("Price (USD)", None)
+            if not price or not pair:
+                continue
+            # evita duplicati
+            exists = any(p.get("addr")==addr and p.get("open") for p in st.session_state["pt_positions"])
+            if exists:
+                continue
+            st.session_state["pt_positions"].append({
+                "ts_open": time.time(),
+                "pair": pair,
+                "addr": addr,
+                "price_open": float(price),
+                "size_usd": float(st.session_state.get("pt_size", 100.0)),
+                "tp_pct": float(st.session_state.get("pt_tp", 20.0)),
+                "sl_pct": float(st.session_state.get("pt_sl", 10.0)),
+                "trail_pct": float(st.session_state.get("pt_trail", 8.0)),
+                "peak_px": float(price),
+                "open": True,
+                "link": r.get("Link",""),
+            })
+            opened += 1
+        st.success(f"Aperte {opened} posizioni (paper).")
 
     # Vista posizioni
     open_pos = [p for p in st.session_state["pt_positions"] if p.get("open")]
