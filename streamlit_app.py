@@ -1,8 +1,7 @@
-# streamlit_app.py — Meme Radar (Solana) — Radar + Drill-down + ROI/ATH/DD + Survivors + Winners + Equity + Entry Finder + Telegram Alerts + Paper Trader
+# streamlit_app.py — Meme Radar (NO trading reale) + Drill-down + ROI/ATH/DD + Survivors + Winners + Equity + Entry Finder (smart+presets+volume) + Paper Trading (Axiom Pro) + Telegram Alerts
 # Requisiti: streamlit, plotly, pandas, requests; file market_data.py con MarketDataProvider
-import os, time, math, random, datetime, threading
-from typing import Dict, Any, List, Tuple, Optional
 
+import os, time, math, random, datetime, threading
 import pandas as pd
 import plotly.express as px
 import requests
@@ -15,10 +14,10 @@ from market_data import MarketDataProvider
 st.set_page_config(page_title="Meme Radar — Solana", layout="wide")
 st.title("Solana Meme Coin Radar")
 
-REFRESH_SEC        = int(os.getenv("REFRESH_SEC", "60"))
-PROXY_TICKET       = float(os.getenv("PROXY_TICKET_USD", "150"))
-BIRDEYE_URL        = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
-AGE_LIMIT_HOURS    = 10000.0
+REFRESH_SEC   = int(os.getenv("REFRESH_SEC", "60"))
+PROXY_TICKET  = float(os.getenv("PROXY_TICKET_USD", "150"))
+BIRDEYE_URL   = "https://public-api.birdeye.so/defi/tokenlist?chain=solana&sort=createdBlock&order=desc&limit=50"
+AGE_LIMIT_HOURS = 10000.0
 
 SEARCH_QUERIES = [
     "chain:solana raydium","chain:solana orca","chain:solana meteora","chain:solana lifinity",
@@ -46,9 +45,10 @@ if "eq_equity" not in st.session_state: st.session_state["eq_equity"] = float(st
 if "eq_history" not in st.session_state: st.session_state["eq_history"] = []   # [{ts,equity,ret,n}]
 if "eq_last_prices" not in st.session_state: st.session_state["eq_last_prices"] = {}
 
-# Paper trader state
-if "pt_positions" not in st.session_state: st.session_state["pt_positions"] = []   # list of dict
-if "pt_history"   not in st.session_state: st.session_state["pt_history"] = []     # closed trades
+# Paper trading state
+if "pt_positions" not in st.session_state: st.session_state["pt_positions"] = []  # posizioni aperte
+if "pt_history"   not in st.session_state: st.session_state["pt_history"] = []    # posizioni chiuse
+if "last_entry_candidates" not in st.session_state: st.session_state["last_entry_candidates"] = pd.DataFrame()
 
 # ================= Sidebar =================
 with st.sidebar:
@@ -215,8 +215,6 @@ with st.sidebar:
     st.markdown("**Trailing-stop alert**")
     enable_trailing    = st.toggle("Abilita trailing-stop alert", value=False)
     trailing_dd_thr    = st.number_input("Soglia Drawdown (%)", value=-15.0, step=1.0)
-    st.markdown("**Entry Finder alert**")
-    enable_entry_alerts = st.toggle("Abilita alert Entry Finder (🟢)", value=True, key="enable_entry_alerts")
     st.markdown("**Rate-limit**")
     alert_cooldown_min = st.number_input("Cooldown alert (min)", min_value=1, value=30, step=5)
     alert_max_per_run  = st.number_input("Max alert per refresh (hit)", min_value=1, value=3, step=1)
@@ -225,11 +223,8 @@ with st.sidebar:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             st.warning("Inserisci BOT_TOKEN e CHAT_ID."); return
         try:
-            rq = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar", "disable_web_page_preview": True},
-                timeout=15
-            )
+            rq = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              params={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ Test dal Meme Radar", "disable_web_page_preview": True}, timeout=15)
             st.success("Messaggio di test inviato ✅" if rq.ok else f"Telegram {rq.status_code}.")
         except Exception as e:
             st.error(f"Errore Telegram: {e}")
@@ -278,7 +273,7 @@ with util_col2:
     if st.button("Aggiorna ora", use_container_width=True): st.rerun()
 
 # ================= Helpers =================
-def fetch_with_retry(url: str, tries: int = 3, base_backoff: float = 0.7, headers: Optional[Dict[str,str]] = None) -> Tuple[Optional[dict], Optional[int]]:
+def fetch_with_retry(url, tries=3, base_backoff=0.7, headers=None):
     last = (None, None)
     for i in range(tries):
         try:
@@ -293,10 +288,9 @@ def fetch_with_retry(url: str, tries: int = 3, base_backoff: float = 0.7, header
             last = (None, "ERR"); time.sleep(base_backoff*(i+1) + random.uniform(0,0.3))
     return last
 
-def fmt_int(n: Optional[float]) -> str:
-    return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
+def fmt_int(n): return f"{int(round(n)):,}".replace(",", ".") if n is not None else "N/D"
 
-def hours_since_ms(ms_or_s) -> Optional[float]:
+def hours_since_ms(ms_or_s):
     if ms_or_s is None: return None
     try:
         v = int(ms_or_s)
@@ -304,7 +298,7 @@ def hours_since_ms(ms_or_s) -> Optional[float]:
         return max(0.0, (time.time() - v) / 3600.0)
     except Exception: return None
 
-def ms_to_dt(ms_or_s) -> str:
+def ms_to_dt(ms_or_s):
     if not ms_or_s: return ""
     try:
         v = int(ms_or_s)
@@ -312,7 +306,7 @@ def ms_to_dt(ms_or_s) -> str:
         return datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M")
     except Exception: return str(ms_or_s)
 
-def fmt_age(hours: Optional[float]) -> str:
+def fmt_age(hours):
     if hours is None: return ""
     if hours < 1: return f"{int(round(hours*60))}m"
     if hours < 48:
@@ -321,7 +315,7 @@ def fmt_age(hours: Optional[float]) -> str:
     d = int(hours // 24); h = int(hours % 24)
     return f"{d}d {h}h"
 
-def safe_series_mean(s: pd.Series) -> Optional[float]:
+def safe_series_mean(s):
     vals = []
     for x in s:
         try:
@@ -329,11 +323,11 @@ def safe_series_mean(s: pd.Series) -> Optional[float]:
         except Exception: pass
     return (sum(vals)/len(vals)) if vals else None
 
-def safe_sort(df: Optional[pd.DataFrame], col: str, ascending=False) -> Optional[pd.DataFrame]:
+def safe_sort(df, col, ascending=False):
     if df is None or df.empty or col not in df.columns: return df
     return df.sort_values(by=[col], ascending=ascending)
 
-def to_float0(x, default=0.0) -> float:
+def to_float0(x, default=0.0):
     if x is None: return default
     try:
         v = float(x); return v if math.isfinite(v) else default
@@ -345,7 +339,7 @@ def to_float0(x, default=0.0) -> float:
         except Exception:
             return default
 
-def to_int0(x, default=0) -> int:
+def to_int0(x, default=0):
     v = to_float0(x, float(default)); return int(round(v))
 
 # Meme Score helpers
@@ -353,16 +347,16 @@ STRONG_MEMES = {"WIF","BONK","PEPE","DOGE","DOG","SHIB","WOJAK","MOG","TRUMP","E
 WEAK_MEMES   = {"FROG","COIN","INU","APE","GIGA","PONZI","LUNA","RUG","RICK","MORTY","ROCKET","HAMSTER"}
 DEX_WEIGHTS  = {"raydium":1.0, "orca":0.9, "meteora":0.85, "lifinity":0.8}
 
-def s_sigmoid(x, k=0.02) -> float:
+def s_sigmoid(x, k=0.02):
     try: return 1.0 / (1.0 + math.exp(-k * (float(x) - 200)))
     except Exception: return 0.0
-def score_symbol(s: str) -> float:
+def score_symbol(s):
     S=(s or "").upper()
     return 1.0 if any(t in S for t in STRONG_MEMES) else (0.6 if any(t in S for t in WEAK_MEMES) else 0.3)
-def score_age(hours: Optional[float]) -> float:
+def score_age(hours):
     if hours is None: return 0.5
     return max(0.0, min(1.0, 1.0 - (hours / 72.0)))
-def score_liq(liq: Optional[float], mn: float, mx: float) -> float:
+def score_liq(liq, mn, mx):
     if liq is None or liq <= 0: return 0.0
     try: mn = float(mn) if mn is not None else 0.0
     except Exception: mn = 0.0
@@ -371,10 +365,9 @@ def score_liq(liq: Optional[float], mn: float, mx: float) -> float:
     if mn <= liq <= mx: return 1.0
     if liq < mn: return max(0.0, liq / (mn if mn > 0 else 1.0))
     return max(0.0, (mx if mx < float("inf") else 0.0) / liq) if mx < float("inf") else 0.6
-def score_dex(d: str) -> float:
-    return DEX_WEIGHTS.get((d or "").lower(), 0.6)
+def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
-def compute_meme_score_row(r: dict, weights=None, sweet_min=None, sweet_max=None) -> int:
+def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
     base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
     dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
     liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
@@ -382,9 +375,9 @@ def compute_meme_score_row(r: dict, weights=None, sweet_min=None, sweet_max=None
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
     local_weights = tuple(weights or (20,20,25,20,15))
     f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
-         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), liq_min_sweet, liq_max_sweet) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), sweet_min, sweet_max) +
          local_weights[4]*score_dex(dex))
-    return int(round(100.0 * f / max(1e-6, sum(local_weights))))
+    return round(100.0 * f / max(1e-6, sum(local_weights)))
 
 # ============== Provider init ==============
 if "provider" not in st.session_state:
@@ -412,7 +405,7 @@ st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts 
 df_view = df_provider.copy()
 pre_count = len(df_view)
 
-def norm_list(s: str) -> List[str]:
+def norm_list(s):
     out = []
     for part in (s or "").replace(" ", "").split(","):
         if not part: continue
@@ -421,10 +414,10 @@ def norm_list(s: str) -> List[str]:
 
 watchlist = norm_list(st.session_state.get("watchlist_input", ""))
 
-def is_watch_hit_row(r) -> bool:
-    base = (str(r.get("baseSymbol", "")).upper() if hasattr(r, "get") else str(r["baseSymbol"]).upper())
-    quote = (str(r.get("quoteSymbol", "")).upper() if hasattr(r, "get") else str(r["quoteSymbol"]).upper())
-    addr = (r.get("pairAddress", "") if hasattr(r, "get") else r["pairAddress"])
+def is_watch_hit_row(r):
+    base = str(r.get("baseSymbol","")).upper() if hasattr(r,"get") else str(r["baseSymbol"]).upper()
+    quote= str(r.get("quoteSymbol","")).upper() if hasattr(r,"get") else str(r["quoteSymbol"]).upper()
+    addr = r.get("pairAddress","") if hasattr(r,"get") else r["pairAddress"]
     return (watchlist and (base in watchlist or quote in watchlist or addr in watchlist))
 
 if st.session_state.get("watchlist_only", False) and not df_view.empty:
@@ -462,7 +455,7 @@ if bird_data and "data" in bird_data:
     elif isinstance(bird_data["data"], list):
         bird_tokens = bird_data["data"]; bird_ok = True
 
-def liquidity_from_birdeye_token(t: dict) -> Optional[float]:
+def liquidity_from_birdeye_token(t):
     for k in ("liquidity","liquidityUsd","liquidityUSD"):
         try:
             v = t.get(k)
@@ -472,7 +465,6 @@ def liquidity_from_birdeye_token(t: dict) -> Optional[float]:
         except Exception:
             pass
     return None
-
 if bird_ok and bird_tokens:
     new_liq_values = [liquidity_from_birdeye_token(t) for t in bird_tokens[:20]]
     new_liq_values = [v for v in new_liq_values if v is not None]
@@ -500,13 +492,13 @@ with c3: st.metric("Txns 1h medie Top 10", fmt_int(tx1h_avg))
 with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
 # ============== ROI/ATH/DD helpers ==============
-def _addr_key_from_rowdict(rdict: dict) -> Optional[str]:
+def _addr_key_from_rowdict(rdict):
     for k in ("baseAddress","pairAddress","Base Address","Pair Address"):
         v = rdict.get(k)
         if v: return str(v)
     return rdict.get("Pair") or rdict.get("pair") or None
 
-def update_profit_metrics_from_raw(rdict: dict):
+def update_profit_metrics_from_raw(rdict):
     addr = _addr_key_from_rowdict(rdict)
     if not addr: return None, None, None
     px = rdict.get("priceUsd")
@@ -529,7 +521,7 @@ def update_profit_metrics_from_raw(rdict: dict):
     return roi_pct, ath_pct, dd_pct
 
 # ============== Tabella (build) ==============
-def _first_or_none(d: dict, keys: List[str]):
+def _first_or_none(d, keys):
     for k in keys:
         try:
             v = d.get(k) if hasattr(d, "get") else d[k]
@@ -547,7 +539,7 @@ def _to_float_pct(x):
     except Exception:
         return None
 
-def _get_change_pct_from_nested(r: dict, nested_key: str, candidates: Tuple[str, ...]):
+def _get_change_pct_from_nested(r, nested_key, candidates):
     try:
         obj = r.get(nested_key) if hasattr(r, "get") else r[nested_key]
     except Exception:
@@ -559,11 +551,11 @@ def _get_change_pct_from_nested(r: dict, nested_key: str, candidates: Tuple[str,
                 if val is not None: return val
     return None
 
-def _get_change_pct(r: dict, flat_keys: List[str], nested_key: str, nested_candidates: Tuple[str, ...]):
+def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
     v = _first_or_none(r, flat_keys); v = _to_float_pct(v)
     return v if v is not None else _get_change_pct_from_nested(r, nested_key, nested_candidates)
 
-def build_table(df: pd.DataFrame) -> pd.DataFrame:
+def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
         mscore = compute_meme_score_row(r, (w_symbol, w_age, w_txns, w_liq, w_dex), liq_min_sweet, liq_max_sweet)
@@ -606,8 +598,8 @@ if not df_pairs_table.empty and "PairAgeHours" in df_pairs_table.columns:
     age_series = pd.to_numeric(df_pairs_table["PairAgeHours"], errors="coerce")
     df_pairs_table = df_pairs_table[age_series.between(float(pairs_age_min_h), float(pairs_age_max_h), inclusive="both")]
 if pairs_liq_enable and not df_pairs_table.empty and "Liquidity (USD)" in df_pairs_table.columns:
-    liq_series_tbl = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
-    df_pairs_table = df_pairs_table[(liq_series_tbl >= pairs_liq_min) & (liq_series_tbl <= pairs_liq_max)]
+    liq_series = pd.to_numeric(df_pairs_table["Liquidity (USD)"], errors="coerce").fillna(0)
+    df_pairs_table = df_pairs_table[(liq_series >= pairs_liq_min) & (liq_series <= pairs_liq_max)]
 if pairs_vol_enable and not df_pairs_table.empty and "Volume 24h (USD)" in df_pairs_table.columns:
     vol_series_tbl = pd.to_numeric(df_pairs_table["Volume 24h (USD)"], errors="coerce").fillna(0)
     df_pairs_table = df_pairs_table[(vol_series_tbl >= pairs_vol_min) & (vol_series_tbl <= pairs_vol_max)]
@@ -704,7 +696,7 @@ def _equity_tick(df_pairs_table: pd.DataFrame, topN: int = 10) -> None:
         st.session_state["eq_history"].append({"ts": time.time(),"equity": st.session_state["eq_equity"],"ret": 0.0,"n": 0})
     st.session_state["eq_last_prices"] = curr_prices
 
-def _max_drawdown(equity_series: List[float]) -> float:
+def _max_drawdown(equity_series: list[float]) -> float:
     peak = -1e18; mdd = 0.0
     for x in equity_series:
         if x > peak: peak = x
@@ -1006,12 +998,11 @@ with tab_radar:
         c_dex = cnt(s["DEX"].str.lower().isin(list(st.session_state.get("allowed_dex", ["raydium","orca","meteora","lifinity"]))))
         c_meme = cnt(s["Meme Score"] >= int(st.session_state.get("strat_meme", 70)))
         c_tx   = cnt(s["Txns 1h"] >= int(st.session_state.get("strat_txns", 250)))
-        if vmin is None: _vmin = 0
-        else: _vmin = vmin
+        if vmin is None: vmin = 0
         if vol24_max > 0:
-            c_vol = cnt((s["Volume 24h (USD)"] >= _vmin) & (s["Volume 24h (USD)"] <= vol24_max))
+            c_vol = cnt((s["Volume 24h (USD)"] >= vmin) & (s["Volume 24h (USD)"] <= vol24_max))
         else:
-            c_vol = cnt((s["Volume 24h (USD)"] >= _vmin))
+            c_vol = cnt((s["Volume 24h (USD)"] >= vmin))
         c_turn = cnt((s["Volume 24h (USD)"] / s["Liquidity (USD)"].replace(0,1)) >= float(st.session_state.get("strat_turnover", 1.2)))
         c_chg  = cnt((chg_series >= float(st.session_state.get("chg_min", -8))) & (chg_series <= float(st.session_state.get("chg_max", 180))))
 
@@ -1101,7 +1092,7 @@ with tab_equity:
         csv = df_eq[["t","equity","ret","n"]].to_csv(index=False).encode("utf-8")
         st.download_button("📥 Scarica equity.csv", data=csv, file_name="equity_curve.csv", mime="text/csv")
 
-# ===================== Entry Finder (smart + presets) =====================
+# ===================== Entry Finder (smart + presets + volume filter) =====================
 with tab_entry:
     st.markdown("### 🎯 Entry Finder — scanner ingressi (smart + presets)")
 
@@ -1116,7 +1107,7 @@ with tab_entry:
             "trend_pos": True,
             "allow_missing_ch1": True, "allow_missing_h4": True,
             "survivor": False, "targetN": 10,
-            "vol_min": 0, "vol_max": 0
+            "vol_min": 0, "vol_max": 0,     # <<< aggiunto
         },
         "Medio": {
             "ms_min": 65, "tx_min": 150,
@@ -1127,7 +1118,7 @@ with tab_entry:
             "trend_pos": True,
             "allow_missing_ch1": True, "allow_missing_h4": True,
             "survivor": False, "targetN": 12,
-            "vol_min": 0, "vol_max": 0
+            "vol_min": 50_000, "vol_max": 0,
         },
         "On-Fire": {
             "ms_min": 70, "tx_min": 250,
@@ -1138,11 +1129,10 @@ with tab_entry:
             "trend_pos": True,
             "allow_missing_ch1": True, "allow_missing_h4": True,
             "survivor": False, "targetN": 15,
-            "vol_min": 0, "vol_max": 0
+            "vol_min": 100_000, "vol_max": 0,
         }
     }
-    def apply_preset(p: dict):
-        # aggiorna i default vivi (non scrive nei widget durante il render)
+    def apply_preset(p):
         for k, v in p.items():
             st.session_state[f"ef_{k}"] = v
         st.toast("Preset applicato ✅"); st.rerun()
@@ -1182,7 +1172,7 @@ with tab_entry:
         c4, c5, c6 = st.columns(3)
         liq_max_e = c4.number_input("Liquidity USD max (0 = ∞)", min_value=0, value=st.session_state.get("ef_liq_max", 0), step=5000, key="ef_liq_max")
         age_min_m = c5.number_input("Età min (min)", min_value=0, value=st.session_state.get("ef_age_min_m", 0), step=1, key="ef_age_min_m")
-        age_max_m = c6.number_input("Età max (min)", min_value=0, value=st.session_state.get("ef_age_max_m", 360), step=5, key="ef_age_max_m")
+        age_max_m = c6.number_input("Età max (min)", min_value=1, value=st.session_state.get("ef_age_max_m", 360), step=5, key="ef_age_max_m")
 
         c7, c8, c9 = st.columns(3)
         ch1_min = c7.number_input("Change 1h min (%)", value=st.session_state.get("ef_ch1_min", -3), step=1, key="ef_ch1_min")
@@ -1194,16 +1184,14 @@ with tab_entry:
         cap_24h = c11.number_input("Limita overextension (Change 24h max %)", min_value=0, value=st.session_state.get("ef_cap_24h", 150), step=10, key="ef_cap_24h")
         sort_mode = c12.radio("Ordina per", ["Momentum (1h %)", "Qualità (Meme Score)", "Freschezza (Age)"], horizontal=True, key="ef_sort_mode")
 
+        # >>> Volume filter (Entry Finder)
         c13, c14, c15 = st.columns(3)
-        allow_missing_ch1 = c13.toggle("Consenti H1 mancante", value=st.session_state.get("ef_allow_missing_ch1", True), key="ef_allow_missing_ch1")
-        allow_missing_h4  = c14.toggle("Consenti H4/H6 mancante", value=st.session_state.get("ef_allow_missing_h4", True), key="ef_allow_missing_h4")
+        vol_min_e = c13.number_input("Volume 24h MIN (Entry)", min_value=0, value=st.session_state.get("ef_vol_min", 0), step=10000, key="ef_vol_min")
+        vol_max_e = c14.number_input("Volume 24h MAX (Entry, 0=∞)", min_value=0, value=st.session_state.get("ef_vol_max", 0), step=100000, key="ef_vol_max")
         auto_relax        = c15.toggle("Auto-relax fino a N risultati", value=st.session_state.get("ef_auto_relax", True), key="ef_auto_relax")
         targetN = st.number_input("Target risultati", min_value=1, max_value=100, value=st.session_state.get("ef_targetN", 10), step=1, key="ef_targetN")
 
-        c16, c17, c18 = st.columns(3)
-        vol_min_e = c16.number_input("Volume 24h USD min", min_value=0, value=st.session_state.get("ef_vol_min", 0), step=10000, key="ef_vol_min")
-        vol_max_e = c17.number_input("Volume 24h USD max (0 = ∞)", min_value=0, value=st.session_state.get("ef_vol_max", 0), step=50000, key="ef_vol_max")
-        topN_show = c18.number_input("Mostra prime N", min_value=1, max_value=100, value=st.session_state.get("ef_topN_show", 25), step=1, key="ef_topN_show")
+        topN_show = st.number_input("Mostra prime N", min_value=1, max_value=100, value=st.session_state.get("ef_topN_show", 25), step=1, key="ef_topN_show")
 
         # Cast
         dfC = df_base_for_entry.copy()
@@ -1228,8 +1216,9 @@ with tab_entry:
         m_age = age_h.between(age_min_m/60.0, age_max_m/60.0, inclusive="both")
 
         has_ch1 = ch1_col > -9998
-        m_ch1 = ((~has_ch1) | ch1_col.between(ch1_min, ch1_max, inclusive="both")) if allow_missing_ch1 else (has_ch1 & ch1_col.between(ch1_min, ch1_max, inclusive="both"))
+        m_ch1 = ((~has_ch1) | ch1_col.between(ch1_min, ch1_max, inclusive="both")) if st.session_state.get("ef_allow_missing_ch1", True) else (has_ch1 & ch1_col.between(ch1_min, ch1_max, inclusive="both"))
         has_h4 = ch4_col > -9998
+        allow_missing_h4 = st.session_state.get("ef_allow_missing_h4", True)
         if trend_pos:
             m_ch4 = ((~has_h4) & allow_missing_h4) | (has_h4 & (ch4_col > 0))
         else:
@@ -1242,63 +1231,50 @@ with tab_entry:
 
         dfE = dfC[mask].copy()
 
-        # Auto-relax (solo variabili locali, non tocco i widget durante il render)
+        # Auto-relax
         relax_applied = False
-        relax_note = ""
         if auto_relax and (dfE.empty or len(dfE) < targetN):
             relax_applied = True
             _tx, _ch1min, _ch1max = int(tx_min), int(ch1_min), int(ch1_max)
             _liqmin, _liqmax = int(liq_min_e), int(liq_max_e)
+            _volmin, _volmax = int(vol_min_e), int(vol_max_e)
             _agemin, _agemax = int(age_min_m), int(age_max_m)
             _cap24 = int(cap_24h)
-            _volmin, _volmax = int(vol_min_e), int(vol_max_e)
 
             for _ in range(10):
                 _tx = max(50, _tx - 50)
                 _ch1min -= 3; _ch1max += 5
                 _liqmin = max(0, _liqmin - 5000)
                 _liqmax = 0 if _liqmax == 0 else min(1_000_000_000, int(_liqmax * 2))
+                _volmin = max(0, _volmin - 50000)
+                _volmax = 0 if _volmax == 0 else min(2_000_000_000, int(_volmax * 2))
                 _agemin = max(0, _agemin - 5)
                 _agemax = min(720, _agemax + 60)
                 _cap24  = min(300, _cap24 + 30)
-                _volmin = max(0, _volmin - 20000)
-                _volmax = 0 if _volmax == 0 else min(2_000_000_000, int(_volmax * 2))
 
                 m_tx  = (tx_col >= _tx)
                 m_liq = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
-                m_age = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
-                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if allow_missing_ch1 else ((ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both"))
-                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ((ch4_col > -9998) | allow_missing_h4)
-                m_c24 = (ch24_col <= _cap24) | (ch24_col < -9998)
                 m_vol = (vol_col >= _volmin) & ((_volmax == 0) | (vol_col <= _volmax))
+                m_age = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
+                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if st.session_state.get("ef_allow_missing_ch1", True) else ( (ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both") )
+                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ( (ch4_col > -9998) | allow_missing_h4 )
+                m_c24 = (ch24_col <= _cap24) | (ch24_col < -9998)
 
-                m_relaxed = m_ms & m_tx & m_liq & m_age & m_ch1 & m_ch4 & m_c24 & m_vol
+                m_relaxed = m_ms & m_tx & m_liq & m_vol & m_age & m_ch1 & m_ch4 & m_c24
                 if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
                 dfE = dfC[m_relaxed].copy()
                 if len(dfE) >= targetN or len(dfE) > 0:
-                    relax_note = f"Tx≥{_tx}, H1∈[{_ch1min},{_ch1max}]%, Liq≥{_liqmin}{(' & ≤'+str(_liqmax)) if _liqmax>0 else ''}, Age {_agemin}-{_agemax} min, 24h≤{_cap24}%, Vol≥{_volmin}{(' & ≤'+str(_volmax)) if _volmax>0 else ''}"
+                    st.session_state["ef_tx_min"] = _tx
+                    st.session_state["ef_ch1_min"] = _ch1min
+                    st.session_state["ef_ch1_max"] = _ch1max
+                    st.session_state["ef_liq_min"] = _liqmin
+                    st.session_state["ef_liq_max"] = _liqmax
+                    st.session_state["ef_vol_min"] = _volmin
+                    st.session_state["ef_vol_max"] = _volmax
+                    st.session_state["ef_age_min_m"] = _agemin
+                    st.session_state["ef_age_max_m"] = _agemax
+                    st.session_state["ef_cap_24h"] = _cap24
                     break
-
-        # Badge sintetico
-        def entry_badge(row: pd.Series) -> str:
-            try:
-                ms = float(row.get("Meme Score", 0))
-                tx = float(row.get("Txns 1h", 0))
-                ch1 = row.get("Change 1h (%)", None)
-                ch4 = row.get("Change 4h/6h (%)", None)
-                liq = float(row.get("Liquidity (USD)", 0))
-                ok_trend = (pd.isna(ch4) and allow_missing_h4) or (not pd.isna(ch4) and float(ch4) > 0)
-                ok_ch1 = (pd.isna(ch1) and allow_missing_ch1) or (not pd.isna(ch1) and ch1_min <= float(ch1) <= ch1_max)
-                if ms >= ms_min+5 and tx >= tx_min*1.2 and ok_trend and ok_ch1 and (liq >= max(1, liq_min_e)):
-                    return "🟢"
-                if ms >= ms_min and tx >= tx_min and ok_trend:
-                    return "🟡"
-                return "🔴"
-            except Exception:
-                return "🔴"
-
-        if not dfE.empty:
-            dfE["EntryBadge"] = dfE.apply(entry_badge, axis=1)
 
         # Diagnostica rapida
         def _diag_counts():
@@ -1308,17 +1284,22 @@ with tab_entry:
                 "H4/6 n/d": int((ch4_col <= -9998).sum())
             }
         diag = _diag_counts()
-        cols = st.columns(4)
+        cols = st.columns(3)
         cols[0].metric("Universe", diag.get("Universe", 0))
         cols[1].metric("H1 n/d", diag.get("H1 n/d", 0))
         cols[2].metric("H4/6 n/d", diag.get("H4/6 n/d", 0))
-        cols[3].metric("Candidati", len(dfE))
 
         if dfE.empty:
             st.warning("Nessun candidato con questi parametri. Prova un preset o allarga i range.")
+            st.session_state["last_entry_candidates"] = pd.DataFrame()
         else:
-            if relax_applied and relax_note:
-                st.info(f"Auto-relax applicato → {relax_note}", icon="🪄")
+            if relax_applied:
+                st.info(f"Auto-relax applicato → Tx≥{st.session_state['ef_tx_min']}, "
+                        f"H1∈[{st.session_state['ef_ch1_min']},{st.session_state['ef_ch1_max']}]%, "
+                        f"Liq≥{st.session_state['ef_liq_min']}{' & ≤'+str(st.session_state['ef_liq_max']) if st.session_state['ef_liq_max']>0 else ''}, "
+                        f"Vol24≥{st.session_state['ef_vol_min']}{' & ≤'+str(st.session_state['ef_vol_max']) if st.session_state['ef_vol_max']>0 else ''}, "
+                        f"Age {st.session_state['ef_age_min_m']}-{st.session_state['ef_age_max_m']} min, "
+                        f"24h≤{st.session_state['ef_cap_24h']}%.", icon="🪄")
 
             # Reasons
             reasons = []
@@ -1329,9 +1310,11 @@ with tab_entry:
                     if float(r.get("Txns 1h", 0)) >= tx_min: rs.append("Tx1h✓")
                     L = float(r.get("Liquidity (USD)", 0))
                     if (L >= liq_min_e) and ((liq_max_e == 0) or (L <= liq_max_e)): rs.append("Liq✓")
+                    V = float(r.get("Volume 24h (USD)", 0))
+                    if (V >= vol_min_e) and ((vol_max_e == 0) or (V <= vol_max_e)): rs.append("Vol24✓")
                     v1 = r.get("Change 1h (%)", None)
                     if pd.isna(v1):
-                        if allow_missing_ch1: rs.append("H1 n/d✓")
+                        if st.session_state.get("ef_allow_missing_ch1", True): rs.append("H1 n/d✓")
                     else:
                         if ch1_min <= float(v1) <= ch1_max: rs.append("H1✓")
                     v4 = r.get("Change 4h/6h (%)", None)
@@ -1349,162 +1332,296 @@ with tab_entry:
 
             # Ordinamento & show
             if sort_mode.startswith("Momentum"):
-                dfE = dfE.sort_values(by=["EntryBadge","Change 1h (%)","Meme Score","Txns 1h"], ascending=[True, False, False, False])
+                dfE = dfE.sort_values(by=["Change 1h (%)","Meme Score","Txns 1h"], ascending=[False, False, False])
             elif sort_mode.startswith("Qualità"):
-                dfE = dfE.sort_values(by=["EntryBadge","Meme Score","Txns 1h","Liquidity (USD)"], ascending=[True, False, False, False])
+                dfE = dfE.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
             else:
-                dfE = dfE.sort_values(by=["EntryBadge","PairAgeHours","Meme Score"], ascending=[True, True, False])
+                dfE = dfE.sort_values(by=["PairAgeHours","Meme Score"], ascending=[True, False])
 
-            keep_cols = ["EntryBadge","Pair","DEX","Meme Score","Price (USD)","Txns 1h",
+            keep_cols = ["Pair","DEX","Meme Score","Price (USD)","Txns 1h",
                          "Liquidity (USD)","Volume 24h (USD)",
                          "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
                          "ROI (%)","ATH (%)","Drawdown (%)",
-                         "Pair Age","Link"]
+                         "Pair Age","Link","Reasons","Base Address","Pair Address","PairAgeHours"]
             show_cols = [c for c in keep_cols if c in dfE.columns]
-            st.success(f"Candidati: {len(dfE)} — mostrati i primi {min(int(st.session_state.get('ef_topN_show', 25)), len(dfE))}", icon="🎯")
-            st.dataframe(dfE[show_cols].head(int(st.session_state.get("ef_topN_show", 25))), use_container_width=True, hide_index=True)
+            topN_show_val = int(st.session_state.get("ef_topN_show", 25))
+            st.success(f"Candidati: {len(dfE)} — mostrati i primi {min(topN_show_val, len(dfE))}", icon="🎯")
+            st.dataframe(dfE[show_cols].head(topN_show_val), use_container_width=True, hide_index=True)
             st.caption("Tip: apri **📡 Radar** e spunta la riga per il drill-down con i link Jupiter/Raydium.")
 
-            # Telegram Entry Alerts (solo badge 🟢)
-            if running and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and st.session_state.get("enable_entry_alerts", True):
-                try:
-                    df_candidates = dfE[dfE.get("EntryBadge","") == "🟢"].copy()
-                    if not df_candidates.empty:
-                        if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
-                        cooldown = int(alert_cooldown_min) * 60
-                        now = time.time()
-                        sent_now = 0
-                        max_send = int(alert_max_per_run)
-                        for _, row in df_candidates.head(max_send * 2).iterrows():
-                            addr = str(row.get("Base Address", "")) or row.get("Pair")
-                            last_ts = st.session_state["tg_sent"].get(("entry", addr), 0)
-                            if now - last_ts < cooldown:
-                                continue
-                            pair = row.get("Pair", "")
-                            dex  = row.get("DEX", "")
-                            ms   = int(row.get("Meme Score", 0) or 0)
-                            tx1  = int(row.get("Txns 1h", 0) or 0)
-                            liq  = int(row.get("Liquidity (USD)", 0) or 0)
-                            vol  = int(row.get("Volume 24h (USD)", 0) or 0)
-                            ch1  = row.get("Change 1h (%)", None)
-                            ch4  = row.get("Change 4h/6h (%)", None)
-                            link = row.get("Link", "")
-
-                            lines = [
-                                f"✅ Entry Finder — {pair}",
-                                f"DEX: {dex} | MemeScore: {ms}",
-                                f"Tx1h: {tx1:,} | Liq: ${liq:,} | Vol24h: ${vol:,}",
-                            ]
-                            if ch1 is not None:
-                                try: lines.append(f"H1: {float(ch1):.2f}%")
-                                except Exception: pass
-                            if ch4 is not None:
-                                try: lines.append(f"H4/6: {float(ch4):.2f}%")
-                                except Exception: pass
-                            if link: lines.append(link)
-                            txt = "\n".join(lines)
-
-                            def tg_send(text: str):
-                                try:
-                                    r = requests.get(
-                                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                                        params={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
-                                        timeout=15
-                                    )
-                                    return (True, None) if r.ok else (False, f"status={r.status_code}")
-                                except Exception as e:
-                                    return False, str(e)
-
-                            ok, err = tg_send(txt)
-                            if ok:
-                                st.session_state["tg_sent"][("entry", addr)] = now
-                                sent_now += 1
-                                if sent_now >= max_send:
-                                    break
-                except Exception as e:
-                    st.caption(f"Alert Telegram (entry): errore — {e}")
-
-            # Salvo i candidati per la tab Paper Trader
+            # salva per Paper Trading / Alerts
             st.session_state["last_entry_candidates"] = dfE.copy()
 
-# ===================== Paper Trader (test Entry Finder) =====================
+# ======== AXIOM PRO — Strategy Engine (per Paper Trading) ========
+AXIOM_DEFAULTS = {
+    "Breakout": {
+        "min_ms": 65, "min_tx1h": 150, "min_ch1": 3.0,
+        "require_h4_pos": True, "max_ch24": 180.0, "min_turnover": 1.0,
+        "liq_min": 10_000, "liq_max": 250_000, "max_dd_abs": 25.0,
+        "age_min_m": 5, "age_max_m": 480, "survivor": False, "green_threshold": 6
+    },
+    "Pullback": {
+        "min_ms": 60, "min_tx1h": 120, "ch1_min": -6.0, "ch1_max": 2.0,
+        "require_h4_pos": True, "max_ch24": 150.0, "min_turnover": 0.8,
+        "liq_min": 8_000, "liq_max": 250_000, "max_dd_abs": 30.0,
+        "age_min_m": 10, "age_max_m": 720, "survivor": False, "green_threshold": 6
+    },
+    "Continuation": {
+        "min_ms": 65, "min_tx1h": 180, "ch1_min": 2.0, "ch1_max": 15.0,
+        "require_h4_pos": True, "max_ch24": 150.0, "min_turnover": 1.2,
+        "liq_min": 10_000, "liq_max": 0, "max_dd_abs": 20.0,
+        "age_min_m": 5, "age_max_m": 360, "survivor": True, "green_threshold": 6
+    },
+}
+
+def _num_or_nan(row, key):
+    try:
+        v = row.get(key, None)
+        if v is None: return float("nan")
+        return float(str(v).replace("%",""))
+    except Exception:
+        return float("nan")
+
+def _turnover_row(row) -> float:
+    try:
+        v = float(row.get("Volume 24h (USD)", 0) or 0)
+        l = float(row.get("Liquidity (USD)", 0) or 1)
+        return v / (l if l != 0 else 1)
+    except Exception:
+        return 0.0
+
+def axiom_pro_score(row, strategy: str, cfg: dict) -> tuple[int, str, list[str]]:
+    """
+    Ritorna (score_count_true, badge, reasons_list)
+    Badge: 🟢 se score>=green_threshold, 🟡 se >= green_threshold-1, altrimenti 🔴
+    """
+    ms   = _num_or_nan(row, "Meme Score")
+    tx1  = _num_or_nan(row, "Txns 1h")
+    ch1  = _num_or_nan(row, "Change 1h (%)")
+    ch4  = _num_or_nan(row, "Change 4h/6h (%)")
+    ch24 = _num_or_nan(row, "Change 24h (%)")
+    liq  = _num_or_nan(row, "Liquidity (USD)")
+    roi  = _num_or_nan(row, "ROI (%)")
+    dd   = _num_or_nan(row, "Drawdown (%)")
+    ageh = float(row.get("PairAgeHours", float("nan")))
+    turnover = _turnover_row(row)
+
+    reasons = []
+    true_cnt = 0
+
+    def _add(cond: bool, label: str):
+        nonlocal true_cnt
+        if cond:
+            true_cnt += 1
+            reasons.append(label)
+
+    # comuni
+    _add(ms >= cfg["min_ms"], f"MS≥{cfg['min_ms']}")
+    _add(tx1 >= cfg["min_tx1h"], f"Tx1h≥{cfg['min_tx1h']}")
+    _add(turnover >= cfg["min_turnover"], f"Turnover≥{cfg['min_turnover']:.2f}")
+
+    liq_ok = (liq >= cfg["liq_min"]) and (cfg["liq_max"] == 0 or liq <= cfg["liq_max"])
+    _add(liq_ok, "Liq✓")
+
+    if cfg.get("require_h4_pos", False):
+        h4_ok = (math.isnan(ch4) and True) or (not math.isnan(ch4) and ch4 > 0)
+        _add(h4_ok, "H4/6>0")
+
+    ch24_ok = (math.isnan(ch24)) or (ch24 <= cfg["max_ch24"])
+    _add(ch24_ok, f"24h≤{cfg['max_ch24']}%")
+
+    dd_ok = (math.isnan(dd)) or (dd >= -abs(cfg["max_dd_abs"]))
+    _add(dd_ok, f"DD≥{-abs(cfg['max_dd_abs'])}%")
+
+    age_ok = (not math.isnan(ageh)) and ( (ageh*60) >= cfg["age_min_m"] ) and ( (ageh*60) <= cfg["age_max_m"] )
+    _add(age_ok, f"Age∈[{cfg['age_min_m']},{cfg['age_max_m']}]m")
+
+    if cfg.get("survivor", False):
+        surv_ok = (not math.isnan(roi)) and (roi > 0) and (not math.isnan(ageh)) and (ageh >= 1.0)
+        _add(surv_ok, "Survivor✓")
+
+    if strategy == "Breakout":
+        _add((not math.isnan(ch1)) and (ch1 >= cfg["min_ch1"]), f"H1≥{cfg['min_ch1']}%")
+    elif strategy == "Pullback":
+        _add((not math.isnan(ch1)) and (cfg["ch1_min"] <= ch1 <= cfg["ch1_max"]), f"H1∈[{cfg['ch1_min']},{cfg['ch1_max']}]%")
+    elif strategy == "Continuation":
+        _add((not math.isnan(ch1)) and (cfg["ch1_min"] <= ch1 <= cfg["ch1_max"]), f"H1∈[{cfg['ch1_min']},{cfg['ch1_max']}]%")
+
+    thr = int(cfg.get("green_threshold", 6))
+    badge = "🟢" if true_cnt >= thr else ("🟡" if true_cnt >= (thr-1) else "🔴")
+    return true_cnt, badge, reasons
+
+# ===================== Paper Trading (Axiom Pro) =====================
 with tab_paper:
-    st.markdown("### 🧪 Paper Trading — test sui candidati dell’Entry Finder (NO trading reale)")
-    # Parametri semplici di gestione
+    st.markdown("### 🧪 Paper Trading — test Axiom Pro sui candidati dell’Entry Finder (NO trading reale)")
+
+    # --- Selettore strategia & parametri Axiom ---
+    colS1, colS2 = st.columns([2,1])
+    with colS1:
+        ax_strategy = st.selectbox("Axiom Pro — strategia", ["Breakout", "Pullback", "Continuation"], index=0, key="ax_strategy")
+    with colS2:
+        show_params = st.toggle("Mostra parametri", value=False, key="ax_show_params")
+
+    ax_cfg = dict(AXIOM_DEFAULTS.get(ax_strategy, AXIOM_DEFAULTS["Breakout"]))
+    if show_params:
+        st.caption("Taratura rapida (tutti i numeri sono **soglie**):")
+        c1, c2, c3, c4 = st.columns(4)
+        ax_cfg["min_ms"]       = c1.number_input("MS min", min_value=0, max_value=100, value=int(ax_cfg["min_ms"]), step=1)
+        ax_cfg["min_tx1h"]     = c2.number_input("Tx1h min", min_value=0, value=int(ax_cfg["min_tx1h"]), step=10)
+        ax_cfg["min_turnover"] = c3.number_input("Turnover min", min_value=0.0, value=float(ax_cfg["min_turnover"]), step=0.1, format="%.1f")
+        ax_cfg["max_dd_abs"]   = c4.number_input("DD max abs %", min_value=0.0, value=float(ax_cfg["max_dd_abs"]), step=1.0)
+
+        c5, c6, c7, c8 = st.columns(4)
+        ax_cfg["liq_min"]      = c5.number_input("Liq min $", min_value=0, value=int(ax_cfg["liq_min"]), step=1000)
+        ax_cfg["liq_max"]      = c6.number_input("Liq max $ (0=∞)", min_value=0, value=int(ax_cfg["liq_max"]), step=5000)
+        ax_cfg["max_ch24"]     = c7.number_input("24h max %", min_value=0.0, value=float(ax_cfg["max_ch24"]), step=5.0)
+        ax_cfg["green_threshold"] = c8.number_input("Soglia 🟢 (count)", min_value=3, max_value=12, value=int(ax_cfg["green_threshold"]), step=1)
+
+        if ax_strategy == "Breakout":
+            c9, c10 = st.columns(2)
+            ax_cfg["min_ch1"] = c9.number_input("H1 min %", value=float(ax_cfg["min_ch1"]), step=0.5)
+            ax_cfg["require_h4_pos"] = c10.toggle("Richiedi H4/6 > 0", value=bool(ax_cfg["require_h4_pos"]))
+        else:
+            c9, c10, c11 = st.columns(3)
+            ax_cfg["ch1_min"] = c9.number_input("H1 min %", value=float(ax_cfg.get("ch1_min", -6.0)), step=0.5)
+            ax_cfg["ch1_max"] = c10.number_input("H1 max %", value=float(ax_cfg.get("ch1_max", 2.0)), step=0.5)
+            ax_cfg["require_h4_pos"] = c11.toggle("Richiedi H4/6 > 0", value=bool(ax_cfg["require_h4_pos"]))
+
+        c12, c13, c14 = st.columns(3)
+        ax_cfg["age_min_m"] = c12.number_input("Age min (min)", min_value=0, value=int(ax_cfg["age_min_m"]), step=5)
+        ax_cfg["age_max_m"] = c13.number_input("Age max (min)", min_value=1, value=int(ax_cfg["age_max_m"]), step=10)
+        ax_cfg["survivor"]  = c14.toggle("Richiedi Survivor", value=bool(ax_cfg["survivor"]))
+
+    # --- Parametri risk management paper ---
     colP1, colP2, colP3, colP4 = st.columns(4)
     with colP1:
-        pt_size = st.number_input("Position size ($ paper)", min_value=10.0, value=100.0, step=10.0, key="pt_size")
+        pt_size = st.number_input("Position size ($ paper)", min_value=10.0, value=st.session_state.get("pt_size", 100.0), step=10.0, key="pt_size")
     with colP2:
-        pt_tp = st.number_input("Take Profit %", value=20.0, step=1.0, key="pt_tp")
+        pt_tp = st.number_input("Take Profit %", value=st.session_state.get("pt_tp", 20.0), step=1.0, key="pt_tp")
     with colP3:
-        pt_sl = st.number_input("Stop Loss %", value=10.0, step=1.0, key="pt_sl")
+        pt_sl = st.number_input("Stop Loss %", value=st.session_state.get("pt_sl", 10.0), step=1.0, key="pt_sl")
     with colP4:
-        pt_trail = st.number_input("Trailing %", value=8.0, step=0.5, key="pt_trail")
+        pt_trail = st.number_input("Trailing %", value=st.session_state.get("pt_trail", 8.0), step=0.5, key="pt_trail")
 
     df_candidates = st.session_state.get("last_entry_candidates", pd.DataFrame())
     if df_candidates is None or df_candidates.empty:
         st.info("Nessun candidato ancora (esegui l’Entry Finder).")
     else:
-        good = df_candidates[df_candidates.get("EntryBadge","") == "🟢"].copy()
-        st.caption(f"Candidati Entry (🟢): {len(good)}")
+        # Calcolo Axiom score/badge
+        scores, badges, notes = [], [], []
+        for _, r in df_candidates.iterrows():
+            sc, bdg, rs = axiom_pro_score(r, ax_strategy, ax_cfg)
+            scores.append(sc); badges.append(bdg); notes.append(", ".join(rs))
+        df_ax = df_candidates.copy()
+        df_ax["AxiomScore"] = scores
+        df_ax["AxiomBadge"] = badges
+        df_ax["AxiomReasons"] = notes
 
-# Apri posizioni sulle prime N
-colO1, colO2 = st.columns(2)
-n_good = int(len(good))
+        st.markdown("#### Valutazione Axiom Pro sui candidati")
+        st.dataframe(
+            df_ax[["AxiomBadge","AxiomScore","Pair","DEX","Price (USD)","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Change 1h (%)","Change 4h/6h (%)","Change 24h (%)","ROI (%)","Drawdown (%)","Pair Age","Link","AxiomReasons"]]
+            .sort_values(by=["AxiomBadge","AxiomScore","Txns 1h"], ascending=[True, False, False]),
+            use_container_width=True, hide_index=True
+        )
 
-if n_good == 0:
-    topN_open = colO1.number_input(
-        "Apri prime N (🟢)",
-        min_value=0, max_value=100, value=0, step=1,
-        key="pt_topN_open",
-        help="Nessun candidato 🟢 al momento."
-    )
-    colO2.button("Apri posizioni (paper)", disabled=True)
-else:
-    default_val = min(5, n_good)
-    topN_open = colO1.number_input(
-        "Apri prime N (🟢)",
-        min_value=1, max_value=n_good, value=default_val, step=1,
-        key="pt_topN_open"
-    )
-    if colO2.button("Apri posizioni (paper)"):
-        opened = 0
-        for _, r in good.head(int(topN_open)).iterrows():
-            pair = r.get("Pair","")
-            addr = str(r.get("Base Address","")) or pair
-            price = r.get("Price (USD)", None)
-            if not price or not pair:
-                continue
-            # evita duplicati
-            exists = any(p.get("addr")==addr and p.get("open") for p in st.session_state["pt_positions"])
-            if exists:
-                continue
-            st.session_state["pt_positions"].append({
-                "ts_open": time.time(),
-                "pair": pair,
-                "addr": addr,
-                "price_open": float(price),
-                "size_usd": float(st.session_state.get("pt_size", 100.0)),
-                "tp_pct": float(st.session_state.get("pt_tp", 20.0)),
-                "sl_pct": float(st.session_state.get("pt_sl", 10.0)),
-                "trail_pct": float(st.session_state.get("pt_trail", 8.0)),
-                "peak_px": float(price),
-                "open": True,
-                "link": r.get("Link",""),
-            })
-            opened += 1
-        st.success(f"Aperte {opened} posizioni (paper).")
+        # Solo 🟢 per l’apertura automatica
+        good_axiom = df_ax[df_ax["AxiomBadge"] == "🟢"].copy()
+        st.caption(f"Candidati Axiom 🟢: {len(good_axiom)}  •  Strategia: **{ax_strategy}**")
 
-    # Vista posizioni
+        # --- Apertura posizioni sulle prime N 🟢 ---
+        colO1, colO2 = st.columns(2)
+        n_good = int(len(good_axiom))
+        if n_good == 0:
+            topN_open = colO1.number_input("Apri prime N (🟢)", min_value=0, max_value=100, value=0, step=1, key="pt_topN_open")
+            colO2.button("Apri posizioni (paper)", disabled=True)
+        else:
+            default_val = min(5, n_good)
+            topN_open = colO1.number_input("Apri prime N (🟢)", min_value=1, max_value=n_good, value=default_val, step=1, key="pt_topN_open")
+            if colO2.button("Apri posizioni (paper)"):
+                opened = 0
+                for _, r in good_axiom.sort_values(by=["AxiomScore","Txns 1h"], ascending=[False, False]).head(int(topN_open)).iterrows():
+                    pair = r.get("Pair","")
+                    addr = str(r.get("Base Address","")) or pair
+                    price = r.get("Price (USD)", None)
+                    if not price or not pair:
+                        continue
+                    # evita duplicati
+                    exists = any(p.get("addr")==addr and p.get("open") for p in st.session_state["pt_positions"])
+                    if exists:
+                        continue
+                    st.session_state["pt_positions"].append({
+                        "ts_open": time.time(),
+                        "pair": pair,
+                        "addr": addr,
+                        "price_open": float(price),
+                        "size_usd": float(pt_size),
+                        "tp_pct": float(pt_tp),
+                        "sl_pct": float(pt_sl),
+                        "trail_pct": float(pt_trail),
+                        "peak_px": float(price),
+                        "open": True,
+                        "link": r.get("Link",""),
+                        "axiom_strategy": ax_strategy,
+                        "axiom_score": int(r.get("AxiomScore", 0))
+                    })
+                    opened += 1
+                st.success(f"Aperte {opened} posizioni (paper) con filtro Axiom {ax_strategy}.")
+
+    # --- Update PnL/chiusure ---
+    def _update_paper_positions(df_price_source: pd.DataFrame):
+        if not st.session_state["pt_positions"]: return
+        price_map = {}
+        for _, row in df_pairs_table.iterrows():
+            addr = str(row.get("Base Address","")) or row.get("Pair")
+            px = row.get("Price (USD)", None)
+            try:
+                if addr and px is not None and float(px) > 0: price_map[addr] = float(px)
+            except Exception: pass
+
+        closed = 0
+        for pos in st.session_state["pt_positions"]:
+            if not pos.get("open"): continue
+            addr = pos["addr"]
+            px = price_map.get(addr)
+            if px is None: continue
+            # update peak
+            if px > pos["peak_px"]:
+                pos["peak_px"] = px
+            # returns
+            ret = (px / pos["price_open"] - 1.0) * 100.0
+            dd_from_peak = (px / pos["peak_px"] - 1.0) * 100.0
+
+            # Stop/TP/Trail
+            hit_tp = ret >= pos["tp_pct"]
+            hit_sl = ret <= -abs(pos["sl_pct"])
+            hit_trail = dd_from_peak <= -abs(pos["trail_pct"])
+
+            if hit_tp or hit_sl or hit_trail:
+                pos["open"] = False
+                pos["ts_close"] = time.time()
+                pos["price_close"] = px
+                pos["ret_pct"] = ret
+                st.session_state["pt_history"].append(pos.copy())
+                closed += 1
+        if closed > 0:
+            st.toast(f"PaperTrader: {closed} posizioni chiuse", icon="✅")
+
+    if running:
+        _update_paper_positions(df_pairs_table)
+
+    # --- Vista posizioni ---
     open_pos = [p for p in st.session_state["pt_positions"] if p.get("open")]
     closed_pos = [p for p in st.session_state["pt_positions"] if not p.get("open")]
+
     st.markdown("#### Posizioni aperte")
     if not open_pos:
         st.caption("Nessuna posizione aperta.")
     else:
         df_open = pd.DataFrame(open_pos)
         df_open["t_open"] = pd.to_datetime(df_open["ts_open"], unit="s")
-        st.dataframe(df_open[["pair","price_open","size_usd","tp_pct","sl_pct","trail_pct","peak_px","t_open","link"]], use_container_width=True, hide_index=True)
+        cols_keep = ["pair","price_open","size_usd","tp_pct","sl_pct","trail_pct","peak_px","axiom_strategy","axiom_score","t_open","link"]
+        cols_keep = [c for c in cols_keep if c in df_open.columns]
+        st.dataframe(df_open[cols_keep], use_container_width=True, hide_index=True)
 
     st.markdown("#### Posizioni chiuse (storico)")
     if not closed_pos:
@@ -1513,13 +1630,14 @@ else:
         df_closed = pd.DataFrame(closed_pos)
         df_closed["t_open"] = pd.to_datetime(df_closed["ts_open"], unit="s")
         df_closed["t_close"] = pd.to_datetime(df_closed["ts_close"], unit="s")
-        st.dataframe(df_closed[["pair","price_open","price_close","ret_pct","size_usd","t_open","t_close","link"]].sort_values(by="t_close", ascending=False),
-                     use_container_width=True, hide_index=True)
+        cols_keep = ["pair","price_open","price_close","ret_pct","size_usd","axiom_strategy","axiom_score","t_open","t_close","link"]
+        cols_keep = [c for c in cols_keep if c in df_closed.columns]
+        st.dataframe(df_closed[cols_keep].sort_values(by="t_close", ascending=False), use_container_width=True, hide_index=True)
         if not df_closed.empty:
             avg_ret = float(pd.to_numeric(df_closed["ret_pct"], errors="coerce").fillna(0).mean())
             st.metric("Rendimento medio trade", f"{avg_ret:.2f}%")
 
-# ============== Alert Telegram generali (Hit Radar + Trailing) ==============
+# ============== Alert Telegram Helpers ==============
 def tg_send(text: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
     try:
@@ -1539,49 +1657,35 @@ if running and enable_alerts and (df_pairs_table is not None) and not df_pairs_t
     try:
         df_alert = df_pairs_table.copy()
         mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
-        if int(alert_meme_min) > 0:
-            mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
+        if int(alert_meme_min) > 0: mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
         df_alert = df_alert[mask]
         if not df_alert.empty:
-            df_alert = df_alert.sort_values(by=["Meme Score", "Txns 1h", "Liquidity (USD)"], ascending=[False, False, False])
+            df_alert = df_alert.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
             max_send = int(alert_max_per_run)
-            for _, row in df_alert.head(max_send * 2).iterrows():
-                addr = str(row.get("Base Address", "")) or row.get("Pair")
+            for _, row in df_alert.head(max_send*2).iterrows():
+                addr = str(row.get("Base Address","")) or row.get("Pair")
                 last_ts = st.session_state["tg_sent"].get(("hit", addr), 0)
-                if now - last_ts < cooldown:
-                    continue
-
-                pair = row.get("Pair", "")
-                dex  = row.get("DEX", "")
-                ms   = int(row.get("Meme Score", 0) or 0)
-                tx1  = int(row.get("Txns 1h", 0) or 0)
-                liq  = int(row.get("Liquidity (USD)", 0) or 0)
-                vol  = int(row.get("Volume 24h (USD)", 0) or 0)
-                px   = row.get("Price (USD)", None)
-                chg  = row.get("Change 24h (%)", None)
-                link = row.get("Link", "")
-
-                txt = (
-                    f"⚡️ Radar Hit — {pair}\n"
-                    f"DEX: {dex}  |  MemeScore: {ms}\n"
-                    f"Txns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
-                )
-                if isinstance(px, (int, float)) and px:
-                    txt += f"\nPrice: {px:.8f}"
+                if now - last_ts < cooldown: continue
+                pair = row.get("Pair","")
+                dex = row.get("DEX","")
+                ms = int(row.get("Meme Score",0) or 0)
+                tx1 = int(row.get("Txns 1h",0) or 0)
+                liq = int(row.get("Liquidity (USD)",0) or 0)
+                vol = int(row.get("Volume 24h (USD)",0) or 0)
+                px  = row.get("Price (USD)", None)
+                chg = row.get("Change 24h (%)", None)
+                link= row.get("Link","")
+                txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
+                if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
                 if chg is not None:
-                    try:
-                        txt += f"  |  24h: {float(chg):.2f}%"
-                    except Exception:
-                        pass
-                if link:
-                    txt += f"\n{link}"
-
+                    try: txt += f"  |  24h: {float(chg):.2f}%"
+                    except Exception: pass
+                if link: txt += f"\n{link}"
                 ok, err = tg_send(txt)
                 if ok:
                     st.session_state["tg_sent"][("hit", addr)] = now
                     tg_sent_now += 1
-                    if tg_sent_now >= max_send:
-                        break
+                    if tg_sent_now >= max_send: break
     except Exception as e:
         st.caption(f"Alert Telegram (hit): errore — {e}")
 
@@ -1593,37 +1697,62 @@ if running and enable_trailing and (df_pairs_table is not None) and not df_pairs
         roi_series = pd.to_numeric(df_tr["ROI (%)"], errors="coerce")
         mask_tr = (dd_series <= float(trailing_dd_thr)) & (roi_series >= 0)
         df_tr = df_tr[mask_tr]
-
         for _, row in df_tr.iterrows():
-            addr = str(row.get("Base Address", "")) or row.get("Pair")
+            addr = str(row.get("Base Address","")) or row.get("Pair")
             last_ts = st.session_state["tg_sent"].get(("trail", addr), 0)
-            if now - last_ts < cooldown:
-                continue
-
-            pair = row.get("Pair", "")
-            dd   = row.get("Drawdown (%)")
-            roi  = row.get("ROI (%)")
-            link = row.get("Link", "")
-
+            if now - last_ts < cooldown: continue
+            pair = row.get("Pair","")
+            dd = row.get("Drawdown (%)")
+            roi = row.get("ROI (%)")
+            link = row.get("Link","")
             try:
-                dd_str = f"{float(dd):.1f}%"
+                txt = f"⚠️ Trailing stop — {pair}\nDD: {float(dd):.1f}%  |  ROI: {float(roi):.1f}%"
             except Exception:
-                dd_str = "N/D"
-            try:
-                roi_str = f"{float(roi):.1f}%"
-            except Exception:
-                roi_str = "N/D"
-
-            txt = f"⚠️ Trailing stop — {pair}\nDD: {dd_str}  |  ROI: {roi_str}"
-            if link:
-                txt += f"\n{link}"
-
+                txt = f"⚠️ Trailing stop — {pair}"
+            if link: txt += f"\n{link}"
             ok, err = tg_send(txt)
             if ok:
                 st.session_state["tg_sent"][("trail", addr)] = now
                 tg_sent_now += 1
     except Exception as e:
         st.caption(f"Alert Telegram (trailing): errore — {e}")
+
+# (C) Alert Telegram — Axiom 🟢 (momento di entrare)
+if running and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        df_candidates = st.session_state.get("last_entry_candidates", pd.DataFrame())
+        if df_candidates is not None and not df_candidates.empty:
+            # ricalcolo rapido con config corrente (usa la stessa strategia/parametri della tab Paper Trading)
+            df_ax_alert = []
+            for _, r in df_candidates.iterrows():
+                sc, bdg, rs = axiom_pro_score(r, st.session_state.get("ax_strategy","Breakout"), dict(AXIOM_DEFAULTS.get(st.session_state.get("ax_strategy","Breakout"))))
+                if bdg == "🟢":
+                    df_ax_alert.append((r, sc, rs))
+            if df_ax_alert:
+                max_send = 3
+                for r, sc, rs in df_ax_alert[:max_send]:
+                    addr = str(r.get("Base Address","")) or r.get("Pair")
+                    last_ts = st.session_state["tg_sent"].get(("axiom", addr), 0)
+                    if now - last_ts < cooldown:
+                        continue
+                    pair = r.get("Pair","")
+                    dex = r.get("DEX","")
+                    tx1 = int(r.get("Txns 1h",0) or 0)
+                    liq = int(r.get("Liquidity (USD)",0) or 0)
+                    vol = int(r.get("Volume 24h (USD)",0) or 0)
+                    link= r.get("Link","")
+                    txt = (
+                        f"✅ Axiom {st.session_state.get('ax_strategy','Breakout')} — {pair}\n"
+                        f"Score: {sc}  |  DEX: {dex}\n"
+                        f"Tx1h: {tx1:,} | Liq: ${liq:,} | Vol24h: ${vol:,}\n"
+                        + (link or "")
+                    )
+                    ok, err = tg_send(txt)
+                    if ok:
+                        st.session_state["tg_sent"][("axiom", addr)] = now
+                        tg_sent_now += 1
+    except Exception as e:
+        st.caption(f"Alert Telegram (Axiom): errore — {e}")
 
 # ============== Diagnostica finale ==============
 st.subheader("Diagnostica")
@@ -1639,7 +1768,8 @@ st.caption(
     f"Stato: {'🟢 Running' if running else '⏸️ Pausa'} • Refresh: {REFRESH_SEC}s • "
     f"TG alerts (run): {tg_sent_now} • Ticket proxy: ${PROXY_TICKET:.0f} • "
     f"PAIRS→Diagnostica: {'ON' if pairs_filters_to_strategy else 'OFF'} • "
-    f"EquityCurve: tracking={'ON' if st.session_state.get('eq_enabled', True) else 'OFF'}"
+    f"EquityCurve: tracking={'ON' if st.session_state.get('eq_enabled', True) else 'OFF'} • "
+    f"TopN={int(st.session_state.get('eq_topN_tab', 10))} • Equity=${st.session_state.get('eq_equity', 0):,.2f}".replace(",", ".")
 )
 
 st.session_state["last_refresh_ts"] = time.time()
