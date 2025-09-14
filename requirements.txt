@@ -4,6 +4,7 @@ pandas>=2.2,<3.0
 numpy>=1.26,<3.0
 plotly>=5.20,<6.0
 requests>=2.31,<3.0
+ruff
 
 # Utilities
 streamlit-autorefresh>=0.0.1
