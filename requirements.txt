@@ -1,10 +1,15 @@
-streamlit
-pandas
-requests
-plotly
-websocket-client==1.8.0
-streamlit-autorefresh
-solana
-solders
+# Core app
+streamlit>=1.35,<2.0
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+plotly>=5.20,<6.0
+requests>=2.31,<3.0
 
+# Utilities
+streamlit-autorefresh>=0.0.1
+python-dotenv>=1.0
 
+# (Opzionali)
+# kaleido           # per esportare grafici Plotly in immagini statiche
+# pyarrow           # velocizza operazioni su dataframe/grandi CSV
+# rich              # log/print più leggibili in locale
