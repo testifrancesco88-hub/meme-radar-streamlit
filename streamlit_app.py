@@ -1417,31 +1417,49 @@ if running and enable_alerts and (df_pairs_table is not None) and not df_pairs_t
     try:
         df_alert = df_pairs_table.copy()
         mask = (df_alert["Txns 1h"] >= int(alert_tx1h_min)) & (df_alert["Liquidity (USD)"] >= int(alert_liq_min))
-        if int(alert_meme_min) > 0: mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
+        if int(alert_meme_min) > 0:
+            mask &= (df_alert["Meme Score"] >= int(alert_meme_min))
         df_alert = df_alert[mask]
         if not df_alert.empty:
-            df_alert = df_alert.sort_values(by=["Meme Score","Txns 1h","Liquidity (USD)"], ascending=[False, False, False])
+            df_alert = df_alert.sort_values(by=["Meme Score", "Txns 1h", "Liquidity (USD)"], ascending=[False, False, False])
             max_send = int(alert_max_per_run)
-            for _, row in df_alert.head(max_send*2).iterrows():
-                addr = str(row.get("Base Address","")) or row.get("Pair")
+            for _, row in df_alert.head(max_send * 2).iterrows():
+                addr = str(row.get("Base Address", "")) or row.get("Pair")
                 last_ts = st.session_state["tg_sent"].get(("hit", addr), 0)
-                if now - last_ts < cooldown: continue
-                pair = row.get("Pair","")); dex = row.get("DEX","")); ms = int(row.get("Meme Score",0) or 0)
-                tx1 = int(row.get("Txns 1h",0) or 0); liq = int(row.get("Liquidity (USD)",0) or 0)
-                vol = int(row.get("Volume 24h (USD)",0) or 0)
-                px  = row.get("Price (USD)", None); chg = row.get("Change 24h (%)", None)
-                link= row.get("Link","")
-                txt = f"⚡️ Radar Hit — {pair}\nDEX: {dex}  |  MemeScore: {ms}\nTxns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
-                if isinstance(px,(int,float)) and px: txt += f"\nPrice: {px:.8f}"
+                if now - last_ts < cooldown:
+                    continue
+
+                pair = row.get("Pair", "")
+                dex  = row.get("DEX", "")
+                ms   = int(row.get("Meme Score", 0) or 0)
+                tx1  = int(row.get("Txns 1h", 0) or 0)
+                liq  = int(row.get("Liquidity (USD)", 0) or 0)
+                vol  = int(row.get("Volume 24h (USD)", 0) or 0)
+                px   = row.get("Price (USD)", None)
+                chg  = row.get("Change 24h (%)", None)
+                link = row.get("Link", "")
+
+                txt = (
+                    f"⚡️ Radar Hit — {pair}\n"
+                    f"DEX: {dex}  |  MemeScore: {ms}\n"
+                    f"Txns 1h: {tx1:,}  |  Liq: ${liq:,}  |  Vol24h: ${vol:,}"
+                )
+                if isinstance(px, (int, float)) and px:
+                    txt += f"\nPrice: {px:.8f}"
                 if chg is not None:
-                    try: txt += f"  |  24h: {float(chg):.2f}%"
-                    except Exception: pass
-                if link: txt += f"\n{link}"
+                    try:
+                        txt += f"  |  24h: {float(chg):.2f}%"
+                    except Exception:
+                        pass
+                if link:
+                    txt += f"\n{link}"
+
                 ok, err = tg_send(txt)
                 if ok:
                     st.session_state["tg_sent"][("hit", addr)] = now
                     tg_sent_now += 1
-                    if tg_sent_now >= max_send: break
+                    if tg_sent_now >= max_send:
+                        break
     except Exception as e:
         st.caption(f"Alert Telegram (hit): errore — {e}")
 
@@ -1453,13 +1471,31 @@ if running and enable_trailing and (df_pairs_table is not None) and not df_pairs
         roi_series = pd.to_numeric(df_tr["ROI (%)"], errors="coerce")
         mask_tr = (dd_series <= float(trailing_dd_thr)) & (roi_series >= 0)
         df_tr = df_tr[mask_tr]
+
         for _, row in df_tr.iterrows():
-            addr = str(row.get("Base Address","")) or row.get("Pair")
+            addr = str(row.get("Base Address", "")) or row.get("Pair")
             last_ts = st.session_state["tg_sent"].get(("trail", addr), 0)
-            if now - last_ts < cooldown: continue
-            pair = row.get("Pair","")); dd = row.get("Drawdown (%)"); roi=row.get("ROI (%)"); link=row.get("Link","")
-            txt = f"⚠️ Trailing stop — {pair}\nDD: {dd:.1f}%  |  ROI: {roi:.1f}%"
-            if link: txt += f"\n{link}"
+            if now - last_ts < cooldown:
+                continue
+
+            pair = row.get("Pair", "")
+            dd   = row.get("Drawdown (%)")
+            roi  = row.get("ROI (%)")
+            link = row.get("Link", "")
+
+            try:
+                dd_str = f"{float(dd):.1f}%"
+            except Exception:
+                dd_str = "N/D"
+            try:
+                roi_str = f"{float(roi):.1f}%"
+            except Exception:
+                roi_str = "N/D"
+
+            txt = f"⚠️ Trailing stop — {pair}\nDD: {dd_str}  |  ROI: {roi_str}"
+            if link:
+                txt += f"\n{link}"
+
             ok, err = tg_send(txt)
             if ok:
                 st.session_state["tg_sent"][("trail", addr)] = now
