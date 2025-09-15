@@ -1,8 +1,9 @@
+
 # streamlit_app.py — Meme Radar (no trading) + Drill-down + ROI/ATH/DD + Survivors + Winners
 # + Equity + Entry Finder (smart+presets+vol filter) + Paper Trading (vanilla) + Telegram alerts
 # Requisiti: streamlit, plotly, pandas, requests; file market_data.py con MarketDataProvider
 
-import os, time, math, random, datetime
+import os, time, math, random, datetime, threading
 import pandas as pd
 import plotly.express as px
 import requests
@@ -31,25 +32,26 @@ UA_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Reuse a single HTTP session (resilienza + performance)
+# Use a single HTTP session
 _SESSION = requests.Session()
 _SESSION.headers.update(UA_HEADERS)
 
 # =============== Session State ===============
 if "app_running" not in st.session_state: st.session_state["app_running"] = True
 if "last_refresh_ts" not in st.session_state: st.session_state["last_refresh_ts"] = time.time()
-
-# Profit metrics baseline/ath per token (key = pairAddress)
+# Profit metrics baseline/ath per token
 for k in ("baseline_px","ath_px"):
     if k not in st.session_state: st.session_state[k] = {}
-
 # Equity curve state
 if "eq_enabled" not in st.session_state: st.session_state["eq_enabled"] = True
 if "eq_init_capital" not in st.session_state: st.session_state["eq_init_capital"] = 1000.0
 if "eq_equity" not in st.session_state: st.session_state["eq_equity"] = float(st.session_state["eq_init_capital"])
 if "eq_history" not in st.session_state: st.session_state["eq_history"] = []   # [{ts,equity,ret,n}]
 if "eq_last_prices" not in st.session_state: st.session_state["eq_last_prices"] = {}
+# Alerts state
 if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
+# Entry Finder results state (for Paper Trading)
+if "entry_finder_results" not in st.session_state: st.session_state["entry_finder_results"] = pd.DataFrame()
 
 # ================= Sidebar =================
 with st.sidebar:
@@ -237,7 +239,7 @@ with st.sidebar:
 running = bool(st.session_state.get("app_running", True))
 st.markdown(f"**Stato:** {'🟢 Running' if running else '⏸️ Pausa'}")
 
-# 🔁 Auto-refresh (senza thread secondari, fallback HTML meta-refresh)
+# 🔁 Auto-refresh (stabile)
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -254,9 +256,16 @@ effective_auto_refresh = auto_refresh and running
 if effective_auto_refresh:
     if st_autorefresh:
         st_autorefresh(interval=int(REFRESH_SEC * 1000), key="auto_refresh_tick")
-    else:
-        # Fallback universale (HTML meta refresh)
-        st.markdown(f"<meta http-equiv='refresh' content='{REFRESH_SEC}'>", unsafe_allow_html=True)
+    elif "fallback_rerun_thread" not in st.session_state:
+        def _delayed_rerun():
+            time.sleep(max(1, REFRESH_SEC))
+            try:
+                st.rerun()
+            except Exception:
+                pass
+        t = threading.Thread(target=_delayed_rerun, daemon=True)
+        t.start()
+        st.session_state["fallback_rerun_thread"] = True
 
 util_col1, util_col2 = st.columns([5, 1])
 with util_col1:
@@ -361,22 +370,16 @@ def score_liq(liq, mn, mx):
 def score_dex(d): return DEX_WEIGHTS.get((d or "").lower(), 0.6)
 
 def compute_meme_score_row(r, weights=None, sweet_min=None, sweet_max=None):
-    """Usa i parametri passati (no variabili globali)"""
     base = r.get("baseSymbol","") if hasattr(r, "get") else r["baseSymbol"]
     dex  = r.get("dexId","") if hasattr(r, "get") else r["dexId"]
     liq  = r.get("liquidityUsd", None) if hasattr(r, "get") else r["liquidityUsd"]
     tx1  = r.get("txns1h", 0) if hasattr(r, "get") else r["txns1h"]
     ageh = hours_since_ms(r.get("pairCreatedAt", 0) if hasattr(r, "get") else r["pairCreatedAt"])
-    w_symbol_, w_age_, w_txns_, w_liq_, w_dex_ = tuple(weights or (20,20,25,20,15))
-
-    liq_score = score_liq((liq or 0.0), sweet_min, sweet_max)
-    f = (w_symbol_ * score_symbol(base) +
-         w_age_    * score_age(ageh) +
-         w_txns_   * s_sigmoid(tx1)  +
-         w_liq_    * liq_score       +
-         w_dex_    * score_dex(dex))
-    denom = max(1e-6, (w_symbol_+w_age_+w_txns_+w_liq_+w_dex_))
-    return round(100.0 * f / denom)
+    local_weights = tuple(weights or (20,20,25,20,15))
+    f = (local_weights[0]*score_symbol(base) + local_weights[1]*score_age(ageh) +
+         local_weights[2]*s_sigmoid(tx1) + local_weights[3]*score_liq((liq or 0.0), sweet_min, sweet_max) +
+         local_weights[4]*score_dex(dex))
+    return round(100.0 * f / max(1e-6, sum(local_weights)))
 
 # ============== Provider init ==============
 if "provider" not in st.session_state:
@@ -401,7 +404,6 @@ codes = provider.get_last_http_codes()
 st.caption(f"Aggiornato: {time.strftime('%H:%M:%S', time.localtime(ts))}" if ts else "Aggiornamento in corso…")
 
 # ============== Watchlist & Volume filtro dataset ==============
-df_provider = df_provider if isinstance(df_provider, pd.DataFrame) else pd.DataFrame()
 df_view = df_provider.copy()
 pre_count = len(df_view)
 
@@ -492,8 +494,7 @@ with c4: st.metric("Nuove coin – Liquidity media", fmt_int(new_liq_avg))
 
 # ============== ROI/ATH/DD helpers ==============
 def _addr_key_from_rowdict(rdict):
-    # Preferisci SEMPRE pairAddress (pool univoco)
-    for k in ("pairAddress","Pair Address","baseAddress","Base Address"):
+    for k in ("baseAddress","pairAddress","Base Address","Pair Address"):
         v = rdict.get(k)
         if v: return str(v)
     return rdict.get("Pair") or rdict.get("pair") or None
@@ -520,17 +521,7 @@ def update_profit_metrics_from_raw(rdict):
     dd_pct  = (px/new_ath - 1.0)*100.0 if new_ath>0 else None
     return roi_pct, ath_pct, dd_pct
 
-# ============== Tabella (build) ==============
-def _first_or_none(d, keys):
-    for k in keys:
-        try:
-            v = d.get(k) if hasattr(d, "get") else d[k]
-            if v is not None:
-                return v
-        except Exception:
-            pass
-    return None
-
+# ============== Change helpers ==============
 def _to_float_pct(x):
     if x is None: return None
     try:
@@ -552,9 +543,13 @@ def _get_change_pct_from_nested(r, nested_key, candidates):
     return None
 
 def _get_change_pct(r, flat_keys, nested_key, nested_candidates):
-    v = _first_or_none(r, flat_keys); v = _to_float_pct(v)
-    return v if v is not None else _get_change_pct_from_nested(r, nested_key, nested_candidates)
+    for k in flat_keys:
+        v = r.get(k) if hasattr(r, "get") else r[k]
+        val = _to_float_pct(v)
+        if val is not None: return val
+    return _get_change_pct_from_nested(r, nested_key, nested_candidates)
 
+# ============== Tabella (build) ==============
 def build_table(df):
     rows = []
     for r in df.to_dict(orient="records"):
@@ -653,7 +648,7 @@ else:
 
 # ============== Equity helpers & tick ==============
 def _addr_from_row(row: dict):
-    for k in ("Pair Address","Base Address"):
+    for k in ("Base Address","Pair Address"):
         v = row.get(k)
         if isinstance(v, str) and v: return v
     return row.get("Pair")
@@ -672,7 +667,7 @@ def _select_top_roi(df_pairs_table: pd.DataFrame, topN: int) -> pd.DataFrame:
 
 def _equity_tick(df_pairs_table: pd.DataFrame, topN: int = 10) -> None:
     if df_pairs_table is None or df_pairs_table.empty: return
-    sel = _select_top_roi(df_pairs_table, topN)
+    sel = _select_top_roi(df_pairs_table, topN); 
     if sel.empty: return
     curr_prices = {}
     for _, row in sel.iterrows():
@@ -1234,29 +1229,19 @@ with tab_entry:
 
         dfE = dfC[mask].copy()
 
-        # --- Auto-relax (senza toccare subito session_state) ---
+        # Auto-relax (senza toccare i widget's session_state per evitare eccezioni)
         relax_applied = False
-        relaxed_values = None  # parametri proposti (opzionali)
-
+        chosen_params = None
         if auto_relax and (dfE.empty or len(dfE) < targetN):
             relax_applied = True
-
-            _tx      = int(tx_min)
-            _ch1min  = int(ch1_min)
-            _ch1max  = int(ch1_max)
-            _liqmin  = int(liq_min_e)
-            _liqmax  = int(liq_max_e)
-            _volmin  = int(vol_min_e)
-            _volmax  = int(vol_max_e)
-            _agemin  = int(age_min_m)
-            _agemax  = int(age_max_m)
-            _cap24   = int(cap_24h)
-
+            _tx = int(tx_min); _ch1min = int(ch1_min); _ch1max = int(ch1_max)
+            _liqmin = int(liq_min_e); _liqmax = int(liq_max_e)
+            _volmin = int(vol_min_e); _volmax = int(vol_max_e)
+            _agemin = int(age_min_m); _agemax = int(age_max_m)
+            _cap24 = int(cap_24h)
             for _ in range(10):
-                # allenta i vincoli
-                _tx     = max(50, _tx - 50)
-                _ch1min -= 3
-                _ch1max += 5
+                _tx = max(50, _tx - 50)
+                _ch1min -= 3; _ch1max += 5
                 _liqmin = max(0, _liqmin - 5000)
                 _liqmax = 0 if _liqmax == 0 else min(1_000_000_000, int(_liqmax * 2))
                 _volmin = max(0, _volmin - 20_000)
@@ -1265,31 +1250,20 @@ with tab_entry:
                 _agemax = min(720, _agemax + 60)
                 _cap24  = min(300, _cap24 + 30)
 
-                m_tx   = (tx_col >= _tx)
-                m_liq  = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
-                m_age  = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
-                m_vol  = (vol_col >= _volmin) & ((_volmax == 0) | (vol_col <= _volmax))
-                m_ch1r = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if allow_missing_ch1 else ((ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both"))
-                m_ch4r = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ((ch4_col > -9998) | allow_missing_h4)
-                m_c24r = (ch24_col <= _cap24) | (ch24_col < -9998)
+                m_tx  = (tx_col >= _tx)
+                m_liq = (liq_col >= _liqmin) & ((_liqmax == 0) | (liq_col <= _liqmax))
+                m_age = age_h.between(_agemin/60.0, _agemax/60.0, inclusive="both")
+                m_vol = (vol_col >= _volmin) & ((_volmax == 0) | (vol_col <= _volmax))
+                m_ch1 = ((~(ch1_col > -9998)) | ch1_col.between(_ch1min, _ch1max, inclusive="both")) if allow_missing_ch1 else ( (ch1_col > -9998) & ch1_col.between(_ch1min, _ch1max, inclusive="both") )
+                m_ch4 = ((~(ch4_col > -9998)) | (ch4_col > 0)) if trend_pos else ( (ch4_col > -9998) | allow_missing_h4 )
+                m_c24 = (ch24_col <= _cap24) | (ch24_col < -9998)
 
-                m_relaxed = m_ms & m_tx & m_liq & m_age & m_vol & m_ch1r & m_ch4r & m_c24r
+                m_relaxed = m_ms & m_tx & m_liq & m_age & m_vol & m_ch1 & m_ch4 & m_c24
                 if survivors_gate: m_relaxed &= ((age_h >= 1.0) & (roi_col > 0))
                 dfE = dfC[m_relaxed].copy()
-                if len(dfE) >= targetN or len(dfE) > 0:
-                    relaxed_values = {
-                        "ef_tx_min": _tx,
-                        "ef_ch1_min": _ch1min,
-                        "ef_ch1_max": _ch1max,
-                        "ef_liq_min": _liqmin,
-                        "ef_liq_max": _liqmax,
-                        "ef_vol_min": _volmin,
-                        "ef_vol_max": _volmax,
-                        "ef_age_min_m": _agemin,
-                        "ef_age_max_m": _agemax,
-                        "ef_cap_24h": _cap24,
-                    }
-                    break
+                chosen_params = dict(tx=_tx, ch1min=_ch1min, ch1max=_ch1max, liqmin=_liqmin, liqmax=_liqmax,
+                                     volmin=_volmin, volmax=_volmax, agemin=_agemin, agemax=_agemax, cap24=_cap24)
+                if len(dfE) >= targetN or len(dfE) > 0: break
 
         # Diagnostica rapida
         def _diag_counts():
@@ -1306,7 +1280,6 @@ with tab_entry:
 
         # Entry grade + badge sintetico
         def _entry_grade(row) -> tuple[int, str]:
-            # 0–100 + badge
             ms = float(row.get("Meme Score", 0) or 0)
             tx = float(row.get("Txns 1h", 0) or 0)
             liq= float(row.get("Liquidity (USD)", 0) or 0)
@@ -1384,6 +1357,17 @@ with tab_entry:
             st.dataframe(dfE[show_cols].head(topN_show), use_container_width=True, hide_index=True)
             st.caption("Badge: 🟢 forte | 🟡 medio | 🔴 debole. Tip: apri **📡 Radar** e spunta la riga per il drill-down Jupiter/Raydium.")
 
+            # Salva i risultati per Paper Trading
+            st.session_state["entry_finder_results"] = dfE.copy()
+            st.session_state["entry_finder_saved_at"] = time.time()
+
+            # Info su auto-relax applicato
+            if relax_applied and chosen_params:
+                st.caption(f"Auto-relax applicato → tx≥{chosen_params['tx']}, H1∈[{chosen_params['ch1min']},{chosen_params['ch1max']}], "
+                           f"liq∈[{chosen_params['liqmin']},{'∞' if chosen_params['liqmax']==0 else chosen_params['liqmax']}], "
+                           f"vol∈[{chosen_params['volmin']},{'∞' if chosen_params['volmax']==0 else chosen_params['volmax']}], "
+                           f"age∈[{chosen_params['agemin']}m,{chosen_params['agemax']}m], 24h≤{chosen_params['cap24']}%.")
+
             # === ALERT TELEGRAM: Entry Finder ===
             def tg_send(text: str):
                 if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return False, "missing-credentials"
@@ -1427,68 +1411,96 @@ with tab_entry:
                         st.session_state["tg_sent"][("entry", addr)] = now
                         sent += 1
 
-        # Mostra proposta di parametri rilassati (senza scrivere in session finché non confermi)
-        if relax_applied and relaxed_values is not None:
-            st.info("Auto-relax: trovati parametri più larghi che generano risultati. Puoi applicarli ai widget.")
-            cols_apply = st.columns(2)
-            with cols_apply[0]:
-                if st.button("✅ Applica parametri rilassati"):
-                    st.session_state.update(relaxed_values)
-                    st.rerun()
-            with cols_apply[1]:
-                with st.expander("Vedi parametri proposti"):
-                    st.json(relaxed_values)
-
 # ===================== Paper Trading (vanilla) =====================
 with tab_paper:
-    st.markdown("### 🧪 Paper Trading — entry selezionate (vanilla)")
+    st.markdown("### 🧪 Paper Trading — dalle entry dell’Entry Finder (vanilla)")
     st.caption("Nota: simulazione didattica. Nessun trading reale.")
-    if df_pairs_table.empty:
-        st.info("Serve almeno una lista dalla tabella filtrata (PAIRS).")
+
+    ef_df = st.session_state.get("entry_finder_results", None)
+
+    if ef_df is None or ef_df.empty:
+        st.info("Non ci sono risultati salvati dall’Entry Finder. Vai nella tab **🎯 Entry Finder**, genera i candidati e verranno usati qui automaticamente.")
     else:
-        # Candidati “buoni” = ROI>0 OR Change1h>0 AND badge 🟢/🟡
-        dfPT = df_pairs_table.copy()
-        ch1 = pd.to_numeric(dfPT.get("Change 1h (%)"), errors="coerce")
-        roi = pd.to_numeric(dfPT.get("ROI (%)"), errors="coerce")
-        dfPT["posMomentum"] = (ch1 > 0) | (roi > 0)
-        # Entry grade semplice per ranking
-        def _pt_grade(row):
-            ms = float(row.get("Meme Score",0) or 0)
-            tx = float(row.get("Txns 1h",0) or 0)
-            liq= float(row.get("Liquidity (USD)",0) or 0)
-            heat = s_sigmoid(tx)*100
-            return 0.5*ms + 0.5*heat + 10*score_liq(liq, liq_min_sweet, liq_max_sweet)
-        dfPT["PT Grade"] = dfPT.apply(_pt_grade, axis=1)
+        # Filtri rapidi su candidati EF
+        colF1, colF2, colF3 = st.columns(3)
+        badge_keep = colF1.multiselect("Badge ammessi", ["🟢","🟡","🔴"], default=["🟢","🟡"] if "Badge" in ef_df.columns else [])
+        min_grade  = colF2.slider("Entry Grade minimo", 0, 100, 60 if "Entry Grade" in ef_df.columns else 0)
+        sort_mode_pt = colF3.radio("Ordina per", ["Entry Grade", "Momentum (1h %)", "Freschezza (Age)"], horizontal=True)
 
-        good = dfPT[dfPT["posMomentum"]==True].sort_values(by=["PT Grade","Meme Score","Txns 1h"], ascending=[False,False,False])
+        dfPT = ef_df.copy()
 
-        colO1, colO2 = st.columns(2)
-        default_open = max(1, min(5, len(good)))
-        topN_open = colO1.number_input("Apri prime N (🟢)", min_value=1, max_value=100, value=default_open, step=1)
+        # Filtri
+        if "Badge" in dfPT.columns and badge_keep:
+            dfPT = dfPT[dfPT["Badge"].isin(badge_keep)]
+        if "Entry Grade" in dfPT.columns:
+            dfPT = dfPT[pd.to_numeric(dfPT["Entry Grade"], errors="coerce").fillna(0) >= min_grade]
+
+        # Ordinamento coerente
+        if sort_mode_pt.startswith("Entry"):
+            by = ["Entry Grade","Meme Score","Txns 1h"]; asc = [False, False, False]
+        elif sort_mode_pt.startswith("Momentum"):
+            by = ["Change 1h (%)","Entry Grade","Meme Score"]; asc = [False, False, False]
+        else:  # Freschezza
+            by = ["PairAgeHours","Entry Grade","Meme Score"]; asc = [True, False, False]
+        for c in by:
+            if c not in dfPT.columns: dfPT[c] = 0
+        dfPT = dfPT.sort_values(by=by, ascending=asc)
+
+        # Mostra elenco candidati (EF) pronto per PT
+        show_cols = [c for c in [
+            "Badge","Entry Grade","Pair","DEX","Price (USD)","Meme Score","Txns 1h",
+            "Liquidity (USD)","Volume 24h (USD)",
+            "Change 1h (%)","Change 4h/6h (%)","Change 24h (%)",
+            "ROI (%)","ATH (%)","Drawdown (%)",
+            "Pair Age","Link"
+        ] if c in dfPT.columns]
+
+        st.markdown("**Candidati dall’Entry Finder (post-filtri Paper Trading)**")
+        st.dataframe(dfPT[show_cols].head(100), use_container_width=True, hide_index=True)
+
+        # Parametri allocazione
+        colO1, colO2, colO3 = st.columns(3)
+        default_open = max(1, min(5, len(dfPT)))
+        topN_open = colO1.number_input("Apri prime N", min_value=1, max_value=100, value=default_open, step=1)
         risk_per_pos = colO2.number_input("Risk% eq. per posizione", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+        use_only_green = colO3.toggle("Solo 🟢 se disponibili", value=True)
 
-        st.markdown("**Candidati ordinati (PT Grade)**")
-        show_cols = ["Pair","DEX","Price (USD)","Meme Score","Txns 1h","Liquidity (USD)","Volume 24h (USD)","Change 1h (%)","ROI (%)","PT Grade","Link"]
-        st.dataframe(good[show_cols].head(50), use_container_width=True, hide_index=True)
+        # Simula entrata
+        if st.button("📌 Simula entrata sulle prime N (da Entry Finder)"):
+            dfSim = dfPT.copy()
+            if use_only_green and "Badge" in dfSim.columns and (dfSim["Badge"] == "🟢").any():
+                dfSim = dfSim[dfSim["Badge"] == "🟢"]
 
-        if st.button("📌 Simula entrata sulle prime N"):
-            # Semplice: alloca capitale per N posizioni, poi registra come 'aperto'
-            N = int(topN_open)
-            if N < 1 or good.empty:
-                st.warning("Nessun candidato o N<1.")
+            if dfSim.empty:
+                st.warning("Nessun candidato dopo i filtri correnti (badge/grade).")
             else:
+                N = int(topN_open)
+                dfSim = dfSim.head(N)
+
                 cap = float(st.session_state.get("eq_equity", 1000.0))
-                risk_cap = cap * (risk_per_pos/100.0)
-                alloc = risk_cap  # qui 'risk' = allocazione flat
+                alloc = cap * (risk_per_pos/100.0)  # allocazione flat per posizione
+
                 opened = []
-                for _, r in good.head(N).iterrows():
+                for _, r in dfSim.iterrows():
                     px = r.get("Price (USD)")
                     pair = r.get("Pair")
-                    if px is None or px==0: continue
-                    opened.append({"pair": pair, "price": float(px), "alloc": float(alloc)})
-                st.success(f"Aperte {len(opened)} posizioni paper (alloc≈${alloc:,.2f} cad.).".replace(",", "."))
-                with st.expander("Dettagli"):
-                    st.write(opened)
+                    if px is None or px == 0: 
+                        continue
+                    opened.append({
+                        "pair": pair,
+                        "price": float(px),
+                        "alloc": float(alloc),
+                        "entry_grade": int(r.get("Entry Grade", 0) or 0),
+                        "badge": r.get("Badge",""),
+                        "link": r.get("Link","")
+                    })
+
+                if opened:
+                    st.success(f"Aperte {len(opened)} posizioni paper (alloc≈${alloc:,.2f} cad.).".replace(",", "."))
+                    with st.expander("Dettagli posizioni aperte"):
+                        st.write(opened)
+                else:
+                    st.warning("Nessuna posizione aperta (prezzi non disponibili).")
 
 # ============== Alert Telegram (global) ==============
 def tg_send(text: str):
@@ -1500,6 +1512,7 @@ def tg_send(text: str):
     except Exception as e:
         return False, str(e)
 
+if "tg_sent" not in st.session_state: st.session_state["tg_sent"] = {}
 tg_sent_now = 0
 cooldown = int(alert_cooldown_min) * 60
 now = time.time()
